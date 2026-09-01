@@ -1,0 +1,16 @@
+workflow: full
+phase: archive
+build_mode: subagent-driven-development
+isolation: branch
+verify_mode: artifact-backed
+base_ref: fe8a6e672a2c9613d94885c6bd6c5315599acf44
+design_doc: docs/superpowers/specs/2026-06-05-minicode-lite-productization-design.md
+plan: docs/superpowers/plans/2026-06-05-minicode-lite-productization-build.md
+verify_result: pass
+verification_report: docs/superpowers/reports/2026-06-05-minicode-lite-productization-verify.md
+branch_status: handled
+created_at: 2026-06-05
+verified_at: 2026-06-05
+archived: true
+handoff_context: openspec/changes/minicode-lite-productization/.comet/handoff/design-context.json
+handoff_hash: ac56e14282b69f38edc73c75fe69a78377236f2e520f4d91a5573ba4d7f8138b

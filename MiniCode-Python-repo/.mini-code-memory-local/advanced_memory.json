@@ -1,0 +1,28 @@
+{
+  "scope": "local",
+  "last_updated": 1775697205.9423084,
+  "entries": [
+    {
+      "id": "local-skill-d2475d4b",
+      "scope": "local",
+      "type": "skill",
+      "content": "本地技能: 代码审查自动化",
+      "created_at": 1775695152.502256,
+      "updated_at": 1775695152.5022562,
+      "accessed_at": 1775695152.5022562,
+      "tags": [
+        "skill",
+        "review"
+      ],
+      "categories": [],
+      "priority": 2,
+      "usage_count": 0,
+      "confidence": 1.0,
+      "dependencies": [],
+      "references": [],
+      "related_skills": [],
+      "source": "deep_check",
+      "context_hash": "f7692d9c"
+    }
+  ]
+}

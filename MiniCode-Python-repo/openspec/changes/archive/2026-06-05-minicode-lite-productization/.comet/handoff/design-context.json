@@ -1,0 +1,18 @@
+{
+  "change": "minicode-lite-productization",
+  "phase": "design",
+  "mode": "compact",
+  "canonical_spec": "openspec",
+  "generated_by": "comet-handoff.sh",
+  "context_hash": "ac56e14282b69f38edc73c75fe69a78377236f2e520f4d91a5573ba4d7f8138b",
+  "files": [
+    { "path": "openspec/changes/minicode-lite-productization/proposal.md", "sha256": "cd09872b8fdbf6cd45fafd45ed2dbc6ac5ddc0f0cf1cc4f747de676252ef3607" },
+    { "path": "openspec/changes/minicode-lite-productization/design.md", "sha256": "fe1a609657eb4bc8298420be4807219d18f5da6a6300fc1e3f8cbfd658e0dc6c" },
+    { "path": "openspec/changes/minicode-lite-productization/tasks.md", "sha256": "0bbacb2b130292d8d286f785d11e9adf44c1d767f83c6e46e448d01487cc092a" },
+    { "path": "openspec/changes/minicode-lite-productization/specs/delegated-background-runtime/spec.md", "sha256": "4bfc4220ee8031f7b5dc6088328df173929e36c5b4dfbcec8e1b321c4537c9a2" },
+    { "path": "openspec/changes/minicode-lite-productization/specs/extension-packaging/spec.md", "sha256": "8a99187cb6b0b70e77a5b28ac83d4b75485d96d8e7c5cda86be62c027c327434" },
+    { "path": "openspec/changes/minicode-lite-productization/specs/first-class-hook-workflows/spec.md", "sha256": "380dfece6967ad1bf86a479754770b0d6b8643c8c6d70c757b2c5f01c8a14399" },
+    { "path": "openspec/changes/minicode-lite-productization/specs/instruction-policy-layers/spec.md", "sha256": "f1183b8beede9e3dbfcb6d94030145393986fb5dcb081cfa8e69a2fee2f5d93b" },
+    { "path": "openspec/changes/minicode-lite-productization/specs/product-readiness-evaluation/spec.md", "sha256": "d9a3398528a1e6d7753897fc15b60aac7e981944b23e38e09903932d56349ef7" }
+  ]
+}

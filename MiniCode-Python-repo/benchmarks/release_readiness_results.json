@@ -1,0 +1,518 @@
+{
+  "generated_at": "2026-07-17T06:54:02.128764+00:00",
+  "status": "blocked",
+  "local_gate_status": "blocked",
+  "provider_status": "at-risk",
+  "status_reasons": [
+    "Local gates are blocked; inspect failed core or product smoke checks.",
+    "Live provider status is at-risk: provider_channel_unavailable.",
+    "Fallback coverage is not locally ready (provider-config)."
+  ],
+  "compile_check": {
+    "label": "compileall",
+    "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m compileall -q minicode tests benchmarks Main Package",
+    "exit_code": 0,
+    "status": "passed",
+    "summary": "compileall completed.",
+    "stdout": "",
+    "stderr": ""
+  },
+  "test_check": {
+    "label": "pytest-q",
+    "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m pytest -q",
+    "exit_code": 0,
+    "status": "passed",
+    "summary": "1310 passed, 2 skipped in 27.20s",
+    "stdout": "........................................................................ [  5%]\n........................................................................ [ 10%]\n........................................................................ [ 16%]\n........................................................................ [ 21%]\n........................................................................ [ 27%]\n........................................................................ [ 32%]\n........................................................................ [ 38%]\n........................................................................ [ 43%]\n........................................................................ [ 49%]\n............ss.......................................................... [ 54%]\n........................................................................ [ 60%]\n........................................................................ [ 65%]\n........................................................................ [ 71%]\n........................................................................ [ 76%]\n........................................................................ [ 82%]\n........................................................................ [ 87%]\n........................................................................ [ 93%]\n........................................................................ [ 98%]\n................                                                         [100%]\n1310 passed, 2 skipped in 27.20s",
+    "stderr": ""
+  },
+  "runtime_eval_check": {
+    "label": "runtime-profile-eval",
+    "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 benchmarks/runtime_profile_eval.py",
+    "exit_code": 0,
+    "status": "passed",
+    "summary": "benchmarks/runtime_profile_eval_results.md",
+    "stdout": "benchmarks/runtime_profile_eval_results.json\nbenchmarks/runtime_profile_eval_results.md",
+    "stderr": "StateObserver: degradation=0.75 confidence=0.95"
+  },
+  "structure_check": {
+    "label": "structure-compliance",
+    "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.structure_check --root . --hotspots 5 --max-dependency-upstream 4 --check-material-inventory --report .temp/structure-compliance.json",
+    "exit_code": 0,
+    "status": "passed",
+    "summary": "quality gate findings: 0",
+    "stdout": "AGENTS structure compliance: passed\nrecords: 91\nstructure findings: 0\ndependency edges: 5\ndependency impact nodes: 7\ndependency impact hotspots: 2\n  - 4 direct upstream: Main/MinicodeFrontline/Src/Application/Dto/AppProjection.py\n  - 1 direct upstream: Package/EngineeringStructure/Src/Application/Query/ProductRootProjection.py\nmax dependency direct upstream: 4\nimport dependency edges: 0\nsame-project import dependency edges: 0\nvendor import dependency edges: 0\ncross-project import dependency edges: 0\nimport impact nodes: 0\nimport impact hotspots: 0\nmax import transitive upstream: 0\nimport findings: 0\ndependency findings: 0\ntotal findings: 0\nmaterial inventory gates: 19\nmaterial inventory materials: 9\nmaterial inventory findings: 0\nquality gate findings: 0",
+    "stderr": ""
+  },
+  "smoke_checks": [
+    {
+      "label": "list-workspace-sessions",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.main --list-workspace-sessions",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "Total: 1 session(s)",
+      "stdout": "Saved sessions:\n\n  1. [ee9037a5] 2026-07-17 06:54 - outputs/release_smoke_workspace\n     Messages: 0 | First: (empty)\n     Checkpoints: 1\n     Runtime: phase:verify@2\n\nTotal: 1 session(s)",
+      "stderr": ""
+    },
+    {
+      "label": "inspect-session",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.main --inspect-session latest",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "- [tool:edit_file/success] Patched demo.txt",
+      "stdout": "Session inspect: ee9037a5\n  Created: 2026-07-17 06:54:02\n  Updated: 2026-07-17 06:54:02\n  Workspace: outputs/release_smoke_workspace\n  Messages: 0\n  Transcript entries: 2\n  History entries: 1\n  Skills: (none)\n  MCP servers: (none)\n  Checkpoints: 1\n  Runtime: phase:verify@2\n  Readiness: ready via anthropic-compatible\n  Instructions: 1 layer(s): project-managed\n  Hooks: 1/1 hook(s) enabled\n  Delegation: 1 running, 3 slot(s) open\n  Extensions: 1 extension(s): git-helpers\n\nRecent checkpoints: 1 saved; latest [55f27fe1] demo.txt\n\nInstruction layers:\n  - project-managed [project/managed, present] Prefer verification-first delivery.\n\nHook surface:\n  1/1 hook(s) enabled\n\nDelegation surface:\n  1 running, 3 slot(s) open\n  - lint-worker :: running\n\nExtensions:\n  - git-helpers [project] 1.0.0, enabled :: Local helper bundle\n\nReadiness:\n  ready via anthropic-compatible (ready)\n\nRecent transcript (2 shown):\n  - [runtime:phase] Runtime phase: verify.\n  - [tool:edit_file/success] Patched demo.txt",
+      "stderr": ""
+    },
+    {
+      "label": "replay-session",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.main --replay-session latest",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "- [tool:edit_file/success] Patched demo.txt",
+      "stdout": "Session replay: ee9037a5\n  Workspace: outputs/release_smoke_workspace\n  Created: 2026-07-17 06:54:02\n  Updated: 2026-07-17 06:54:02\n  Runtime: phase:verify@2\n  Checkpoints: 1\n  Readiness: ready via anthropic-compatible\n  Delegation: 1 running, 3 slot(s) open\n\nCheckpoint trail (1 shown):\n  - [55f27fe1] 2026-07-17 06:54:02 :: demo.txt (edit)\n\nInstruction layers:\n  - project-managed [project/managed, present] Prefer verification-first delivery.\n\nExtensions:\n  - git-helpers [project] 1.0.0, enabled :: Local helper bundle\n\nPrompt history (1 shown):\n  1. continue with runtime trace\n\nTranscript timeline (2 shown):\n  - [runtime:phase] Runtime phase: verify.\n  - [tool:edit_file/success] Patched demo.txt",
+      "stderr": ""
+    },
+    {
+      "label": "preview-rewind",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.main --preview-rewind latest",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "Type: edit",
+      "stdout": "Rewind preview for session ee9037a5:\n\nWould restore 1 checkpoint(s) across 1 file(s).\nMode: restore pre-edit file snapshots.\n\nPlanned restores:\n  1. [55f27fe1] 2026-07-17 06:54:02 - outputs/release_smoke_workspace/demo.txt\n     Restores: existing file\n     Type: edit",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-cli",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.main --readiness",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]",
+      "stdout": "Readiness surface:\nreadiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\n\nStatus: blocked\nProvider: unknown\nProvider ready: no\nChannel: unknown channel\nFallback ready: no\nRisk scope: provider-config\nIssues:\n- No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\nGuidance:\n- Add fallbackModels or fallbackModels to enable model failover.\nLocal preflight:\n- primary-provider-config: blocked - unknown channel\n  Action: Run a live provider smoke before release.\n- fallback-coverage: blocked - No configured or default fallback models are available.\n  Action: Configure at least one locally ready fallback model.\n- configured-fallbacks: warning - No explicit fallbackModels are configured.\n  Action: Add fallbackModels for deterministic release behavior.\n- default-fallbacks: warning - No default fallback model is locally viable for this provider.\n  Action: Use explicit fallbackModels when defaults are unavailable.\n- live-smoke-readiness: not-run - Readiness preflight is local-only and does not call the model provider.\n  Action: Run benchmarks/release_readiness.py for the live provider smoke.\nNext actions:\n- Fix the primary provider channel or credentials.\n- Configure at least one locally ready fallback model.\n- Add fallbackModels or fallbackModels to enable model failover.\n- No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\nRepair plan:\n- diagnose-local-readiness: blocked - Inspect local provider and fallback readiness without calling the model provider.\n  Command: minicode-readiness --json --fail-on blocked\n- choose-fallback-provider: manual - Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.\n- preview-openai-fallback: preview - Preview settings for OpenAI fallback.\n- preview-openrouter-fallback: preview - Preview settings for OpenRouter fallback.\n- verify-local-readiness: verify - Verify that local provider config and fallback coverage are no longer blocked.\n  Command: minicode-readiness --json --fail-on blocked\n- verify-release-readiness: verify - Run the release smoke after local readiness is configured.\n  Command: python benchmarks/release_readiness.py --fail-on at-risk\nConfig examples:\n- OpenAI fallback [~/.mini-code/settings.json]: {\"env\": {\"OPENAI_API_KEY\": \"sk-...\", \"OPENAI_BASE_URL\": \"https://api.openai.com\"}, \"fallbackModels\": [\"gpt-4o\", \"gpt-4o-mini\"]}\n- OpenRouter fallback [~/.mini-code/settings.json]: {\"env\": {\"OPENROUTER_API_KEY\": \"[REDACTED]\", \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"}, \"fallbackModels\": [\"openrouter/auto\"]}",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-json",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.main --readiness-json",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "readiness blocked (provider-config)",
+      "stdout": "{\n  \"status\": \"blocked\",\n  \"provider\": \"unknown\",\n  \"provider_ready\": false,\n  \"provider_channel\": \"unknown channel\",\n  \"fallback_ready\": false,\n  \"fallback_candidates\": [],\n  \"viable_fallbacks\": [],\n  \"fallback_guidance\": [\n    \"Add fallbackModels or fallbackModels to enable model failover.\"\n  ],\n  \"risk_scope\": \"provider-config\",\n  \"next_actions\": [\n    \"Fix the primary provider channel or credentials.\",\n    \"Configure at least one locally ready fallback model.\",\n    \"Add fallbackModels or fallbackModels to enable model failover.\",\n    \"No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\"\n  ],\n  \"fallback_config_examples\": [\n    {\n      \"label\": \"OpenAI fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      }\n    },\n    {\n      \"label\": \"OpenRouter fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      }\n    }\n  ],\n  \"repair_plan\": [\n    {\n      \"step\": \"diagnose-local-readiness\",\n      \"status\": \"blocked\",\n      \"action\": \"Inspect local provider and fallback readiness without calling the model provider.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"choose-fallback-provider\",\n      \"status\": \"manual\",\n      \"action\": \"Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.\",\n      \"target_paths\": [\n        \"~/.mini-code/settings.json\"\n      ],\n      \"risk_scope\": \"provider-config\",\n      \"safety\": \"preview-only; no settings are modified\"\n    },\n    {\n      \"step\": \"preview-openai-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenAI fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"preview-openrouter-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenRouter fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"verify-local-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Verify that local provider config and fallback coverage are no longer blocked.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"verify-release-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Run the release smoke after local readiness is configured.\",\n      \"command\": \"python benchmarks/release_readiness.py --fail-on at-risk\",\n      \"safety\": \"may call the live provider\"\n    }\n  ],\n  \"preflight_checks\": [\n    {\n      \"label\": \"primary-provider-config\",\n      \"status\": \"blocked\",\n      \"summary\": \"unknown channel\",\n      \"action\": \"Run a live provider smoke before release.\"\n    },\n    {\n      \"label\": \"fallback-coverage\",\n      \"status\": \"blocked\",\n      \"summary\": \"No configured or default fallback models are available.\",\n      \"action\": \"Configure at least one locally ready fallback model.\"\n    },\n    {\n      \"label\": \"configured-fallbacks\",\n      \"status\": \"warning\",\n      \"summary\": \"No explicit fallbackModels are configured.\",\n      \"action\": \"Add fallbackModels for deterministic release behavior.\"\n    },\n    {\n      \"label\": \"default-fallbacks\",\n      \"status\": \"warning\",\n      \"summary\": \"No default fallback model is locally viable for this provider.\",\n      \"action\": \"Use explicit fallbackModels when defaults are unavailable.\"\n    },\n    {\n      \"label\": \"live-smoke-readiness\",\n      \"status\": \"not-run\",\n      \"summary\": \"Readiness preflight is local-only and does not call the model provider.\",\n      \"action\": \"Run benchmarks/release_readiness.py for the live provider smoke.\"\n    }\n  ],\n  \"issues\": [\n    \"No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\"\n  ],\n  \"summary\": \"readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\"\n}",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-script-json",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.readiness --cwd outputs/release_smoke_workspace --json",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "readiness blocked (provider-config)",
+      "stdout": "{\n  \"status\": \"blocked\",\n  \"provider\": \"unknown\",\n  \"provider_ready\": false,\n  \"provider_channel\": \"unknown channel\",\n  \"fallback_ready\": false,\n  \"fallback_candidates\": [],\n  \"viable_fallbacks\": [],\n  \"fallback_guidance\": [\n    \"Add fallbackModels or fallbackModels to enable model failover.\"\n  ],\n  \"risk_scope\": \"provider-config\",\n  \"next_actions\": [\n    \"Fix the primary provider channel or credentials.\",\n    \"Configure at least one locally ready fallback model.\",\n    \"Add fallbackModels or fallbackModels to enable model failover.\",\n    \"No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\"\n  ],\n  \"fallback_config_examples\": [\n    {\n      \"label\": \"OpenAI fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      }\n    },\n    {\n      \"label\": \"OpenRouter fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      }\n    }\n  ],\n  \"repair_plan\": [\n    {\n      \"step\": \"diagnose-local-readiness\",\n      \"status\": \"blocked\",\n      \"action\": \"Inspect local provider and fallback readiness without calling the model provider.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"choose-fallback-provider\",\n      \"status\": \"manual\",\n      \"action\": \"Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.\",\n      \"target_paths\": [\n        \"~/.mini-code/settings.json\"\n      ],\n      \"risk_scope\": \"provider-config\",\n      \"safety\": \"preview-only; no settings are modified\"\n    },\n    {\n      \"step\": \"preview-openai-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenAI fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"preview-openrouter-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenRouter fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"verify-local-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Verify that local provider config and fallback coverage are no longer blocked.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"verify-release-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Run the release smoke after local readiness is configured.\",\n      \"command\": \"python benchmarks/release_readiness.py --fail-on at-risk\",\n      \"safety\": \"may call the live provider\"\n    }\n  ],\n  \"preflight_checks\": [\n    {\n      \"label\": \"primary-provider-config\",\n      \"status\": \"blocked\",\n      \"summary\": \"unknown channel\",\n      \"action\": \"Run a live provider smoke before release.\"\n    },\n    {\n      \"label\": \"fallback-coverage\",\n      \"status\": \"blocked\",\n      \"summary\": \"No configured or default fallback models are available.\",\n      \"action\": \"Configure at least one locally ready fallback model.\"\n    },\n    {\n      \"label\": \"configured-fallbacks\",\n      \"status\": \"warning\",\n      \"summary\": \"No explicit fallbackModels are configured.\",\n      \"action\": \"Add fallbackModels for deterministic release behavior.\"\n    },\n    {\n      \"label\": \"default-fallbacks\",\n      \"status\": \"warning\",\n      \"summary\": \"No default fallback model is locally viable for this provider.\",\n      \"action\": \"Use explicit fallbackModels when defaults are unavailable.\"\n    },\n    {\n      \"label\": \"live-smoke-readiness\",\n      \"status\": \"not-run\",\n      \"summary\": \"Readiness preflight is local-only and does not call the model provider.\",\n      \"action\": \"Run benchmarks/release_readiness.py for the live provider smoke.\"\n    }\n  ],\n  \"issues\": [\n    \"No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\"\n  ],\n  \"summary\": \"readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\"\n}",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-threshold",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.readiness --cwd outputs/release_smoke_workspace --json --fail-on blocked",
+      "exit_code": 1,
+      "status": "failed",
+      "summary": "readiness blocked (provider-config)",
+      "stdout": "{\n  \"status\": \"blocked\",\n  \"provider\": \"unknown\",\n  \"provider_ready\": false,\n  \"provider_channel\": \"unknown channel\",\n  \"fallback_ready\": false,\n  \"fallback_candidates\": [],\n  \"viable_fallbacks\": [],\n  \"fallback_guidance\": [\n    \"Add fallbackModels or fallbackModels to enable model failover.\"\n  ],\n  \"risk_scope\": \"provider-config\",\n  \"next_actions\": [\n    \"Fix the primary provider channel or credentials.\",\n    \"Configure at least one locally ready fallback model.\",\n    \"Add fallbackModels or fallbackModels to enable model failover.\",\n    \"No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\"\n  ],\n  \"fallback_config_examples\": [\n    {\n      \"label\": \"OpenAI fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      }\n    },\n    {\n      \"label\": \"OpenRouter fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      }\n    }\n  ],\n  \"repair_plan\": [\n    {\n      \"step\": \"diagnose-local-readiness\",\n      \"status\": \"blocked\",\n      \"action\": \"Inspect local provider and fallback readiness without calling the model provider.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"choose-fallback-provider\",\n      \"status\": \"manual\",\n      \"action\": \"Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.\",\n      \"target_paths\": [\n        \"~/.mini-code/settings.json\"\n      ],\n      \"risk_scope\": \"provider-config\",\n      \"safety\": \"preview-only; no settings are modified\"\n    },\n    {\n      \"step\": \"preview-openai-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenAI fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"preview-openrouter-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenRouter fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"verify-local-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Verify that local provider config and fallback coverage are no longer blocked.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"verify-release-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Run the release smoke after local readiness is configured.\",\n      \"command\": \"python benchmarks/release_readiness.py --fail-on at-risk\",\n      \"safety\": \"may call the live provider\"\n    }\n  ],\n  \"preflight_checks\": [\n    {\n      \"label\": \"primary-provider-config\",\n      \"status\": \"blocked\",\n      \"summary\": \"unknown channel\",\n      \"action\": \"Run a live provider smoke before release.\"\n    },\n    {\n      \"label\": \"fallback-coverage\",\n      \"status\": \"blocked\",\n      \"summary\": \"No configured or default fallback models are available.\",\n      \"action\": \"Configure at least one locally ready fallback model.\"\n    },\n    {\n      \"label\": \"configured-fallbacks\",\n      \"status\": \"warning\",\n      \"summary\": \"No explicit fallbackModels are configured.\",\n      \"action\": \"Add fallbackModels for deterministic release behavior.\"\n    },\n    {\n      \"label\": \"default-fallbacks\",\n      \"status\": \"warning\",\n      \"summary\": \"No default fallback model is locally viable for this provider.\",\n      \"action\": \"Use explicit fallbackModels when defaults are unavailable.\"\n    },\n    {\n      \"label\": \"live-smoke-readiness\",\n      \"status\": \"not-run\",\n      \"summary\": \"Readiness preflight is local-only and does not call the model provider.\",\n      \"action\": \"Run benchmarks/release_readiness.py for the live provider smoke.\"\n    }\n  ],\n  \"issues\": [\n    \"No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\"\n  ],\n  \"summary\": \"readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\"\n}",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-examples",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.readiness --cwd outputs/release_smoke_workspace --examples --examples-out .temp/readiness-fallback-examples.json --fail-on blocked",
+      "exit_code": 1,
+      "status": "failed",
+      "summary": "fallback examples 2 (provider-config)",
+      "stdout": "{\n  \"summary\": \"readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\",\n  \"status\": \"blocked\",\n  \"risk_scope\": \"provider-config\",\n  \"fallback_config_examples\": [\n    {\n      \"label\": \"OpenAI fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      }\n    },\n    {\n      \"label\": \"OpenRouter fallback\",\n      \"path\": \"~/.mini-code/settings.json\",\n      \"settings\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      }\n    }\n  ]\n}",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-doctor",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.readiness --cwd outputs/release_smoke_workspace --doctor --doctor-out .temp/readiness-doctor.md --fail-on blocked",
+      "exit_code": 1,
+      "status": "failed",
+      "summary": "doctor blocked (provider-config)",
+      "stdout": "# MiniCode Readiness Doctor\n\n- Workspace: outputs/release_smoke_workspace\n- Status: blocked\n- Risk scope: provider-config\n- Provider: unknown\n- Provider ready: no\n- Channel: unknown channel\n- Fallback ready: no\n- Summary: readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\n\n## Issues\n\n- No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\n\n## Local Preflight\n\n- `primary-provider-config`: blocked - unknown channel\n  Action: Run a live provider smoke before release.\n- `fallback-coverage`: blocked - No configured or default fallback models are available.\n  Action: Configure at least one locally ready fallback model.\n- `configured-fallbacks`: warning - No explicit fallbackModels are configured.\n  Action: Add fallbackModels for deterministic release behavior.\n- `default-fallbacks`: warning - No default fallback model is locally viable for this provider.\n  Action: Use explicit fallbackModels when defaults are unavailable.\n- `live-smoke-readiness`: not-run - Readiness preflight is local-only and does not call the model provider.\n  Action: Run benchmarks/release_readiness.py for the live provider smoke.\n\n## Next Actions\n\n- Fix the primary provider channel or credentials.\n- Configure at least one locally ready fallback model.\n- Add fallbackModels or fallbackModels to enable model failover.\n- No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\n\n## Repair Plan\n\n- `diagnose-local-readiness`: blocked - Inspect local provider and fallback readiness without calling the model provider.\n  Command: `minicode-readiness --json --fail-on blocked`\n  Safety: read-only\n- `choose-fallback-provider`: manual - Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.\n  Safety: preview-only; no settings are modified\n- `preview-openai-fallback`: preview - Preview settings for OpenAI fallback.\n  Safety: contains placeholders only; do not commit real credentials\n- `preview-openrouter-fallback`: preview - Preview settings for OpenRouter fallback.\n  Safety: contains placeholders only; do not commit real credentials\n- `verify-local-readiness`: verify - Verify that local provider config and fallback coverage are no longer blocked.\n  Command: `minicode-readiness --json --fail-on blocked`\n  Safety: read-only\n- `verify-release-readiness`: verify - Run the release smoke after local readiness is configured.\n  Command: `python benchmarks/release_readiness.py --fail-on at-risk`\n  Safety: may call the live provider\n\n## Fallback Config Examples\n\n### OpenAI fallback\nTarget settings path: `~/.mini-code/settings.json`\n\n```json\n{\n  \"env\": {\n    \"OPENAI_API_KEY\": \"sk-...\",\n    \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n  },\n  \"fallbackModels\": [\n    \"gpt-4o\",\n    \"gpt-4o-mini\"\n  ]\n}\n```\n\n### OpenRouter fallback\nTarget settings path: `~/.mini-code/settings.json`\n\n```json\n{\n  \"env\": {\n    \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n    \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n  },\n  \"fallbackModels\": [\n    \"openrouter/auto\"\n  ]\n}\n```\n\n\n## Safety\n\n- This report is read-only.\n- It does not write credentials.\n- It does not modify MiniCode settings.",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-repair-plan",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.readiness --cwd outputs/release_smoke_workspace --repair-plan --repair-plan-out .temp/readiness-repair-plan.json --fail-on blocked",
+      "exit_code": 1,
+      "status": "failed",
+      "summary": "repair plan 6 (provider-config)",
+      "stdout": "{\n  \"summary\": \"readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\",\n  \"status\": \"blocked\",\n  \"risk_scope\": \"provider-config\",\n  \"repair_plan\": [\n    {\n      \"step\": \"diagnose-local-readiness\",\n      \"status\": \"blocked\",\n      \"action\": \"Inspect local provider and fallback readiness without calling the model provider.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"choose-fallback-provider\",\n      \"status\": \"manual\",\n      \"action\": \"Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.\",\n      \"target_paths\": [\n        \"~/.mini-code/settings.json\"\n      ],\n      \"risk_scope\": \"provider-config\",\n      \"safety\": \"preview-only; no settings are modified\"\n    },\n    {\n      \"step\": \"preview-openai-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenAI fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"preview-openrouter-fallback\",\n      \"status\": \"preview\",\n      \"action\": \"Preview settings for OpenRouter fallback.\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"settings_preview\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      },\n      \"safety\": \"contains placeholders only; do not commit real credentials\"\n    },\n    {\n      \"step\": \"verify-local-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Verify that local provider config and fallback coverage are no longer blocked.\",\n      \"command\": \"minicode-readiness --json --fail-on blocked\",\n      \"safety\": \"read-only\"\n    },\n    {\n      \"step\": \"verify-release-readiness\",\n      \"status\": \"verify\",\n      \"action\": \"Run the release smoke after local readiness is configured.\",\n      \"command\": \"python benchmarks/release_readiness.py --fail-on at-risk\",\n      \"safety\": \"may call the live provider\"\n    }\n  ]\n}",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-patch-preview",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.readiness --cwd outputs/release_smoke_workspace --patch-preview --patch-preview-out .temp/readiness-fallback-patch-preview.json --fail-on blocked",
+      "exit_code": 1,
+      "status": "failed",
+      "summary": "patch preview 2 (provider-config)",
+      "stdout": "{\n  \"summary\": \"readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\",\n  \"status\": \"blocked\",\n  \"risk_scope\": \"provider-config\",\n  \"fallback_settings_patch_preview\": [\n    {\n      \"label\": \"OpenAI fallback\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"merge_patch\": {\n        \"fallbackModels\": [\n          \"gpt-4o\",\n          \"gpt-4o-mini\"\n        ],\n        \"env\": {\n          \"OPENAI_API_KEY\": \"sk-...\",\n          \"OPENAI_BASE_URL\": \"https://api.openai.com\"\n        }\n      },\n      \"safety\": \"preview-only; no settings are modified\",\n      \"apply_notes\": [\n        \"Review the selected provider patch before applying it.\",\n        \"Replace placeholder credentials locally.\",\n        \"Merge only one selected patch into the target settings file.\",\n        \"Run minicode-readiness --json --fail-on blocked after applying.\"\n      ]\n    },\n    {\n      \"label\": \"OpenRouter fallback\",\n      \"target_path\": \"~/.mini-code/settings.json\",\n      \"merge_patch\": {\n        \"fallbackModels\": [\n          \"openrouter/auto\"\n        ],\n        \"env\": {\n          \"OPENROUTER_API_KEY\": \"[REDACTED]\",\n          \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"\n        }\n      },\n      \"safety\": \"preview-only; no settings are modified\",\n      \"apply_notes\": [\n        \"Review the selected provider patch before applying it.\",\n        \"Replace placeholder credentials locally.\",\n        \"Merge only one selected patch into the target settings file.\",\n        \"Run minicode-readiness --json --fail-on blocked after applying.\"\n      ]\n    }\n  ]\n}",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-bundle-generate",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.readiness --cwd outputs/release_smoke_workspace --bundle-out .temp/readiness-bundle --fail-on blocked",
+      "exit_code": 1,
+      "status": "failed",
+      "summary": "- repair_plan_json: .temp/readiness-bundle/readiness-repair-plan.json",
+      "stdout": "Readiness surface:\nreadiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]\n\nStatus: blocked\nProvider: unknown\nProvider ready: no\nChannel: unknown channel\nFallback ready: no\nRisk scope: provider-config\nIssues:\n- No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\nGuidance:\n- Add fallbackModels or fallbackModels to enable model failover.\nLocal preflight:\n- `primary-provider-config`: blocked - unknown channel\n  Action: Run a live provider smoke before release.\n- `fallback-coverage`: blocked - No configured or default fallback models are available.\n  Action: Configure at least one locally ready fallback model.\n- `configured-fallbacks`: warning - No explicit fallbackModels are configured.\n  Action: Add fallbackModels for deterministic release behavior.\n- `default-fallbacks`: warning - No default fallback model is locally viable for this provider.\n  Action: Use explicit fallbackModels when defaults are unavailable.\n- `live-smoke-readiness`: not-run - Readiness preflight is local-only and does not call the model provider.\n  Action: Run benchmarks/release_readiness.py for the live provider smoke.\nNext actions:\n- Fix the primary provider channel or credentials.\n- Configure at least one locally ready fallback model.\n- Add fallbackModels or fallbackModels to enable model failover.\n- No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\nRepair plan:\n- `diagnose-local-readiness`: blocked - Inspect local provider and fallback readiness without calling the model provider.\n  Command: `minicode-readiness --json --fail-on blocked`\n  Safety: read-only\n- `choose-fallback-provider`: manual - Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.\n  Safety: preview-only; no settings are modified\n- `preview-openai-fallback`: preview - Preview settings for OpenAI fallback.\n  Safety: contains placeholders only; do not commit real credentials\n- `preview-openrouter-fallback`: preview - Preview settings for OpenRouter fallback.\n  Safety: contains placeholders only; do not commit real credentials\n- `verify-local-readiness`: verify - Verify that local provider config and fallback coverage are no longer blocked.\n  Command: `minicode-readiness --json --fail-on blocked`\n  Safety: read-only\n- `verify-release-readiness`: verify - Run the release smoke after local readiness is configured.\n  Command: `python benchmarks/release_readiness.py --fail-on at-risk`\n  Safety: may call the live provider\nConfig examples:\n- OpenAI fallback [~/.mini-code/settings.json]: {\"env\": {\"OPENAI_API_KEY\": \"sk-...\", \"OPENAI_BASE_URL\": \"https://api.openai.com\"}, \"fallbackModels\": [\"gpt-4o\", \"gpt-4o-mini\"]}\n- OpenRouter fallback [~/.mini-code/settings.json]: {\"env\": {\"OPENROUTER_API_KEY\": \"[REDACTED]\", \"OPENROUTER_BASE_URL\": \"https://openrouter.ai/api\"}, \"fallbackModels\": [\"openrouter/auto\"]}\nBundle artifacts:\n- artifact_manifest_json: .temp/readiness-bundle/readiness-artifact-manifest.json\n- doctor_markdown: .temp/readiness-bundle/readiness-doctor.md\n- fallback_examples_json: .temp/readiness-bundle/readiness-fallback-examples.json\n- fallback_simulations_json: .temp/readiness-bundle/readiness-fallback-simulations.json\n- patch_preview_json: .temp/readiness-bundle/readiness-fallback-patch-preview.json\n- repair_plan_json: .temp/readiness-bundle/readiness-repair-plan.json",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-artifacts",
+      "command": "validate readiness artifacts",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "readiness artifacts valid: 2 fallback example(s), 6 repair step(s), 2 patch preview(s)",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "fallback-patch-preview",
+      "command": "validate fallback patch preview",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "fallback patch preview valid: 2 preview(s) (provider-config)",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "fallback-simulation",
+      "command": "validate fallback simulations",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "fallback simulations valid: 2 simulation(s)",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "fallback-switch-smoke",
+      "command": "validate local fallback switch",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "fallback switch smoke valid: claude-sonnet-4-20250514 -> gpt-4o",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "readiness-bundle",
+      "command": "validate readiness bundle",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "readiness bundle valid: 6 artifact(s)",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "headless-trace",
+      "command": "validate headless trace",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "headless trace valid: exit_code=1 readiness=blocked repair_steps=6",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "artifact-redaction",
+      "command": "validate artifact redaction",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "artifact redaction valid: 7 artifact(s)",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "fallback-evidence",
+      "command": "validate fallback evidence",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "fallback evidence valid: provider=at-risk fallback=not-ready repair_steps=6",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "structure-compliance-artifact",
+      "command": "validate structure compliance artifact",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "structure compliance artifact valid: focused_gates=19 materials=9",
+      "stdout": "",
+      "stderr": ""
+    },
+    {
+      "label": "artifact-manifest",
+      "command": "validate artifact manifest",
+      "exit_code": 0,
+      "status": "passed",
+      "summary": "artifact manifest valid: 10 artifact(s)",
+      "stdout": "",
+      "stderr": ""
+    }
+  ],
+  "provider_diagnostics": [
+    {
+      "label": "headless-smoke",
+      "outcome": "provider_channel_unavailable",
+      "command": "~/.cache/codex-runtimes/codex-primary-runtime/dependencies/python/bin/python3 -m minicode.headless Reply with exactly OK.",
+      "exit_code": 1,
+      "summary": "2026-07-17 14:57:56,583 [WARNING] minicode.config: Project .mcp.json found at .mcp.json but NOT loaded (security: use --trust-project-mcp or MINI_CODE_TRUST_PROJECT_MCP=1).",
+      "stdout": "",
+      "stderr": "2026-07-17 14:57:56,583 [WARNING] minicode.config: Project .mcp.json found at .mcp.json but NOT loaded (security: use --trust-project-mcp or MINI_CODE_TRUST_PROJECT_MCP=1).\n2026-07-17 14:57:56,583 [ERROR] minicode.headless: Config load failed: No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\nTraceback (most recent call last):\n  File \"minicode/headless.py\", line 178, in run_headless\n    runtime = load_runtime_config(cwd)\n              ^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"minicode/config.py\", line 608, in load_runtime_config\n    raise RuntimeError(\"No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\")\nRuntimeError: No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\n2026-07-17 14:57:56,585 [WARNING] minicode.config: Project .mcp.json found at .mcp.json but NOT loaded (security: use --trust-project-mcp or MINI_CODE_TRUST_PROJECT_MCP=1).\nConfig error: No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.\n",
+      "risk_scope": "provider-config",
+      "error_code": "",
+      "request_id": "",
+      "failure_category": "configuration",
+      "retryable": false,
+      "ownership": "local-configuration",
+      "recovery_action": "Repair model-to-provider channel configuration.",
+      "readiness_status": "blocked",
+      "repair_step_count": 6,
+      "trace_artifact": ".temp/headless-provider-smoke-trace.json",
+      "guidance": [
+        "Verify the selected model group and provider channel configuration.",
+        "Add a viable fallback provider/model or credentials for the configured channel.",
+        "Inspect headless trace artifact: .temp/headless-provider-smoke-trace.json"
+      ]
+    }
+  ],
+  "runtime_profile_artifacts": {
+    "json": "benchmarks/runtime_profile_eval_results.json",
+    "markdown": "benchmarks/runtime_profile_eval_results.md",
+    "headless_trace": ".temp/headless-provider-smoke-trace.json"
+  },
+  "readiness_artifacts": {
+    "fallback_examples_json": ".temp/readiness-fallback-examples.json",
+    "doctor_markdown": ".temp/readiness-doctor.md",
+    "repair_plan_json": ".temp/readiness-repair-plan.json",
+    "patch_preview_json": ".temp/readiness-fallback-patch-preview.json",
+    "fallback_simulations_json": ".temp/readiness-bundle/readiness-fallback-simulations.json",
+    "bundle_directory": ".temp/readiness-bundle",
+    "bundle_manifest_json": ".temp/readiness-bundle/readiness-artifact-manifest.json"
+  },
+  "artifact_manifest": [
+    {
+      "label": "bundle_manifest_json",
+      "path": ".temp/readiness-bundle/readiness-artifact-manifest.json",
+      "exists": true,
+      "size_bytes": 1346,
+      "sha256": "e1756d9f9d9747e2cc36fe19cf5f870a36891f418b52b7411cf240b1dcd97dae"
+    },
+    {
+      "label": "doctor_markdown",
+      "path": ".temp/readiness-doctor.md",
+      "exists": true,
+      "size_bytes": 3277,
+      "sha256": "1cee8e1f80c8d2a267a20297aaca4e4c98fa0e517b17a32d70daf58ed2bb6eaa"
+    },
+    {
+      "label": "fallback_examples_json",
+      "path": ".temp/readiness-fallback-examples.json",
+      "exists": true,
+      "size_bytes": 882,
+      "sha256": "f3664ba7de4a53f32be1ca42223f3a5096d0ee27f234e4c6a308d65f2e7427fe"
+    },
+    {
+      "label": "fallback_simulations_json",
+      "path": ".temp/readiness-bundle/readiness-fallback-simulations.json",
+      "exists": true,
+      "size_bytes": 875,
+      "sha256": "1355d9236755f6dd145b8d78fc48db7bc3ae9b31e157c6dc36270ed3bfd60735"
+    },
+    {
+      "label": "headless_trace",
+      "path": ".temp/headless-provider-smoke-trace.json",
+      "exists": true,
+      "size_bytes": 7935,
+      "sha256": "1bfddc2dd3f9ed4b5f499a14c2268b65de4e15efee6a7dfcf3e09fcf3cd61531"
+    },
+    {
+      "label": "json",
+      "path": "benchmarks/runtime_profile_eval_results.json",
+      "exists": true,
+      "size_bytes": 6289,
+      "sha256": "12acb423538923629e186a507136d631a7e50e4d52ffeae044ed79c1157041f6"
+    },
+    {
+      "label": "markdown",
+      "path": "benchmarks/runtime_profile_eval_results.md",
+      "exists": true,
+      "size_bytes": 2373,
+      "sha256": "5a41364c9693f42d20c4009a9ad10920883f23ad5ced8abadd5416d8b68f2121"
+    },
+    {
+      "label": "patch_preview_json",
+      "path": ".temp/readiness-fallback-patch-preview.json",
+      "exists": true,
+      "size_bytes": 1617,
+      "sha256": "87f7c97f4566dcf156e3dc1660992852fd22f3b295fe300c2c63c082aea96a0c"
+    },
+    {
+      "label": "repair_plan_json",
+      "path": ".temp/readiness-repair-plan.json",
+      "exists": true,
+      "size_bytes": 2482,
+      "sha256": "5d9d0551e73ca6abe1f027b41de4461995c9ab4089014250fa97163eb9ce28a6"
+    },
+    {
+      "label": "structure_compliance",
+      "path": ".temp/structure-compliance.json",
+      "exists": true,
+      "size_bytes": 98320,
+      "sha256": "a0d95a4c996e1a71b6c3da740ba96ff660f6a3502addfcf5894ad02ac5633cea"
+    }
+  ],
+  "readiness_report": {
+    "status": "blocked",
+    "provider": "unknown",
+    "provider_ready": false,
+    "provider_channel": "unknown channel",
+    "fallback_ready": false,
+    "fallback_candidates": [],
+    "viable_fallbacks": [],
+    "fallback_guidance": [
+      "Add fallbackModels or fallbackModels to enable model failover."
+    ],
+    "risk_scope": "provider-config",
+    "next_actions": [
+      "Fix the primary provider channel or credentials.",
+      "Configure at least one locally ready fallback model.",
+      "Add fallbackModels or fallbackModels to enable model failover.",
+      "No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL."
+    ],
+    "fallback_config_examples": [
+      {
+        "label": "OpenAI fallback",
+        "path": "~/.mini-code/settings.json",
+        "settings": {
+          "fallbackModels": [
+            "gpt-4o",
+            "gpt-4o-mini"
+          ],
+          "env": {
+            "OPENAI_API_KEY": "sk-...",
+            "OPENAI_BASE_URL": "https://api.openai.com"
+          }
+        }
+      },
+      {
+        "label": "OpenRouter fallback",
+        "path": "~/.mini-code/settings.json",
+        "settings": {
+          "fallbackModels": [
+            "openrouter/auto"
+          ],
+          "env": {
+            "OPENROUTER_API_KEY": "sk-or-...",
+            "OPENROUTER_BASE_URL": "https://openrouter.ai/api"
+          }
+        }
+      }
+    ],
+    "repair_plan": [
+      {
+        "step": "diagnose-local-readiness",
+        "status": "blocked",
+        "action": "Inspect local provider and fallback readiness without calling the model provider.",
+        "command": "minicode-readiness --json --fail-on blocked",
+        "safety": "read-only"
+      },
+      {
+        "step": "choose-fallback-provider",
+        "status": "manual",
+        "action": "Choose one fallback provider, replace placeholder credentials locally, and merge only the selected settings into the target settings file.",
+        "target_paths": [
+          "~/.mini-code/settings.json"
+        ],
+        "risk_scope": "provider-config",
+        "safety": "preview-only; no settings are modified"
+      },
+      {
+        "step": "preview-openai-fallback",
+        "status": "preview",
+        "action": "Preview settings for OpenAI fallback.",
+        "target_path": "~/.mini-code/settings.json",
+        "settings_preview": {
+          "fallbackModels": [
+            "gpt-4o",
+            "gpt-4o-mini"
+          ],
+          "env": {
+            "OPENAI_API_KEY": "sk-...",
+            "OPENAI_BASE_URL": "https://api.openai.com"
+          }
+        },
+        "safety": "contains placeholders only; do not commit real credentials"
+      },
+      {
+        "step": "preview-openrouter-fallback",
+        "status": "preview",
+        "action": "Preview settings for OpenRouter fallback.",
+        "target_path": "~/.mini-code/settings.json",
+        "settings_preview": {
+          "fallbackModels": [
+            "openrouter/auto"
+          ],
+          "env": {
+            "OPENROUTER_API_KEY": "sk-or-...",
+            "OPENROUTER_BASE_URL": "https://openrouter.ai/api"
+          }
+        },
+        "safety": "contains placeholders only; do not commit real credentials"
+      },
+      {
+        "step": "verify-local-readiness",
+        "status": "verify",
+        "action": "Verify that local provider config and fallback coverage are no longer blocked.",
+        "command": "minicode-readiness --json --fail-on blocked",
+        "safety": "read-only"
+      },
+      {
+        "step": "verify-release-readiness",
+        "status": "verify",
+        "action": "Run the release smoke after local readiness is configured.",
+        "command": "python benchmarks/release_readiness.py --fail-on at-risk",
+        "safety": "may call the live provider"
+      }
+    ],
+    "preflight_checks": [
+      {
+        "label": "primary-provider-config",
+        "status": "blocked",
+        "summary": "unknown channel",
+        "action": "Run a live provider smoke before release."
+      },
+      {
+        "label": "fallback-coverage",
+        "status": "blocked",
+        "summary": "No configured or default fallback models are available.",
+        "action": "Configure at least one locally ready fallback model."
+      },
+      {
+        "label": "configured-fallbacks",
+        "status": "warning",
+        "summary": "No explicit fallbackModels are configured.",
+        "action": "Add fallbackModels for deterministic release behavior."
+      },
+      {
+        "label": "default-fallbacks",
+        "status": "warning",
+        "summary": "No default fallback model is locally viable for this provider.",
+        "action": "Use explicit fallbackModels when defaults are unavailable."
+      },
+      {
+        "label": "live-smoke-readiness",
+        "status": "not-run",
+        "summary": "Readiness preflight is local-only and does not call the model provider.",
+        "action": "Run benchmarks/release_readiness.py for the live provider smoke."
+      }
+    ],
+    "issues": [
+      "No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL."
+    ],
+    "summary": "readiness: blocked (unknown) [No model configured. Set ~/.mini-code/settings.json or ANTHROPIC_MODEL.]"
+  }
+}

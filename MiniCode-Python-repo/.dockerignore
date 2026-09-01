@@ -1,0 +1,50 @@
+# =============================================================================
+# MiniCode Python — Docker ignore
+# =============================================================================
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+.temp/
+
+# Test and dev files
+tests/
+benchmarks/
+docs/
+*.md
+!README.md
+
+# IDE and editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Session / log / temp data
+session-log.txt
+*.log
+*.tmp
+.env
+.mini-code/
+.mini-code-memory/
+
+# Git
+.git/
+.gitignore
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db

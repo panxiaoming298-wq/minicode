@@ -1,0 +1,10 @@
+node_modules/
+dist/
+playwright-report/
+test-results/
+artifacts/
+.finesse/
+*.tsbuildinfo
+.env
+.env.*
+!.env.example

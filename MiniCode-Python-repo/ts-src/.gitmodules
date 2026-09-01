@@ -1,0 +1,9 @@
+<<<<<<< HEAD
+[submodule "py-src"]
+	path = py-src
+	url = https://github.com/QUSETIONS/MiniCode-Python.git
+=======
+[submodule "external/MiniCode-rs"]
+	path = external/MiniCode-rs
+	url = https://github.com/harkerhand/MiniCode-rs.git
+>>>>>>> 3d862c34550662848aad1401374dba20e7542fae

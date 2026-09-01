@@ -1,0 +1,93 @@
+# =============================================================================
+# MiniCode Python — Docker Compose
+# =============================================================================
+# Supports the two runtime modes implemented by the current package:
+#   1. cli       — Interactive terminal session (default)
+#   2. headless  — One-shot non-interactive execution
+#
+# Usage:
+#   docker compose run --rm cli
+#   docker compose run --rm -e DEEPSEEK_API_KEY=sk-... cli
+#   docker compose run --rm headless "帮我分析这个项目的结构"
+# =============================================================================
+
+services:
+  # ===========================================================================
+  # Mode 1: Interactive CLI — the classic MiniCode experience
+  # ===========================================================================
+  cli:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: minicode-py:latest
+    container_name: minicode-cli
+    stdin_open: true        # docker -i
+    tty: true               # docker -t
+    init: true              # tini for proper signal handling
+    environment:
+      - MINI_CODE_PROVIDER=${MINI_CODE_PROVIDER:-}
+      - MINI_CODE_MODEL=${MINI_CODE_MODEL:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-}
+      - DEEPSEEK_THINKING_MODE=${DEEPSEEK_THINKING_MODE:-}
+      - DEEPSEEK_REASONING_EFFORT=${DEEPSEEK_REASONING_EFFORT:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-}
+      - CUSTOM_API_KEY=${CUSTOM_API_KEY:-}
+      - CUSTOM_API_BASE_URL=${CUSTOM_API_BASE_URL:-}
+      - MINI_CODE_LOG_LEVEL=${MINI_CODE_LOG_LEVEL:-WARNING}
+    volumes:
+      # Mount workspace (current directory by default)
+      - ${MINI_CODE_WORKSPACE:-.}:/workspace
+      # Persist user-level config, memory, skills across containers
+      - minicode-home:/home/minicode/.mini-code
+    working_dir: /workspace
+
+  # ===========================================================================
+  # Mode 2: Headless — One-shot non-interactive execution
+  # ===========================================================================
+  headless:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: minicode-py:latest
+    container_name: minicode-headless
+    init: true
+    entrypoint: ["python", "-m", "minicode.headless"]
+    environment:
+      - MINI_CODE_PROVIDER=${MINI_CODE_PROVIDER:-}
+      - MINI_CODE_MODEL=${MINI_CODE_MODEL:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - ANTHROPIC_AUTH_TOKEN=${ANTHROPIC_AUTH_TOKEN:-}
+      - ANTHROPIC_BASE_URL=${ANTHROPIC_BASE_URL:-}
+      - ANTHROPIC_MODEL=${ANTHROPIC_MODEL:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-}
+      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY:-}
+      - DEEPSEEK_BASE_URL=${DEEPSEEK_BASE_URL:-}
+      - DEEPSEEK_MODEL=${DEEPSEEK_MODEL:-}
+      - DEEPSEEK_THINKING_MODE=${DEEPSEEK_THINKING_MODE:-}
+      - DEEPSEEK_REASONING_EFFORT=${DEEPSEEK_REASONING_EFFORT:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - OPENROUTER_BASE_URL=${OPENROUTER_BASE_URL:-}
+      - CUSTOM_API_KEY=${CUSTOM_API_KEY:-}
+      - CUSTOM_API_BASE_URL=${CUSTOM_API_BASE_URL:-}
+      - MINI_CODE_LOG_LEVEL=${MINI_CODE_LOG_LEVEL:-WARNING}
+    volumes:
+      - ${MINI_CODE_WORKSPACE:-.}:/workspace
+      - minicode-home:/home/minicode/.mini-code
+    working_dir: /workspace
+
+# =============================================================================
+# Named volumes — persist config, memory, and skills across containers
+# =============================================================================
+volumes:
+  minicode-home:
+    driver: local
