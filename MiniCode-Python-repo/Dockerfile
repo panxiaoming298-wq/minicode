@@ -21,6 +21,7 @@
 FROM python:3.12-slim AS builder
 
 WORKDIR /build
+ARG MINICODE_INSTALL_TARGET=.
 
 # Copy package source
 COPY pyproject.toml README.md ./
@@ -29,9 +30,10 @@ COPY Main/ ./Main/
 COPY Package/ ./Package/
 
 # Install into a clean venv (keeps final image small)
-RUN python -m venv /opt/minicode-venv && \
-    /opt/minicode-venv/bin/pip install --no-cache-dir --upgrade pip && \
-    /opt/minicode-venv/bin/pip install --no-cache-dir .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    python -m venv /opt/minicode-venv && \
+    /opt/minicode-venv/bin/pip install --upgrade pip && \
+    /opt/minicode-venv/bin/pip install "${MINICODE_INSTALL_TARGET}"
 
 # ---------------------------------------------------------------------------
 # Stage 2: Runtime — minimal image with only the venv
@@ -53,7 +55,14 @@ COPY --from=builder /opt/minicode-venv /opt/minicode-venv
 ENV PATH="/opt/minicode-venv/bin:${PATH}"
 
 # Create persistent data directories
-RUN mkdir -p /home/minicode/.mini-code/memory /home/minicode/.mini-code/skills && \
+RUN mkdir -p \
+        /home/minicode/.mini-code/memory \
+        /home/minicode/.mini-code/memory-v2/artifacts \
+        /home/minicode/.mini-code/memory-v2/runtime-artifacts \
+        /home/minicode/.mini-code/memory-v2/spool \
+        /home/minicode/.mini-code/memory-v2/backups \
+        /home/minicode/.mini-code/models/fastembed \
+        /home/minicode/.mini-code/skills && \
     chown -R minicode:minicode /home/minicode/.mini-code
 
 # Default workspace

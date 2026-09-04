@@ -71,6 +71,7 @@ tmp_*.log
 .omx/
 .playwright-mcp/
 .mini-code-memory/*.json
+.mini-code-memory-v2/
 
 # MiniCode specific
 .mini-code/

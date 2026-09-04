@@ -11,11 +11,24 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "hypothesis>=6.0.0", "setuptools>=68"]
+dev = [
+    "pytest>=8.0.0",
+    "hypothesis>=6.0.0",
+    "httpx2>=2.0.0,<3.0.0",
+    "setuptools>=68",
+]
 web = [
     "fastapi>=0.116.0,<1.0.0",
     "httpx>=0.28.0,<1.0.0",
     "uvicorn[standard]>=0.35.0,<1.0.0",
+]
+memory = [
+    "boto3>=1.40.0,<2.0.0",
+    "cryptography>=45.0.0,<47.0.0",
+    "fastembed==0.8.0",
+    "psycopg[binary]>=3.2.0,<4.0.0",
+    "pymilvus>=2.6.0,<2.7.0",
+    "tiktoken>=0.11.0,<1.0.0",
 ]
 
 [project.scripts]
@@ -25,6 +38,10 @@ minicode-readiness = "minicode.readiness:main"
 minicode-structure-check = "minicode.structure_check:main"
 minicode-provider-smoke = "minicode.provider_smoke:main"
 minicode-web = "minicode.web_api:main"
+minicode-memory = "minicode.paged_memory.admin:main"
+
+[tool.setuptools.package-data]
+"minicode.paged_memory" = ["sql/*.sql"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
