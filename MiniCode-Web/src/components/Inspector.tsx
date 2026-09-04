@@ -1,6 +1,4 @@
 import {
-  Activity,
-  Braces,
   Check,
   ChevronDown,
   ChevronRight,
@@ -11,7 +9,6 @@ import {
   FileCode2,
   Folder,
   GitBranch,
-  KeyRound,
   LoaderCircle,
   MessageSquare,
   PanelRight,
@@ -20,16 +17,21 @@ import {
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 import { api } from "../api/client";
+import { CapabilityPanel } from "./CapabilityPanel";
+import { ContextPanel } from "./ContextPanel";
+import { RuntimePanel } from "./RuntimePanel";
 import type {
+  CapabilitySnapshot,
   RunEvent,
   RunStatus,
+  SessionInspect,
   SettingsView,
   WorkspaceEntry,
   WorkspaceFileContent,
   WorkspaceStatus,
 } from "../types";
 
-type InspectorTab = "files" | "changes" | "run" | "context";
+type InspectorTab = "files" | "changes" | "run" | "capabilities" | "context";
 type ChangeView = "diff" | "source";
 
 interface InspectorProps {
@@ -39,6 +41,10 @@ interface InspectorProps {
   runStatus: RunStatus;
   events: RunEvent[];
   settings: SettingsView | null;
+  capabilities: CapabilitySnapshot | null;
+  capabilitiesLoading: boolean;
+  capabilitiesError: string;
+  sessionInspect: SessionInspect | null;
   diff: string;
   selectedFile: string | null;
   onSelectFile: (path: string) => void;
@@ -55,12 +61,6 @@ interface FileTreeLevelProps {
   selectedSourceFile: string | null;
   onToggleDirectory: (path: string) => void;
   onSelectSourceFile: (path: string) => void;
-}
-
-function statusIcon(status: string) {
-  if (status === "running" || status === "stopping") return <LoaderCircle size={15} className="spin" />;
-  if (status === "failed") return <CircleAlert size={15} />;
-  return <Check size={15} />;
 }
 
 function fileLabel(status: string): string {
@@ -222,6 +222,10 @@ export function Inspector({
   runStatus,
   events,
   settings,
+  capabilities,
+  capabilitiesLoading,
+  capabilitiesError,
+  sessionInspect,
   diff,
   selectedFile,
   onSelectFile,
@@ -310,10 +314,6 @@ export function Inspector({
     if (!(path in entriesByDirectory)) void loadDirectory(path);
   }
 
-  const visibleEvents = events.filter((event) =>
-    ["run_started", "tool_start", "tool_result", "approval_requested", "approval_resolved", "error", "status"].includes(event.kind),
-  );
-
   return (
     <aside id="workspace-inspector" className={`inspector ${open ? "is-open" : ""}`} aria-label="文件与任务检查器" aria-hidden={!open} inert={!open}>
       <header className="inspector-header">
@@ -321,6 +321,7 @@ export function Inspector({
           <button role="tab" aria-selected={tab === "files"} onClick={() => setTab("files")}>文件</button>
           <button role="tab" aria-selected={tab === "changes"} onClick={() => setTab("changes")}>变更</button>
           <button role="tab" aria-selected={tab === "run"} onClick={() => setTab("run")}>运行</button>
+          <button role="tab" aria-selected={tab === "capabilities"} onClick={() => setTab("capabilities")}>能力</button>
           <button role="tab" aria-selected={tab === "context"} onClick={() => setTab("context")}>上下文</button>
         </div>
         {open && (
@@ -414,61 +415,26 @@ export function Inspector({
       )}
 
       {tab === "run" && (
-        <div className="inspector-body run-panel">
-          <div className={`run-overview state-${runStatus}`}>
-            {statusIcon(runStatus)}
-            <div><strong>{runStatus === "running" ? "任务正在运行" : "任务状态"}</strong><span>{visibleEvents.length} 条可检查事件</span></div>
-          </div>
-          {visibleEvents.length === 0 ? (
-            <div className="inspector-empty"><Activity size={19} /><p>任务启动后，工具和审批记录会出现在这里。</p></div>
-          ) : (
-            <ol className="event-list">
-              {visibleEvents.map((event) => (
-                <li key={event.sequence}>
-                  <i />
-                  <div>
-                    <strong>
-                      {event.kind === "tool_start" ? `调用 ${event.toolName}`
-                        : event.kind === "tool_result" ? `${event.toolName} ${event.isError ? "失败" : "完成"}`
-                          : event.kind === "approval_requested" ? "请求审批"
-                            : event.kind === "approval_resolved" ? "审批已处理"
-                              : event.kind === "error" ? "执行错误"
-                                : event.kind === "run_started" ? "模型已连接"
-                                  : event.content || event.status || "状态更新"}
-                    </strong>
-                    <span>
-                      {event.kind === "run_started"
-                        ? `${event.provider} / ${event.model}${event.mock ? "（演示）" : ""}`
-                        : event.durationMs
-                          ? `${event.durationMs} ms`
-                          : new Intl.DateTimeFormat("zh-CN", { hour: "2-digit", minute: "2-digit", second: "2-digit" }).format(event.timestamp)}
-                    </span>
-                  </div>
-                </li>
-              ))}
-            </ol>
-          )}
-        </div>
+        <RuntimePanel runStatus={runStatus} events={events} inspect={sessionInspect} />
+      )}
+
+      {tab === "capabilities" && (
+        <CapabilityPanel
+          capabilities={capabilities}
+          inspect={sessionInspect}
+          loading={capabilitiesLoading}
+          error={capabilitiesError}
+        />
       )}
 
       {tab === "context" && (
-        <div className="inspector-body context-panel">
-          <section>
-            <h2><Braces size={16} />运行上下文</h2>
-            <dl>
-              <div><dt>工作区</dt><dd title={workspace}>{workspace || "未绑定项目（独立对话）"}</dd></div>
-              <div><dt>提供商</dt><dd>{settings?.provider || "未配置"}</dd></div>
-              <div><dt>模型</dt><dd>{settings?.model || "未配置"}</dd></div>
-              <div><dt>Base URL</dt><dd title={settings?.baseUrl}>{settings?.baseUrl || "未配置"}</dd></div>
-            </dl>
-          </section>
-          <section className="security-card">
-            <h2><KeyRound size={16} />API Key</h2>
-            <strong>{settings?.apiKeyConfigured ? settings.apiKeyMask : "未配置"}</strong>
-            <p>密钥只保存在本机 MiniCode 设置中，不会写入浏览器存储。</p>
-            <button className="button button-secondary" onClick={onOpenSettings}>管理模型与密钥</button>
-          </section>
-        </div>
+        <ContextPanel
+          workspace={workspace}
+          settings={settings}
+          capabilities={capabilities}
+          inspect={sessionInspect}
+          onOpenSettings={onOpenSettings}
+        />
       )}
     </aside>
   );

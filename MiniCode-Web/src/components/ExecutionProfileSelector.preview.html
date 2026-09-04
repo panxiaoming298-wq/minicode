@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>ExecutionProfileSelector states</title>
+    <link rel="stylesheet" href="../styles.css" />
+    <style>
+      body { min-height: 100vh; padding: 32px; background: var(--canvas); }
+      main { width: min(880px, 100%); margin: 0 auto; }
+      h1 { margin: 0 0 6px; font-size: 24px; }
+      .preview-intro { margin: 0 0 24px; color: var(--muted); }
+      .preview-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+      .preview-card { min-height: 118px; padding: 14px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface-raised); }
+      .preview-card > p { margin: 0 0 15px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+      .preview-card .execution-profile-trigger { background-color: var(--surface); }
+      .preview-card.is-menu { grid-column: 1 / -1; min-height: 330px; }
+      .preview-card.is-menu .execution-profile-menu { right: auto; left: 14px; bottom: auto; top: 82px; }
+      @media (max-width: 520px) { body { padding: 18px 12px; } }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>执行模式选择器</h1>
+      <p class="preview-intro">Standard / Ultra · 组件八态验收预览</p>
+      <section class="preview-grid" aria-label="组件状态">
+        <article class="preview-card"><p>Default</p><div class="execution-profile-selector"><button class="execution-profile-trigger"><span class="execution-profile-status"></span><span class="execution-profile-label">Standard</span><span>⌄</span></button></div></article>
+        <article class="preview-card"><p>Hover</p><div class="execution-profile-selector is-hover"><button class="execution-profile-trigger"><span class="execution-profile-status"></span><span class="execution-profile-label">Ultra</span><span>⌄</span></button></div></article>
+        <article class="preview-card"><p>Focus-visible</p><div class="execution-profile-selector is-focus"><button class="execution-profile-trigger"><span class="execution-profile-status"></span><span class="execution-profile-label">Standard</span><span>⌄</span></button></div></article>
+        <article class="preview-card"><p>Active</p><div class="execution-profile-selector is-active"><button class="execution-profile-trigger"><span class="execution-profile-status"></span><span class="execution-profile-label">Ultra</span><span>⌄</span></button></div></article>
+        <article class="preview-card"><p>Disabled</p><div class="execution-profile-selector is-disabled"><button class="execution-profile-trigger" disabled><span class="execution-profile-status"></span><span class="execution-profile-label">Standard</span><span>⌄</span></button></div></article>
+        <article class="preview-card"><p>Loading</p><div class="execution-profile-selector is-loading"><button class="execution-profile-trigger" disabled><span class="execution-profile-status">◌</span><span class="execution-profile-label">读取模式</span><span>⌄</span></button></div></article>
+        <article class="preview-card"><p>Error</p><div class="execution-profile-selector is-error"><button class="execution-profile-trigger" aria-invalid="true"><span class="execution-profile-status">!</span><span class="execution-profile-label">Standard</span><span>⌄</span></button></div></article>
+        <article class="preview-card"><p>Success</p><div class="execution-profile-selector is-success"><button class="execution-profile-trigger"><span class="execution-profile-status">✓</span><span class="execution-profile-label">Ultra</span><span>⌄</span></button></div></article>
+        <article class="preview-card is-menu"><p>Open menu</p><div class="execution-profile-selector is-open"><button class="execution-profile-trigger" aria-expanded="true"><span class="execution-profile-status"></span><span class="execution-profile-label">Standard</span><span>⌃</span></button><div class="execution-profile-menu" role="listbox" aria-label="选择执行模式"><div class="execution-profile-menu-heading">执行模式</div><button class="execution-profile-option" role="option" aria-selected="true"><span class="execution-profile-option-copy"><strong>Standard</strong><small>日常任务 · 单 Agent 优先</small></span><span class="execution-profile-option-check">✓</span></button><button class="execution-profile-option" role="option" aria-selected="false"><span class="execution-profile-option-copy"><strong>Ultra</strong><small>复杂任务 · 智能并行</small></span><span class="execution-profile-option-check">✓</span></button><p class="execution-profile-note">Ultra 会按任务自动选择深度单 Agent 或只读并行。</p></div></div></article>
+      </section>
+    </main>
+  </body>
+</html>

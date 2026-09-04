@@ -15,32 +15,39 @@ import time
 import uuid
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
-from minicode.agent_loop import run_agent_turn
 from minicode.config import load_runtime_config
 from minicode.context_manager import ContextManager
 from minicode.memory import MemoryManager
 from minicode.model_registry import create_model_adapter
 from minicode.permissions import PermissionManager
+from minicode.product_surfaces import build_product_snapshot
 from minicode.prompt import build_system_prompt_bundle
 from minicode.release_readiness import redact_sensitive_payload
 from minicode.session import load_session, save_session
+from minicode.session_contract import build_memory_continuity_snapshot
 from minicode.state import create_app_store
 from minicode.tools import create_default_tool_registry
 from minicode.turn_events import TurnEvent
-
+from minicode.unified_runtime import run_runtime_turn as run_agent_turn
+from minicode.web_surfaces import capability_surface, public_approval_request
 
 _MAX_EVENT_TEXT = 60_000
 
 
 def _json_safe(value: Any) -> Any:
-    if is_dataclass(value):
-        value = asdict(value)
+    if is_dataclass(value) and not isinstance(value, type):
+        value = asdict(cast(Any, value))
     try:
         value = redact_sensitive_payload(value)
-    except Exception:  # noqa: BLE001
-        pass
+    except Exception:  # noqa: BLE001 - event transport must fail closed.
+        if isinstance(value, dict):
+            return {
+                "kind": "error",
+                "message": "Sensitive event omitted because redaction failed.",
+            }
+        return "[REDACTION_FAILED]"
     if isinstance(value, str) and len(value) > _MAX_EVENT_TEXT:
         omitted = len(value) - _MAX_EVENT_TEXT
         return f"{value[:_MAX_EVENT_TEXT]}\n\n[output truncated: {omitted} characters omitted]"
@@ -66,7 +73,7 @@ class WebEventSink:
 
     def __init__(self) -> None:
         self._tool_started: dict[tuple[int | None, str], float] = {}
-        self._thinking_steps: set[int | None] = set()
+        self._thinking_announced = False
 
     def on_event(self, event: TurnEvent) -> None:
         if event.kind == "tool_start":
@@ -105,13 +112,13 @@ class WebEventSink:
             return
 
         if event.kind == "thinking":
-            if event.step not in self._thinking_steps:
-                self._thinking_steps.add(event.step)
+            if not self._thinking_announced:
+                self._thinking_announced = True
                 _emit(
                     {
                         "kind": "thinking_status",
                         "step": event.step,
-                        "content": "正在分析任务和工作区上下文",
+                        "content": "正在分析当前任务",
                     }
                 )
             return
@@ -143,13 +150,13 @@ class WebEventSink:
             )
 
 
-def _approval_prompt(request: dict[str, Any]) -> dict[str, Any]:
+def _approval_prompt(request: dict[str, Any], *, workspace: str) -> dict[str, Any]:
     request_id = uuid.uuid4().hex
     _emit(
         {
             "kind": "approval_requested",
             "requestId": request_id,
-            "request": request,
+            "request": public_approval_request(request, workspace),
         }
     )
     while True:
@@ -179,11 +186,13 @@ def _approval_prompt(request: dict[str, Any]) -> dict[str, Any]:
         return result
 
 
-def _dataclass_or_value(value: Any) -> Any:
-    return asdict(value) if is_dataclass(value) else value
-
-
-def _run(workspace: str, session_id: str, prompt: str) -> int:
+def _run(
+    workspace: str,
+    session_id: str,
+    prompt: str,
+    execution_profile: str,
+    web_run_id: str = "",
+) -> int:
     root = Path(workspace).expanduser().resolve()
     if not root.is_dir():
         _emit({"kind": "error", "message": f"工作区不存在: {root}"})
@@ -200,18 +209,29 @@ def _run(workspace: str, session_id: str, prompt: str) -> int:
     runtime: dict[str, Any] | None
     try:
         runtime = load_runtime_config(root)
-    except Exception:
+    except Exception:  # noqa: BLE001 - invalid optional runtime falls back to mock mode
         runtime = None
+
+    runtime_loaded = runtime is not None
+    runtime = dict(runtime or {})
+    runtime["executionProfile"] = execution_profile
+    runtime["runtimeV2"] = True
+    if web_run_id:
+        runtime["runtimeRunId"] = web_run_id
+        runtime["webRunId"] = web_run_id
 
     force_mock = os.environ.get("MINI_CODE_WEB_FORCE_MOCK", "").strip().lower() in {
         "1",
         "true",
         "yes",
         "on",
-    } or runtime is None
+    } or not runtime_loaded
 
     tools = create_default_tool_registry(str(root), runtime=runtime)
-    permissions = PermissionManager(str(root), prompt=_approval_prompt)
+    permissions = PermissionManager(
+        str(root),
+        prompt=lambda request: _approval_prompt(request, workspace=str(root)),
+    )
     memory_manager = MemoryManager(project_root=root)
     context_manager = (
         ContextManager(model=str(runtime.get("model", "default"))) if runtime else None
@@ -241,6 +261,18 @@ def _run(workspace: str, session_id: str, prompt: str) -> int:
             "runtime": runtime,
         },
     )
+    _emit(
+        {
+            "kind": "capability_snapshot",
+            "webRunId": web_run_id,
+            "capabilities": capability_surface(
+                tools,
+                product_snapshot=prompt_bundle.product_snapshot,
+                memory={"stats": memory_manager.get_stats()},
+                source="run",
+            ),
+        }
+    )
     messages = list(session.messages)
     system_message = {"role": "system", "content": prompt_bundle.prompt}
     if messages and messages[0].get("role") == "system":
@@ -261,6 +293,7 @@ def _run(workspace: str, session_id: str, prompt: str) -> int:
             "model": model_name,
             "provider": str((runtime or {}).get("provider", "mock")) or "mock",
             "mock": force_mock,
+            "executionProfile": execution_profile,
         }
     )
 
@@ -284,13 +317,36 @@ def _run(workspace: str, session_id: str, prompt: str) -> int:
         session.permissions_summary = {"items": permissions.get_summary()}
         session.skills = tools.get_skills()
         session.mcp_servers = tools.get_mcp_servers()
-        session.instruction_layers = prompt_bundle.instruction_layers
-        session.hook_status = _dataclass_or_value(prompt_bundle.hook_status)
-        session.delegation_status = _dataclass_or_value(prompt_bundle.delegation_status)
-        session.extension_manifests = prompt_bundle.extension_manifests
-        session.readiness_report = _dataclass_or_value(prompt_bundle.readiness_report)
-        session.metadata.status = "completed"
+        fresh_product_snapshot = build_product_snapshot(root, runtime=runtime)
+        session.instruction_layers = fresh_product_snapshot.get("instruction_layers", [])
+        session.hook_status = fresh_product_snapshot.get("hook_status", {})
+        session.delegated_tasks = fresh_product_snapshot.get("delegated_tasks", [])
+        session.delegation_status = fresh_product_snapshot.get("delegation_status", {})
+        session.extension_manifests = fresh_product_snapshot.get("extension_manifests", [])
+        session.readiness_report = fresh_product_snapshot.get("readiness_report", {})
+        session.memory_continuity = build_memory_continuity_snapshot(
+            memory_manager,
+            workspace=str(root),
+        )
+        trace = runtime.get("lastRuntimeTrace", {})
+        if isinstance(trace, dict) and web_run_id:
+            trace["web_run_id"] = web_run_id
+        delivery = trace.get("delivery", {}) if isinstance(trace, dict) else {}
+        delivery_failed = isinstance(delivery, dict) and delivery.get("completed") is False
+        session.metadata.status = "failed" if delivery_failed else "completed"
         save_session(session, force_full=True)
+        if delivery_failed:
+            final_message = next(
+                (
+                    str(message.get("content", ""))
+                    for message in reversed(result_messages)
+                    if message.get("role") == "assistant"
+                    and str(message.get("content", "")).strip()
+                ),
+                "Runtime completion gate rejected delivery.",
+            )
+            _emit({"kind": "error", "message": final_message})
+            return 1
         return 0
     except KeyboardInterrupt:
         session.metadata.status = "stopped"
@@ -305,7 +361,7 @@ def _run(workspace: str, session_id: str, prompt: str) -> int:
         permissions.end_turn()
         try:
             tools.dispose()
-        except Exception:  # noqa: BLE001
+        except Exception:  # noqa: BLE001, S110 - shutdown cleanup is best-effort.
             pass
 
 
@@ -330,10 +386,15 @@ def main(argv: list[str] | None = None) -> None:
 
     message = _read_start_message()
     prompt = str((message or {}).get("prompt", "")).strip()
+    execution_profile = str((message or {}).get("executionProfile", "standard")).strip().lower()
+    web_run_id = str((message or {}).get("runId", "")).strip()
     if not prompt:
         _emit({"kind": "error", "message": "请输入任务内容。"})
         raise SystemExit(2)
-    raise SystemExit(_run(args.workspace, args.session, prompt))
+    if execution_profile not in {"standard", "ultra"}:
+        _emit({"kind": "error", "message": "执行模式只能是 Standard 或 Ultra。"})
+        raise SystemExit(2)
+    raise SystemExit(_run(args.workspace, args.session, prompt, execution_profile, web_run_id))
 
 
 if __name__ == "__main__":

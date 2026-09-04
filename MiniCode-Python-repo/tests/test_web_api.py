@@ -9,7 +9,8 @@ from fastapi.testclient import TestClient
 
 import minicode.config as config_module
 import minicode.session as session_module
-import minicode.web_api as web_api
+from minicode import web_api, web_worker
+from minicode.turn_events import TurnEvent
 
 
 @pytest.fixture
@@ -24,6 +25,7 @@ def isolated_web_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(web_api, "MINI_CODE_SETTINGS_PATH", settings_path)
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     monkeypatch.setenv("MINI_CODE_WEB_FORCE_MOCK", "1")
+    monkeypatch.delenv("MINI_CODE_EXECUTION_PROFILE", raising=False)
     return tmp_path
 
 
@@ -33,6 +35,27 @@ def _client(workspace: Path, isolated_web_home: Path) -> TestClient:
         frontend_dir=isolated_web_home / "missing-frontend",
     )
     return TestClient(app)
+
+
+def test_web_event_sink_announces_task_analysis_once_per_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    emitted: list[dict] = []
+    monkeypatch.setattr(web_worker, "_emit", emitted.append)
+    sink = web_worker.WebEventSink()
+
+    sink.on_event(TurnEvent.thinking_chunk(step=1, content="hidden-one"))
+    sink.on_event(TurnEvent.thinking_chunk(step=1, content="hidden-two"))
+    sink.on_event(TurnEvent.thinking_chunk(step=2, content="hidden-three"))
+
+    assert emitted == [
+        {
+            "kind": "thinking_status",
+            "step": 1,
+            "content": "正在分析当前任务",
+        }
+    ]
+    assert all("hidden" not in str(event) for event in emitted)
 
 
 def test_settings_key_is_saved_but_never_returned(
@@ -55,6 +78,7 @@ def test_settings_key_is_saved_but_never_returned(
         assert response.status_code == 200
         body = response.json()
         assert body["apiKeyConfigured"] is True
+        assert body["executionProfile"] == "standard"
         assert body["apiKeyMask"].endswith("9876")
         assert secret not in response.text
 
@@ -64,6 +88,60 @@ def test_settings_key_is_saved_but_never_returned(
 
     settings = json.loads((isolated_web_home / ".mini-code" / "settings.json").read_text(encoding="utf-8"))
     assert settings["env"]["DEEPSEEK_API_KEY"] == secret
+
+
+def test_web_event_redaction_failure_is_fail_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    secret = "sk-never-return-this-secret"
+
+    def fail_redaction(_value):
+        raise RuntimeError("redactor unavailable")
+
+    monkeypatch.setattr(web_api, "redact_sensitive_payload", fail_redaction)
+    monkeypatch.setattr(web_worker, "redact_sensitive_payload", fail_redaction)
+
+    record = web_api.RunRecord(
+        run_id="redaction-run",
+        session_id="redaction-session",
+        workspace=".",
+        prompt_preview="safe",
+        execution_profile="standard",
+    )
+    event = record.add_event({"kind": "error", "message": secret})
+    worker_payload = web_worker._json_safe({"kind": "error", "message": secret})
+
+    assert secret not in str(event)
+    assert event["kind"] == "error"
+    assert event["message"].startswith("Sensitive event omitted")
+    assert isinstance(worker_payload, dict)
+    assert worker_payload["kind"] == "error"
+    assert secret not in str(worker_payload)
+
+
+def test_run_snapshot_bounds_retention_and_resumes_after_sequence_cursor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_api, "_MAX_RETAINED_RUN_EVENTS", 3)
+    record = web_api.RunRecord(
+        run_id="cursor-run",
+        session_id="cursor-session",
+        workspace=".",
+        prompt_preview="cursor",
+        execution_profile="standard",
+    )
+    for index in range(5):
+        record.add_event({"kind": "progress", "content": f"event-{index + 1}"})
+
+    snapshot = record.snapshot(after=3)
+    full_window = record.snapshot()
+
+    assert snapshot["run"]["eventCount"] == 5
+    assert snapshot["run"]["retainedEventCount"] == 3
+    assert snapshot["run"]["eventsDiscardedThrough"] == 2
+    assert [event["sequence"] for event in snapshot["events"]] == [4, 5]
+    assert [event["sequence"] for event in full_window["events"]] == [2, 3, 4, 5]
+    assert full_window["events"][0]["kind"] == "event_gap"
 
 
 def test_rejects_non_local_origin(tmp_path: Path, isolated_web_home: Path) -> None:
@@ -81,6 +159,45 @@ def test_session_endpoints_use_workspace_scope(tmp_path: Path, isolated_web_home
         listed = client.get("/api/sessions", params={"workspace": str(tmp_path)})
         assert listed.status_code == 200
         assert [item["sessionId"] for item in listed.json()["sessions"]] == [session_id]
+
+        run_snapshot = client.get(f"/api/sessions/{session_id}/run")
+        assert run_snapshot.status_code == 200
+        assert run_snapshot.json() == {"run": None, "events": []}
+
+
+def test_navigation_and_session_snapshot_expose_a_background_run(
+    tmp_path: Path,
+    isolated_web_home: Path,
+) -> None:
+    with _client(tmp_path, isolated_web_home) as client:
+        created = client.post("/api/sessions", json={"workspace": str(tmp_path)})
+        session_id = created.json()["session"]["sessionId"]
+        record = web_api.RunRecord(
+            run_id="background-run",
+            session_id=session_id,
+            workspace=str(tmp_path.resolve()),
+            prompt_preview="后台继续处理",
+            execution_profile="standard",
+            status="running",
+        )
+        record.add_event({"kind": "status", "status": "running", "content": "任务已启动"})
+        manager = client.app.state.run_manager
+        with manager._lock:
+            manager._runs[record.run_id] = record
+
+        navigation = client.get("/api/navigation")
+        assert navigation.status_code == 200
+        summary = next(
+            item for item in navigation.json()["sessions"]
+            if item["sessionId"] == session_id
+        )
+        assert summary["status"] == "running"
+
+        snapshot = client.get(f"/api/sessions/{session_id}/run")
+        assert snapshot.status_code == 200
+        assert snapshot.json()["run"]["runId"] == record.run_id
+        assert snapshot.json()["run"]["status"] == "running"
+        assert snapshot.json()["events"][0]["content"] == "任务已启动"
 
 
 def test_workspace_open_changes_current_workspace_and_tracks_recents(
@@ -332,13 +449,163 @@ def test_workspace_file_browser_lists_source_and_reads_original_text(
         assert outside.status_code == 400
 
 
+def test_workspace_capabilities_expose_names_not_mcp_execution_config(
+    tmp_path: Path,
+    isolated_web_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    skill_dir = tmp_path / ".mini-code" / "skills" / "review-helper"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "# Review helper\n\nReview the current change set.\n",
+        encoding="utf-8",
+    )
+    secret = "mcp-private-token-123"
+    monkeypatch.setattr(
+        web_api,
+        "load_runtime_config",
+        lambda _workspace: {
+            "provider": "mock",
+            "mcpServers": {
+                "private-server": {
+                    "command": "python C:/private/server.py",
+                    "env": {"PRIVATE_TOKEN": secret},
+                    "protocol": "stdio",
+                }
+            },
+        },
+    )
+
+    with _client(tmp_path, isolated_web_home) as client:
+        response = client.get(
+            "/api/workspace/capabilities",
+            params={"path": str(tmp_path)},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()["capabilities"]
+    assert {item["name"] for item in payload["skills"]} == {"review-helper"}
+    assert payload["mcpServers"][0]["name"] == "private-server"
+    assert payload["mcpServers"][0]["status"] == "configured"
+    assert any(tool["name"] == "read_file" for tool in payload["tools"])
+    assert "command" not in payload["mcpServers"][0]
+    assert "server.py" not in response.text
+    assert secret not in response.text
+    assert "path" not in payload["skills"][0]
+
+
+def test_session_inspection_strips_resume_only_content(
+    tmp_path: Path,
+    isolated_web_home: Path,
+) -> None:
+    with _client(tmp_path, isolated_web_home) as client:
+        created = client.post("/api/sessions", json={"workspace": str(tmp_path)}).json()
+        session_id = created["session"]["sessionId"]
+        session = session_module.load_session(session_id)
+        assert session is not None
+        session.skills = [{
+            "name": "safe-skill",
+            "description": "safe description",
+            "source": "project",
+            "path": "C:/secret/SKILL.md",
+        }]
+        session.mcp_servers = [{
+            "name": "safe-mcp",
+            "status": "connected",
+            "toolCount": 2,
+            "command": "python C:/secret/server.py",
+        }]
+        session.instruction_layers = [{
+            "name": "project-managed",
+            "scope": "project",
+            "kind": "managed",
+            "exists": True,
+            "path": "C:/secret/POLICY.md",
+            "content": "instruction-secret-456",
+        }]
+        session.checkpoints = [
+            session_module.FileCheckpoint(
+                checkpoint_id="checkpoint-safe",
+                created_at=time.time(),
+                file_path=str(tmp_path / "src" / "main.py"),
+                existed=True,
+                previous_content="checkpoint-secret-789",
+            )
+        ]
+        session.runtime_runs = [{
+            "schema_version": "minicode-runtime-trace-v2",
+            "plan": {
+                "run_id": "run-safe",
+                "plan_version": 1,
+                "contract_revision": 1,
+                "nodes": [],
+            },
+            "delivery": {
+                "completed": True,
+                "artifact_refs": [{
+                    "artifact_id": "artifact-safe",
+                    "content_hash": "sha256-safe",
+                    "size": 12,
+                    "media_type": "text/plain",
+                    "store_key": "artifact-store-secret",
+                }],
+                "verification_records": [{
+                    "verifier": "pytest",
+                    "passed": True,
+                    "scope": "project",
+                    "details": "1 passed",
+                    "evidence_refs": [{
+                        "evidence_type": "test",
+                        "resource": "C:/secret/test-output.log",
+                        "content_hash": "evidence-safe",
+                        "claim": "tests passed",
+                        "producer_node_id": "node-1",
+                        "base_revision": "base-safe",
+                    }],
+                }],
+            },
+            "profile": {},
+            "topology_decision": {},
+            "scheduler": {},
+            "state": {},
+            "context_manifests": [],
+        }]
+        session_module.save_session(session, force_full=True)
+
+        response = client.get(f"/api/sessions/{session_id}/inspect")
+
+    assert response.status_code == 200
+    inspect = response.json()["inspect"]
+    assert inspect["skills"][0]["name"] == "safe-skill"
+    assert inspect["mcpServers"][0]["name"] == "safe-mcp"
+    assert inspect["instructionLayers"][0]["name"] == "project-managed"
+    assert inspect["checkpoints"][0]["checkpointId"] == "checkpoint-safe"
+    assert inspect["runtimeRuns"][0]["delivery"]["artifacts"][0]["artifactId"] == "artifact-safe"
+    assert inspect["runtimeRuns"][0]["delivery"]["verificationRecords"][0]["evidence"][0]["claim"] == "tests passed"
+    for secret in [
+        "C:/secret/SKILL.md",
+        "C:/secret/server.py",
+        "C:/secret/POLICY.md",
+        "instruction-secret-456",
+        "checkpoint-secret-789",
+        "artifact-store-secret",
+        "C:/secret/test-output.log",
+    ]:
+        assert secret not in response.text
+
+
 def test_mock_run_streams_structured_events(tmp_path: Path, isolated_web_home: Path) -> None:
     with _client(tmp_path, isolated_web_home) as client:
         started = client.post(
             "/api/runs",
-            json={"workspace": str(tmp_path), "prompt": "hello from browser"},
+            json={
+                "workspace": str(tmp_path),
+                "prompt": "你现在是什么思考强度",
+                "executionProfile": "ultra",
+            },
         )
         assert started.status_code == 200
+        assert started.json()["run"]["executionProfile"] == "ultra"
         run_id = started.json()["run"]["runId"]
 
         snapshot = None
@@ -353,6 +620,88 @@ def test_mock_run_streams_structured_events(tmp_path: Path, isolated_web_home: P
         assert snapshot["run"]["status"] == "completed"
         kinds = [event["kind"] for event in snapshot["events"]]
         assert "run_started" in kinds
-        assert "assistant" in kinds
-        assert "done" in kinds
+        assert "capability_snapshot" in kinds
+        assert kinds.count("assistant") == 1
+        assert kinds.count("done") == 1
+        assert "tool_start" not in kinds
+        assert "error" not in kinds
         assert kinds[-1] == "status"
+        assistant = next(event for event in snapshot["events"] if event["kind"] == "assistant")
+        assert "Runtime completion gate rejected delivery" not in assistant["content"]
+        run_started = next(event for event in snapshot["events"] if event["kind"] == "run_started")
+        assert run_started["executionProfile"] == "ultra"
+        persisted_payload = client.get(
+            f"/api/sessions/{started.json()['run']['sessionId']}"
+        ).json()
+        assert persisted_payload["session"]["status"] == "completed"
+        persisted = persisted_payload["messages"]
+        assert persisted[-1]["role"] == "assistant"
+        assert persisted[-1]["content"] == assistant["content"]
+        inspection = client.get(
+            f"/api/sessions/{started.json()['run']['sessionId']}/inspect"
+        ).json()["inspect"]
+        assert inspection["runtimeRuns"][-1]["webRunId"] == run_id
+        assert inspection["runtimeRuns"][-1]["runId"] == run_id
+        session_run = client.get(
+            f"/api/sessions/{started.json()['run']['sessionId']}/run"
+        )
+        assert session_run.status_code == 200
+        assert session_run.json()["run"]["runId"] == run_id
+        assert session_run.json()["run"]["status"] == "completed"
+        assert session_run.json()["events"][-1]["status"] == "completed"
+
+
+def test_completion_gate_rejection_is_a_single_failed_run_error(
+    tmp_path: Path,
+    isolated_web_home: Path,
+) -> None:
+    with _client(tmp_path, isolated_web_home) as client:
+        started = client.post(
+            "/api/runs",
+            json={
+                "workspace": str(tmp_path),
+                "prompt": "修复项目中的并发 bug",
+                "executionProfile": "ultra",
+            },
+        )
+        assert started.status_code == 200
+        run_id = started.json()["run"]["runId"]
+
+        snapshot = None
+        deadline = time.monotonic() + 25
+        while time.monotonic() < deadline:
+            snapshot = client.get(f"/api/runs/{run_id}").json()
+            if snapshot["run"]["status"] in {"completed", "failed", "stopped"}:
+                break
+            time.sleep(0.1)
+
+        assert snapshot is not None
+        assert snapshot["run"]["status"] == "failed"
+        errors = [event for event in snapshot["events"] if event["kind"] == "error"]
+        assert len(errors) == 1
+        assert errors[0]["message"].startswith("Runtime completion gate rejected delivery:")
+        assert not any(event["kind"] == "assistant" for event in snapshot["events"])
+        persisted_payload = client.get(
+            f"/api/sessions/{started.json()['run']['sessionId']}"
+        ).json()
+        assert persisted_payload["session"]["status"] == "failed"
+        persisted = persisted_payload["messages"]
+        assert persisted[-1]["role"] == "assistant"
+        assert persisted[-1]["content"] == errors[0]["message"]
+
+
+def test_run_rejects_non_public_execution_profile(
+    tmp_path: Path,
+    isolated_web_home: Path,
+) -> None:
+    with _client(tmp_path, isolated_web_home) as client:
+        response = client.post(
+            "/api/runs",
+            json={
+                "workspace": str(tmp_path),
+                "prompt": "do not expose internal topology",
+                "executionProfile": "deep",
+            },
+        )
+
+    assert response.status_code == 422

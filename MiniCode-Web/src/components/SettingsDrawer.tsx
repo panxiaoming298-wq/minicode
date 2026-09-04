@@ -30,6 +30,8 @@ interface SettingsDrawerProps {
 
 type Notice = { kind: "success" | "error"; text: string } | null;
 
+const CUSTOM_MODEL_VALUE = "__custom_model__";
+
 export function SettingsDrawer({ open, settings, onClose, onSave, onTest }: SettingsDrawerProps) {
   const [provider, setProvider] = useState("deepseek");
   const [model, setModel] = useState("");
@@ -69,6 +71,8 @@ export function SettingsDrawer({ open, settings, onClose, onSave, onTest }: Sett
     () => settings?.providers.find((option) => option.id === provider),
     [provider, settings],
   );
+  const modelOptions = selectedProvider?.models ?? [];
+  const usesCustomModel = !modelOptions.includes(model);
 
   function changeProvider(nextProvider: string) {
     const option = settings?.providers.find((item) => item.id === nextProvider);
@@ -168,19 +172,33 @@ export function SettingsDrawer({ open, settings, onClose, onSave, onTest }: Sett
             </label>
             <label>
               <span>模型 ID</span>
-              <input
-                value={model}
-                onChange={(event) => setModel(event.target.value)}
-                list="model-options"
-                placeholder="输入模型 ID"
-                required
-                spellCheck={false}
-              />
-              <datalist id="model-options">
-                {selectedProvider?.models.map((item) => <option key={item} value={item} />)}
-              </datalist>
-              <small>可直接输入新模型 ID，不受候选列表限制。</small>
+              <select
+                value={usesCustomModel ? CUSTOM_MODEL_VALUE : model}
+                onChange={(event) => {
+                  setModel(event.target.value === CUSTOM_MODEL_VALUE ? "" : event.target.value);
+                  setNotice(null);
+                }}
+              >
+                {modelOptions.map((item) => <option key={item} value={item}>{item}</option>)}
+                <option value={CUSTOM_MODEL_VALUE}>自定义模型 ID…</option>
+              </select>
+              <small>选择提供商支持的模型，或使用自定义 ID。</small>
             </label>
+            {usesCustomModel && (
+              <label>
+                <span>自定义模型 ID</span>
+                <input
+                  value={model}
+                  onChange={(event) => {
+                    setModel(event.target.value);
+                    setNotice(null);
+                  }}
+                  placeholder="输入模型 ID"
+                  required
+                  spellCheck={false}
+                />
+              </label>
+            )}
             <label>
               <span>Base URL</span>
               <input

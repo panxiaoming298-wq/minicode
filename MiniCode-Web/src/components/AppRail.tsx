@@ -20,7 +20,6 @@ import { createPortal } from "react-dom";
 import type {
   ConversationScope,
   RecentWorkspace,
-  RunStatus,
   SessionSummary,
   WorkspaceStatus,
 } from "../types";
@@ -34,7 +33,6 @@ interface AppRailProps {
   pinnedWorkspacePaths: string[];
   selectedSessionId: string | null;
   conversationScope: ConversationScope;
-  runStatus: RunStatus;
   mobileOpen: boolean;
   onCloseMobile: () => void;
   onNewStandaloneTask: () => void;
@@ -73,6 +71,16 @@ function sessionTitle(session: SessionSummary): string {
   return session.firstMessage || session.lastMessage || "新对话";
 }
 
+function sessionState(session: SessionSummary): string {
+  return {
+    queued: "排队中",
+    running: "运行中",
+    stopping: "停止中",
+    stopped: "已停止，可继续",
+    failed: "失败，可重试",
+  }[session.status] || "";
+}
+
 export function AppRail({
   workspace,
   workspaceStatus,
@@ -82,7 +90,6 @@ export function AppRail({
   pinnedWorkspacePaths,
   selectedSessionId,
   conversationScope,
-  runStatus,
   mobileOpen,
   onCloseMobile,
   onNewStandaloneTask,
@@ -102,7 +109,6 @@ export function AppRail({
     () => new Set(workspace ? [pathIdentity(workspace)] : []),
   );
   const [mobileLayout, setMobileLayout] = useState(() => window.matchMedia("(max-width: 819px)").matches);
-  const workspaceLocked = runStatus === "queued" || runStatus === "running" || runStatus === "stopping";
   const pinnedSessionSet = useMemo(() => new Set(pinnedSessionIds), [pinnedSessionIds]);
   const pinnedWorkspaceSet = useMemo(
     () => new Set(pinnedWorkspacePaths.map(pathIdentity)),
@@ -172,7 +178,6 @@ export function AppRail({
   }
 
   async function startProjectConversation(path: string) {
-    if (workspaceLocked) return;
     expandProject(path);
     try {
       await onNewProjectTask(path);
@@ -184,7 +189,7 @@ export function AppRail({
 
   async function applyWorkspace(path = draftWorkspace) {
     const nextWorkspace = path.trim();
-    if (!nextWorkspace || workspaceLocked) return;
+    if (!nextWorkspace) return;
     setOpening("path");
     try {
       await onChangeWorkspace(nextWorkspace);
@@ -199,7 +204,6 @@ export function AppRail({
   }
 
   async function pickWorkspace() {
-    if (workspaceLocked) return;
     setOpening("picker");
     try {
       const changed = await onPickWorkspace();
@@ -215,7 +219,6 @@ export function AppRail({
   }
 
   function openProjectDialog() {
-    if (workspaceLocked) return;
     setDraftWorkspace(workspace);
     setProjectDialogOpen(true);
   }
@@ -232,6 +235,7 @@ export function AppRail({
 
   function renderConversation(session: SessionSummary, nested = false) {
     const pinned = pinnedSessionSet.has(session.sessionId);
+    const state = sessionState(session);
     return (
       <div
         className={`rail-item conversation-item ${nested ? "is-nested" : ""} ${selectedSessionId === session.sessionId ? "is-active" : ""}`}
@@ -241,9 +245,12 @@ export function AppRail({
           <MessageSquare size={nested ? 14 : 15} />
           <span>
             <strong>{sessionTitle(session)}</strong>
-            <small>
-              {session.scope === "standalone" ? "独立对话" : workspaceName(session.projectPath || session.workspace)}
-              {` · ${relativeTime(session.updatedAt)}`}
+            <small className="session-meta">
+              <span className="session-context">
+                {session.scope === "standalone" ? "独立对话" : workspaceName(session.projectPath || session.workspace)}
+                {` · ${relativeTime(session.updatedAt)}`}
+              </span>
+              {state && <span className={`session-state session-state-${session.status}`}><i />{state}</span>}
             </small>
           </span>
         </button>
@@ -289,7 +296,7 @@ export function AppRail({
         </button>
       </div>
 
-      <button className="new-task-button" onClick={startStandaloneConversation} disabled={workspaceLocked}>
+      <button className="new-task-button" onClick={startStandaloneConversation}>
         <MessageSquare size={17} />
         <span>新对话</span>
         <kbd>Ctrl N</kbd>
@@ -302,7 +309,7 @@ export function AppRail({
             <div className="rail-items">
               {pinnedProjects.map((project) => (
                 <div className="rail-item project-item" key={`pinned-${project.path}`}>
-                  <button className="rail-item-main" onClick={() => void startProjectConversation(project.path)} disabled={workspaceLocked}>
+                  <button className="rail-item-main" onClick={() => void startProjectConversation(project.path)}>
                     <Folder size={16} />
                     <span><strong>{project.name}</strong><small>项目</small></span>
                   </button>
@@ -319,7 +326,7 @@ export function AppRail({
         <section className="rail-group" aria-labelledby="projects-heading">
           <div className="rail-section-heading" id="projects-heading">
             <span>项目</span>
-            <button onClick={openProjectDialog} disabled={workspaceLocked} aria-label="打开项目" title="打开项目"><Plus size={15} /></button>
+            <button onClick={openProjectDialog} aria-label="打开项目" title="打开项目"><Plus size={15} /></button>
           </div>
           <div className="project-tree">
             {projects.length === 0 ? (
@@ -342,7 +349,6 @@ export function AppRail({
                         expandProject(project.path);
                         if (!active) void startProjectConversation(project.path);
                       }}
-                      disabled={workspaceLocked}
                     >
                       <Folder size={16} />
                       <span>
@@ -359,7 +365,7 @@ export function AppRail({
                   {expanded && (
                     <div className="project-conversations">
                       {projectSessions.length === 0 ? (
-                        <button className="project-empty-conversation" onClick={() => void startProjectConversation(project.path)} disabled={workspaceLocked}>
+                        <button className="project-empty-conversation" onClick={() => void startProjectConversation(project.path)}>
                           <Plus size={13} />在这个项目中新建对话
                         </button>
                       ) : (
@@ -381,7 +387,7 @@ export function AppRail({
         <section className="rail-group conversations-group" aria-labelledby="conversations-heading">
           <div className="rail-section-heading" id="conversations-heading">
             <span>对话</span>
-            {runStatus === "running" && conversationScope === "standalone" && <span className="running-label"><i />运行中</span>}
+            {standaloneConversations.some((session) => ["queued", "running", "stopping"].includes(session.status)) && <span className="running-label"><i />有任务运行中</span>}
           </div>
           <div className="rail-items">
             {standaloneConversations.length === 0 ? (
@@ -406,7 +412,7 @@ export function AppRail({
               <button className="icon-button" onClick={() => setProjectDialogOpen(false)} disabled={Boolean(opening)} aria-label="关闭打开项目窗口"><X size={18} /></button>
             </header>
 
-            <button className="workspace-picker-button" onClick={() => void pickWorkspace()} disabled={Boolean(opening) || workspaceLocked}>
+            <button className="workspace-picker-button" onClick={() => void pickWorkspace()} disabled={Boolean(opening)}>
               <FolderOpen size={19} />
               <span>
                 <strong>{opening === "picker" ? "系统选择窗口已打开" : "选择文件夹…"}</strong>
@@ -420,7 +426,7 @@ export function AppRail({
                 {projects.slice(0, 5).map((project) => {
                   const active = conversationScope === "project" && samePath(project.path, workspace);
                   return (
-                    <button key={project.path} className={`recent-workspace-button ${active ? "is-active" : ""}`} onClick={() => void applyWorkspace(project.path)} disabled={Boolean(opening) || workspaceLocked} aria-current={active ? "true" : undefined}>
+                    <button key={project.path} className={`recent-workspace-button ${active ? "is-active" : ""}`} onClick={() => void applyWorkspace(project.path)} disabled={Boolean(opening)} aria-current={active ? "true" : undefined}>
                       <span><strong>{project.name}</strong><small title={project.path}>{project.path}</small></span>
                       {active && <Check size={15} aria-label="当前项目" />}
                     </button>
@@ -434,11 +440,10 @@ export function AppRail({
               <div>
                 <input id="workspace-path" value={draftWorkspace} onChange={(event) => setDraftWorkspace(event.target.value)} onKeyDown={(event) => {
                   if (event.key === "Enter") void applyWorkspace();
-                }} spellCheck={false} disabled={Boolean(opening) || workspaceLocked} />
-                <button className="button button-primary" onClick={() => void applyWorkspace()} disabled={Boolean(opening) || workspaceLocked || !draftWorkspace.trim()}>{opening === "path" ? "打开中" : "打开"}</button>
+                }} spellCheck={false} disabled={Boolean(opening)} />
+                <button className="button button-primary" onClick={() => void applyWorkspace()} disabled={Boolean(opening) || !draftWorkspace.trim()}>{opening === "path" ? "打开中" : "打开"}</button>
               </div>
             </div>
-            {workspaceLocked && <p className="workspace-locked-note">任务运行中，停止后才能切换项目。</p>}
           </section>
         </div>,
         document.body,

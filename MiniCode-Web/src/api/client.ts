@@ -1,9 +1,13 @@
 import type {
   BootstrapPayload,
+  CapabilitySnapshot,
   ConversationScope,
+  ExecutionProfile,
   NavigationPayload,
   RunEvent,
   RunInfo,
+  RunSnapshot,
+  SessionInspect,
   WorkspaceOpenPayload,
   WorkspaceDirectory,
   WorkspaceFileContent,
@@ -83,6 +87,12 @@ export const api = {
     request<{ session: SessionSummary; messages: StoredMessage[] }>(
       `/api/sessions/${encodeURIComponent(sessionId)}`,
     ),
+  getSessionInspect: (sessionId: string) =>
+    request<{ session: SessionSummary; inspect: SessionInspect }>(
+      `/api/sessions/${encodeURIComponent(sessionId)}/inspect`,
+    ),
+  getSessionRun: (sessionId: string) =>
+    request<RunSnapshot>(`/api/sessions/${encodeURIComponent(sessionId)}/run`),
   deleteSession: (sessionId: string) =>
     request<{ deleted: boolean }>(`/api/sessions/${encodeURIComponent(sessionId)}`, {
       method: "DELETE",
@@ -92,6 +102,7 @@ export const api = {
     workspace?: string;
     prompt: string;
     sessionId?: string;
+    executionProfile: ExecutionProfile;
   }) =>
     request<{ run: RunInfo }>("/api/runs", {
       method: "POST",
@@ -101,6 +112,10 @@ export const api = {
     request<{ run: RunInfo }>(`/api/runs/${encodeURIComponent(runId)}/stop`, {
       method: "POST",
     }),
+  getRun: (runId: string, after = 0) => {
+    const query = after > 0 ? `?after=${after}` : "";
+    return request<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}${query}`);
+  },
   approve: (
     runId: string,
     payload: { requestId: string; decision: string; feedback?: string },
@@ -111,6 +126,13 @@ export const api = {
     }),
   workspaceStatus: (workspace: string) =>
     request<WorkspaceStatus>(`/api/workspace/status?path=${encodeURIComponent(workspace)}`),
+  workspaceCapabilities: (workspace: string, scope: ConversationScope = "project") => {
+    const query = new URLSearchParams({ scope });
+    if (scope === "project") query.set("path", workspace);
+    return request<{ capabilities: CapabilitySnapshot }>(
+      `/api/workspace/capabilities?${query.toString()}`,
+    );
+  },
   workspaceFiles: (workspace: string, directory = "") => {
     const query = new URLSearchParams({ path: workspace, directory });
     return request<WorkspaceDirectory>(`/api/workspace/files?${query.toString()}`);
@@ -124,7 +146,10 @@ export const api = {
     if (file) query.set("file", file);
     return request<{ diff: string; file: string }>(`/api/workspace/diff?${query.toString()}`);
   },
-  eventSource: (runId: string) => new EventSource(`${API_ROOT}/api/runs/${encodeURIComponent(runId)}/events`),
+  eventSource: (runId: string, after = 0) => {
+    const query = after > 0 ? `?after=${after}` : "";
+    return new EventSource(`${API_ROOT}/api/runs/${encodeURIComponent(runId)}/events${query}`);
+  },
 };
 
 export function parseRunEvent(event: MessageEvent<string>): RunEvent {

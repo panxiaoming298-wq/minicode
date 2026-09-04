@@ -12,9 +12,10 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import AsyncIterator
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 from urllib.parse import urlparse
 
 try:
@@ -38,6 +39,9 @@ from minicode.config import (
     save_mini_code_settings,
     validate_provider_runtime,
 )
+from minicode.context_manager import compute_context_stats
+from minicode.memory import MemoryManager
+from minicode.product_surfaces import build_product_snapshot
 from minicode.release_readiness import redact_sensitive_payload
 from minicode.session import (
     create_new_session,
@@ -46,17 +50,38 @@ from minicode.session import (
     load_session,
     save_session,
 )
-
+from minicode.tools import create_default_tool_registry
+from minicode.web_surfaces import (
+    capability_surface,
+    public_checkpoints,
+    public_context_stats,
+    public_delegation_status,
+    public_extensions,
+    public_hook_status,
+    public_instruction_layers,
+    public_mcp_servers,
+    public_memory,
+    public_readiness,
+    public_runtime_trace,
+    public_skills,
+)
 
 RunStatus = Literal["queued", "running", "stopping", "completed", "failed", "stopped"]
+ExecutionProfile = Literal["standard", "ultra"]
 _TERMINAL_STATUSES = {"completed", "failed", "stopped"}
-_LOCAL_HOST_RE = re.compile(r"^(localhost|127\.0\.0\.1|\[::1\]|testserver)(:\d+)?$", re.I)
-_LOCAL_ORIGIN_RE = re.compile(r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$", re.I)
+_LOCAL_HOST_RE = re.compile(
+    r"^(localhost|127\.0\.0\.1|\[::1\]|testserver)(:\d+)?$", re.IGNORECASE
+)
+_LOCAL_ORIGIN_RE = re.compile(
+    r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$", re.IGNORECASE
+)
 _WEB_STATE_LOCK = threading.Lock()
 _WORKSPACE_PICKER_LOCK = threading.Lock()
 _MAX_RECENT_WORKSPACES = 8
 _MAX_DIRECTORY_ENTRIES = 500
 _MAX_FILE_PREVIEW_BYTES = 1_500_000
+_MAX_RETAINED_RUN_EVENTS = 512
+_MAX_RETAINED_RUNS = 128
 _IGNORED_BROWSER_DIRECTORIES = {
     ".git",
     ".mypy_cache",
@@ -187,6 +212,7 @@ class RunCreate(BaseModel):
     prompt: str = Field(min_length=1, max_length=200_000)
     session_id: str | None = Field(default=None, alias="sessionId", max_length=64)
     scope: Literal["project", "standalone"] = "project"
+    execution_profile: ExecutionProfile = Field(default="standard", alias="executionProfile")
 
 
 class ApprovalResponse(BaseModel):
@@ -203,7 +229,12 @@ def _safe_payload(value: Any) -> Any:
     try:
         return redact_sensitive_payload(value)
     except Exception:  # noqa: BLE001
-        return value
+        if isinstance(value, dict):
+            return {
+                "kind": "error",
+                "message": "Sensitive event omitted because redaction failed.",
+            }
+        return "[REDACTION_FAILED]"
 
 
 def _resolve_workspace(value: str) -> Path:
@@ -659,6 +690,15 @@ def get_settings_view() -> dict[str, Any]:
     api_key, key_source = _setting_with_source(stored, spec["keyEnv"], root_key_key)
     thinking, _ = _setting_with_source(stored, "DEEPSEEK_THINKING_MODE")
     effort, _ = _setting_with_source(stored, "DEEPSEEK_REASONING_EFFORT")
+    execution_profile = str(
+        os.environ.get("MINI_CODE_EXECUTION_PROFILE", "")
+        or (stored.get("env", {}) or {}).get("MINI_CODE_EXECUTION_PROFILE", "")
+        or stored.get("executionProfile", "")
+        or stored.get("profile", "")
+        or "standard"
+    ).strip().lower()
+    if execution_profile not in {"standard", "ultra"}:
+        execution_profile = "standard"
     return {
         "provider": provider,
         "model": model,
@@ -669,6 +709,7 @@ def get_settings_view() -> dict[str, Any]:
         "apiKeySource": key_source if api_key else "none",
         "thinkingMode": thinking or "enabled",
         "reasoningEffort": effort or "high",
+        "executionProfile": execution_profile,
         "settingsPath": str(MINI_CODE_SETTINGS_PATH),
         "providers": [
             {
@@ -724,8 +765,7 @@ def save_settings(update: SettingsUpdate) -> dict[str, Any]:
 
 def _models_endpoint(provider: str, base_url: str) -> str:
     base = base_url.rstrip("/")
-    if base.endswith("/chat/completions"):
-        base = base[: -len("/chat/completions")]
+    base = base.removesuffix("/chat/completions")
     if provider == "deepseek":
         return f"{base}/models"
     if base.endswith("/v1"):
@@ -738,7 +778,7 @@ def test_saved_provider() -> dict[str, Any]:
         return {"ok": True, "latencyMs": 1, "message": "模拟运行模式已就绪。"}
     try:
         runtime = load_runtime_config(Path.cwd())
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     errors = validate_provider_runtime(runtime, probe_openai_models=False)
     if errors:
@@ -806,6 +846,7 @@ class RunRecord:
     session_id: str
     workspace: str
     prompt_preview: str
+    execution_profile: ExecutionProfile
     status: RunStatus = "queued"
     created_at: int = field(default_factory=_now_ms)
     updated_at: int = field(default_factory=_now_ms)
@@ -813,7 +854,10 @@ class RunRecord:
     events: list[dict[str, Any]] = field(default_factory=list)
     stderr_tail: list[str] = field(default_factory=list)
     saw_done: bool = False
+    stdout_thread: threading.Thread | None = field(default=None, repr=False)
+    stderr_thread: threading.Thread | None = field(default=None, repr=False)
     sequence: int = 0
+    events_discarded_through: int = 0
     condition: threading.Condition = field(default_factory=threading.Condition, repr=False)
     write_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -824,6 +868,12 @@ class RunRecord:
             payload["sequence"] = self.sequence
             payload["timestamp"] = _now_ms()
             self.events.append(payload)
+            excess = len(self.events) - _MAX_RETAINED_RUN_EVENTS
+            if excess > 0:
+                self.events_discarded_through = int(
+                    self.events[excess - 1]["sequence"]
+                )
+                del self.events[:excess]
             self.updated_at = payload["timestamp"]
             if payload.get("kind") == "done":
                 self.saw_done = True
@@ -836,11 +886,43 @@ class RunRecord:
             "sessionId": self.session_id,
             "workspace": self.workspace,
             "promptPreview": self.prompt_preview,
+            "executionProfile": self.execution_profile,
             "status": self.status,
             "createdAt": self.created_at,
             "updatedAt": self.updated_at,
-            "eventCount": len(self.events),
+            "eventCount": self.sequence,
+            "retainedEventCount": len(self.events),
+            "eventsDiscardedThrough": self.events_discarded_through,
         }
+
+    def _events_after_locked(self, after: int) -> list[dict[str, Any]]:
+        cursor = max(0, after)
+        result: list[dict[str, Any]] = []
+        if cursor < self.events_discarded_through:
+            cursor = self.events_discarded_through
+            result.append(
+                {
+                    "kind": "event_gap",
+                    "sequence": cursor,
+                    "timestamp": _now_ms(),
+                    "message": (
+                        "较早的实时运行细节已从内存窗口移除；"
+                        "完整对话结果仍保存在会话记录中。"
+                    ),
+                }
+            )
+        offset = max(0, cursor - self.events_discarded_through)
+        result.extend(self.events[offset:])
+        return result
+
+    def snapshot(self, *, after: int = 0) -> dict[str, Any]:
+        """Return one consistent browser-safe view of the run and its events."""
+
+        with self.condition:
+            return {
+                "run": self.public(),
+                "events": list(self._events_after_locked(after)),
+            }
 
 
 class RunManager:
@@ -856,14 +938,72 @@ class RunManager:
             raise HTTPException(status_code=404, detail="任务不存在。")
         return record
 
+    def latest_for_session(self, session_id: str) -> RunRecord | None:
+        """Return the newest in-memory run for a session, including terminal runs."""
+
+        with self._lock:
+            matches = [record for record in self._runs.values() if record.session_id == session_id]
+        if not matches:
+            return None
+        return max(matches, key=lambda record: (record.created_at, record.run_id))
+
+    def overlay_navigation_statuses(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Keep the task rail authoritative while worker metadata is catching up."""
+
+        sessions = payload.get("sessions", [])
+        if not isinstance(sessions, list):
+            return payload
+        with self._lock:
+            latest_by_session: dict[str, RunRecord] = {}
+            for record in self._runs.values():
+                previous = latest_by_session.get(record.session_id)
+                if previous is None or (record.created_at, record.run_id) > (
+                    previous.created_at,
+                    previous.run_id,
+                ):
+                    latest_by_session[record.session_id] = record
+        for item in sessions:
+            if not isinstance(item, dict):
+                continue
+            active_record = latest_by_session.get(str(item.get("sessionId", "")))
+            if active_record is None:
+                continue
+            item["status"] = active_record.status
+            item["updatedAt"] = max(
+                int(item.get("updatedAt", 0)), active_record.updated_at
+            )
+        return payload
+
     def _active_count(self) -> int:
         return sum(1 for run in self._runs.values() if run.status not in _TERMINAL_STATUSES)
 
-    def start(self, workspace: Path, prompt: str, session_id: str | None) -> RunRecord:
+    def _prune_terminal_runs(self) -> None:
+        excess = len(self._runs) - _MAX_RETAINED_RUNS + 1
+        if excess <= 0:
+            return
+        terminal = sorted(
+            (
+                record
+                for record in self._runs.values()
+                if record.status in _TERMINAL_STATUSES
+            ),
+            key=lambda record: (record.updated_at, record.run_id),
+        )
+        for record in terminal[:excess]:
+            self._runs.pop(record.run_id, None)
+
+    def start(
+        self,
+        workspace: Path,
+        prompt: str,
+        session_id: str | None,
+        execution_profile: ExecutionProfile = "standard",
+    ) -> RunRecord:
         clean_prompt = prompt.strip()
         if not clean_prompt:
             raise HTTPException(status_code=400, detail="请输入任务内容。")
         with self._lock:
+            self._prune_terminal_runs()
             if self._active_count() >= self.max_active:
                 raise HTTPException(status_code=429, detail="同时运行的任务过多，请稍后再试。")
             if session_id:
@@ -886,6 +1026,7 @@ class RunManager:
                 session_id=session.session_id,
                 workspace=str(workspace),
                 prompt_preview=clean_prompt[:120],
+                execution_profile=execution_profile,
             )
             self._runs[run_id] = record
 
@@ -926,12 +1067,27 @@ class RunManager:
         record.process = process
         record.status = "running"
         record.add_event({"kind": "status", "status": "running", "content": "任务已启动"})
-        threading.Thread(target=self._read_stdout, args=(record,), daemon=True).start()
-        threading.Thread(target=self._read_stderr, args=(record,), daemon=True).start()
+        record.stdout_thread = threading.Thread(
+            target=self._read_stdout,
+            args=(record,),
+            daemon=True,
+        )
+        record.stderr_thread = threading.Thread(
+            target=self._read_stderr,
+            args=(record,),
+            daemon=True,
+        )
+        record.stdout_thread.start()
+        record.stderr_thread.start()
         threading.Thread(target=self._wait_for_exit, args=(record,), daemon=True).start()
         self._write(
             record,
-            {"kind": "start", "prompt": clean_prompt},
+            {
+                "kind": "start",
+                "runId": record.run_id,
+                "prompt": clean_prompt,
+                "executionProfile": execution_profile,
+            },
         )
         return record
 
@@ -978,6 +1134,13 @@ class RunManager:
         if process is None:
             return
         return_code = process.wait()
+        # A child can exit before the pipe-reader threads have reduced its
+        # final delivery/error messages.  Drain both pipes before deciding
+        # whether a generic process error is still needed.
+        if record.stdout_thread is not None:
+            record.stdout_thread.join(timeout=2)
+        if record.stderr_thread is not None:
+            record.stderr_thread.join(timeout=2)
         if record.status == "stopping":
             final_status: RunStatus = "stopped"
         elif return_code == 0:
@@ -994,8 +1157,11 @@ class RunManager:
             # session cannot be updated during process teardown.
             pass
         if final_status == "failed":
-            message = record.stderr_tail[-1] if record.stderr_tail else f"工作进程退出码: {return_code}"
-            record.add_event({"kind": "error", "message": message})
+            with record.condition:
+                already_reported = any(event.get("kind") == "error" for event in record.events)
+            if not already_reported:
+                message = record.stderr_tail[-1] if record.stderr_tail else f"工作进程退出码: {return_code}"
+                record.add_event({"kind": "error", "message": message})
         if not record.saw_done:
             record.add_event(
                 {
@@ -1083,6 +1249,85 @@ def _session_metadata_payload(
         "model": value.get("model"),
         "status": value.get("status", "active"),
         "toolCallCount": value.get("tool_call_count", 0),
+        "runtimeSummary": value.get("runtime_summary", ""),
+        "checkpointCount": value.get("checkpoint_count", 0),
+        "instructionSummary": value.get("instruction_summary", ""),
+        "hookSummary": value.get("hook_summary", ""),
+        "delegationSummary": value.get("delegation_summary", ""),
+        "extensionSummary": value.get("extension_summary", ""),
+        "readinessSummary": value.get("readiness_summary", ""),
+        "memorySummary": value.get("memory_summary", ""),
+    }
+
+
+def _workspace_capabilities(workspace: Path, *, source: str = "workspace") -> dict[str, Any]:
+    """Build a read-only capability snapshot without starting configured MCP servers."""
+
+    try:
+        loaded_runtime = load_runtime_config(workspace)
+    except Exception:  # noqa: BLE001 - diagnostics should survive an invalid runtime file
+        loaded_runtime = None
+    runtime = dict(loaded_runtime or {})
+    configured_mcp = runtime.get("mcpServers", {})
+    registry_runtime = dict(runtime)
+    registry_runtime["mcpServers"] = {}
+    registry = create_default_tool_registry(str(workspace), runtime=registry_runtime)
+    try:
+        product_snapshot = build_product_snapshot(workspace, runtime=runtime)
+        try:
+            memory_stats: Any = {"stats": MemoryManager(project_root=workspace).get_stats()}
+        except Exception:  # noqa: BLE001 - memory diagnostics are optional
+            memory_stats = {}
+        return capability_surface(
+            registry,
+            product_snapshot=product_snapshot,
+            memory=memory_stats,
+            mcp_servers=configured_mcp,
+            source=source,
+        )
+    finally:
+        try:
+            registry.dispose()
+        except Exception:  # noqa: BLE001,S110 - disposer failures must not hide the snapshot
+            pass
+
+
+def _session_inspection_payload(session: Any) -> dict[str, Any]:
+    workspace = Path(session.workspace)
+    model = str(session.metadata.model or "default")
+    try:
+        context_stats = public_context_stats(compute_context_stats(session.messages, model))
+    except Exception:  # noqa: BLE001 - inspection remains useful without token accounting
+        context_stats = public_context_stats({})
+    try:
+        memory = public_memory({"stats": MemoryManager(project_root=workspace).get_stats()})
+    except Exception:  # noqa: BLE001
+        memory = public_memory(session.memory_continuity)
+
+    permission_items = session.permissions_summary.get("items", []) \
+        if isinstance(session.permissions_summary, dict) else []
+    if not isinstance(permission_items, list):
+        permission_items = []
+    return {
+        "contextStats": context_stats,
+        "permissions": {
+            "configured": bool(permission_items),
+            "itemCount": len(permission_items),
+        },
+        "skills": public_skills(session.skills),
+        "mcpServers": public_mcp_servers(session.mcp_servers),
+        "instructionLayers": public_instruction_layers(session.instruction_layers),
+        "hookStatus": public_hook_status(session.hook_status),
+        "delegationStatus": public_delegation_status(session.delegation_status),
+        "extensions": public_extensions(session.extension_manifests),
+        "readiness": public_readiness(session.readiness_report),
+        "memory": memory,
+        "runtimeRuns": [
+            public_runtime_trace(trace, workspace)
+            for trace in session.runtime_runs[-20:]
+            if isinstance(trace, dict)
+        ],
+        "checkpoints": public_checkpoints(session.checkpoints, workspace),
     }
 
 
@@ -1336,12 +1581,16 @@ def create_app(
 
     @app.get("/api/navigation")
     def navigation_get() -> dict[str, Any]:
-        return _navigation_payload(app.state.current_workspace)
+        return manager.overlay_navigation_statuses(
+            _navigation_payload(app.state.current_workspace)
+        )
 
     @app.put("/api/navigation/pins")
     def navigation_pin(update: NavigationPinUpdate) -> dict[str, Any]:
         _set_navigation_pin(update)
-        return _navigation_payload(app.state.current_workspace)
+        return manager.overlay_navigation_statuses(
+            _navigation_payload(app.state.current_workspace)
+        )
 
     @app.get("/api/sessions")
     def sessions_get(workspace: str | None = Query(default=None)) -> dict[str, Any]:
@@ -1382,6 +1631,31 @@ def create_app(
             "messages": messages[-300:],
         }
 
+    @app.get("/api/sessions/{session_id}/inspect")
+    def session_inspect(session_id: str) -> dict[str, Any]:
+        session = load_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在。")
+        return {
+            "session": _session_metadata_payload(
+                session.metadata,
+                scope=_session_scope(session.session_id, session.workspace),
+            ),
+            "inspect": _session_inspection_payload(session),
+        }
+
+    @app.get("/api/sessions/{session_id}/run")
+    def session_run(session_id: str) -> dict[str, Any]:
+        session = load_session(session_id)
+        if session is None:
+            raise HTTPException(status_code=404, detail="会话不存在。")
+        record = manager.latest_for_session(session_id)
+        if record is None:
+            return {"run": None, "events": []}
+        snapshot = record.snapshot()
+        snapshot["run"]["scope"] = _session_scope(session.session_id, session.workspace)
+        return snapshot
+
     @app.delete("/api/sessions/{session_id}")
     def session_delete(session_id: str) -> dict[str, Any]:
         if manager.session_is_active(session_id):
@@ -1401,27 +1675,34 @@ def create_app(
             existing_scope = _session_scope(session.session_id, session.workspace)
             if existing_scope != body.scope:
                 raise HTTPException(status_code=400, detail="不能在项目对话与独立对话之间切换会话类型。")
-        record = manager.start(workspace, body.prompt, body.session_id)
+        record = manager.start(
+            workspace,
+            body.prompt,
+            body.session_id,
+            body.execution_profile,
+        )
         _set_session_scope(record.session_id, body.scope)
         return {"run": {**record.public(), "scope": body.scope}}
 
     @app.get("/api/runs/{run_id}")
-    def run_get(run_id: str) -> dict[str, Any]:
+    def run_get(
+        run_id: str, after: int = Query(default=0, ge=0)
+    ) -> dict[str, Any]:
         record = manager.get(run_id)
-        return {"run": record.public(), "events": list(record.events)}
+        return record.snapshot(after=after)
 
     @app.get("/api/runs/{run_id}/events")
     async def run_events(request: Request, run_id: str, after: int = Query(default=0, ge=0)):
         record = manager.get(run_id)
 
-        async def stream() -> Iterator[str]:
+        async def stream() -> AsyncIterator[str]:
             cursor = after
             heartbeat_at = time.monotonic()
             while True:
                 if await request.is_disconnected():
                     break
                 with record.condition:
-                    pending = [event for event in record.events if int(event.get("sequence", 0)) > cursor]
+                    pending = list(record._events_after_locked(cursor))
                     status = record.status
                 for event in pending:
                     cursor = int(event["sequence"])
@@ -1450,6 +1731,24 @@ def create_app(
     @app.get("/api/workspace/status")
     def workspace_status(path: str = Query(min_length=1, max_length=4_096)) -> dict[str, Any]:
         return _workspace_status(_resolve_workspace(path))
+
+    @app.get("/api/workspace/capabilities")
+    def workspace_capabilities(
+        path: str | None = Query(default=None, max_length=4_096),
+        scope: Literal["project", "standalone"] = Query(default="project"),
+    ) -> dict[str, Any]:
+        if scope == "standalone":
+            workspace = _standalone_workspace()
+        elif path:
+            workspace = _resolve_workspace(path)
+        else:
+            raise HTTPException(status_code=400, detail="项目能力快照需要工作区路径。")
+        return {
+            "capabilities": _workspace_capabilities(
+                workspace,
+                source="standalone" if scope == "standalone" else "workspace",
+            )
+        }
 
     @app.get("/api/workspace/files")
     def workspace_files(
