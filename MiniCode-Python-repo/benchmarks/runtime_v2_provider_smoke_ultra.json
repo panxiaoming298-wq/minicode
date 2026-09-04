@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "status": "passed",
+  "outcome": "answered",
+  "live_provider_claim": true,
+  "attempted": true,
+  "prompt": "Reply with exactly OK.",
+  "timeout_seconds": 120,
+  "provider": "deepseek",
+  "model": "deepseek-v4-pro",
+  "execution_profile": "ultra",
+  "selected_route": "deep-single",
+  "summary": "OK",
+  "failure_category": "none",
+  "retryable": false,
+  "ownership": "none",
+  "recovery_action": "No recovery action required.",
+  "error_code": "",
+  "request_id": "",
+  "latency_ms": 39592.5,
+  "readiness": {
+    "status": "ready",
+    "fallback_ready": true,
+    "fallback_candidates": 1,
+    "viable_fallbacks": 1,
+    "risk_scope": "none"
+  },
+  "trace": {
+    "available": true,
+    "readiness_status": "ready",
+    "repair_step_count": 2
+  }
+}

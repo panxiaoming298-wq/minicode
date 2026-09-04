@@ -1,0 +1,93 @@
+{
+  "environment": {
+    "platform": "Windows-10-10.0.26200-SP0",
+    "processor_count": 16,
+    "python": "3.11.5",
+    "samples": 20,
+    "standard_worker_ms": 1000.0,
+    "ultra_logical_units": 5,
+    "ultra_unit_ms": 1200.0,
+    "warmups": 3
+  },
+  "evaluation": {
+    "passed": true,
+    "standard": {
+      "model_call_delta": 0.0,
+      "p95_delta_pct": 3.1578,
+      "passed": true,
+      "success_delta_pp": 0.0,
+      "thresholds": {
+        "maximum_model_call_delta": 0.0,
+        "maximum_p95_delta_pct": 10.0,
+        "maximum_token_delta_pct": 10.0,
+        "minimum_success_delta_pp": -2.0
+      },
+      "token_delta_pct": 0.0
+    },
+    "ultra": {
+      "passed": true,
+      "success_delta_pp": 0.0,
+      "thresholds": {
+        "minimum_success_delta_pp": 10.0,
+        "minimum_wall_clock_improvement_pct": 25.0,
+        "rule": "either"
+      },
+      "wall_clock_improvement_pct": 36.3853
+    }
+  },
+  "generated_at": 1788316293.6006901,
+  "method": {
+    "provider": "deterministic bounded Worker; no network",
+    "standard_baseline": "runtimeV2=false retained compatibility path",
+    "standard_candidate": "unified standard-single path",
+    "ultra_baseline": "unified Standard executing five equivalent logical units serially",
+    "ultra_candidate": "three parallel read units, one exclusive writer unit, one verifier unit"
+  },
+  "schema_version": "minicode-runtime-v2-calibration-v1",
+  "summaries": {
+    "legacy_standard": {
+      "mean_model_calls": 1.0,
+      "mean_tokens": 128.0,
+      "median_ms": 1000.5126,
+      "p95_ms": 1000.8427,
+      "routes": [
+        "legacy-direct"
+      ],
+      "samples": 20,
+      "success_rate": 1.0
+    },
+    "serial_equivalent_workload": {
+      "mean_model_calls": 1.0,
+      "mean_tokens": 500.0,
+      "median_ms": 6028.862,
+      "p95_ms": 6034.6978,
+      "routes": [
+        "standard-single"
+      ],
+      "samples": 20,
+      "success_rate": 1.0
+    },
+    "ultra_read_fanout": {
+      "mean_model_calls": 5.0,
+      "mean_tokens": 500.0,
+      "median_ms": 3819.1148,
+      "p95_ms": 3838.9541,
+      "routes": [
+        "ultra-read-fanout"
+      ],
+      "samples": 20,
+      "success_rate": 1.0
+    },
+    "unified_standard": {
+      "mean_model_calls": 1.0,
+      "mean_tokens": 128.0,
+      "median_ms": 1027.2407,
+      "p95_ms": 1032.4471,
+      "routes": [
+        "standard-single"
+      ],
+      "samples": 20,
+      "success_rate": 1.0
+    }
+  }
+}
