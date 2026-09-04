@@ -7,7 +7,7 @@ import os
 from dataclasses import asdict
 from pathlib import Path
 
-from minicode.agent_loop import run_agent_turn
+from minicode.unified_runtime import run_runtime_turn as run_agent_turn
 from minicode.cli_commands import try_handle_local_command
 from minicode.config import load_runtime_config
 from minicode.history import load_history_entries, save_history_entries
@@ -44,12 +44,14 @@ def _handle_local_command(user_input: str, tools) -> str | None:
 
 
 def _render_banner(runtime: dict | None, cwd: str, permission_summary: list[str], counts: dict[str, int]) -> str:
-    model = runtime["model"] if runtime else "unconfigured"
+    model = runtime.get("model", "unconfigured") if runtime else "unconfigured"
+    profile = str((runtime or {}).get("executionProfile", "standard"))
     lines = [
         "╔══════════════════════════════════════════════════════════╗",
         "║  🤖 MiniCode Python - Your Terminal Coding Assistant    ║",
         "╠══════════════════════════════════════════════════════════╣",
         f"║  Model: {model:<46} ║",
+        f"║  Profile: {profile:<44} ║",
         f"║  CWD: {cwd:<50} ║",
     ]
     if permission_summary:
@@ -369,6 +371,12 @@ def main() -> None:
         action="store_true",
         help="Load project-level .mcp.json (disabled by default for security; also via MINI_CODE_TRUST_PROJECT_MCP=1)",
     )
+    parser.add_argument(
+        "--profile",
+        choices=["standard", "ultra"],
+        default=None,
+        help="Unified Runtime execution profile (default: standard)",
+    )
 
     args, remaining_argv = parser.parse_known_args()
     if remaining_argv and not any(not arg.startswith("--") for arg in remaining_argv):
@@ -466,12 +474,18 @@ def main() -> None:
             file=sys.stderr,
         )
 
+    if args.profile is not None:
+        if runtime is None:
+            runtime = {"executionProfile": args.profile, "runtimeV2": True}
+        else:
+            runtime["executionProfile"] = args.profile
+
     prompt_handler = _make_cli_permission_prompt() if sys.stdin.isatty() else None
     tools = create_default_tool_registry(cwd, runtime=runtime)
     permissions = PermissionManager(cwd, prompt=prompt_handler)
     
     # Use unified model registry for adapter creation
-    force_mock = runtime is None
+    force_mock = runtime is None or not runtime.get("model")
     model = create_model_adapter(
         model=runtime.get("model", "") if runtime else "",
         tools=tools,

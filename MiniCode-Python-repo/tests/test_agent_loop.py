@@ -1,4 +1,10 @@
-from minicode.agent_loop import run_agent_turn
+import threading
+
+from minicode.agent_loop import (
+    _execute_single_tool,
+    _fetch_has_lookup_evidence,
+    run_agent_turn,
+)
 from minicode.model_switcher import ModelSwitcher
 from minicode.state import create_app_store
 from minicode.tooling import ToolDefinition, ToolRegistry, ToolResult
@@ -45,6 +51,85 @@ class NamedProviderUnavailableModel(ModelAdapter):
 
     def next(self, messages: list[ChatMessage], on_stream_chunk=None, store=None) -> AgentStep:
         raise RuntimeError(f"No available channel for model {self.model_id} under group cc")
+
+
+def test_tool_timeout_does_not_wait_for_noncooperative_tool() -> None:
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    result_box = {}
+
+    def block(_input_data: dict, _context) -> ToolResult:
+        started.set()
+        release.wait(timeout=5)
+        return ToolResult(ok=True, output="late")
+
+    registry = ToolRegistry(
+        [
+            ToolDefinition(
+                name="block",
+                description="block",
+                input_schema={"type": "object"},
+                validator=lambda value: value,
+                run=block,
+            )
+        ]
+    )
+
+    def execute() -> None:
+        result_box["result"] = _execute_single_tool(
+            {"id": "timeout", "toolName": "block", "input": {}},
+            registry,
+            ".",
+            None,
+            None,
+            {},
+            None,
+            1,
+            None,
+            None,
+            tool_scheduler=SimpleNamespace(_force_tool_timeout=0.01),
+        )
+        finished.set()
+
+    thread = threading.Thread(target=execute)
+    thread.start()
+    try:
+        assert started.wait(timeout=1)
+        assert finished.wait(timeout=1)
+        assert result_box["result"].ok is False
+        assert "timed out" in result_box["result"].output
+    finally:
+        release.set()
+        thread.join(timeout=1)
+
+
+def test_tool_executor_crash_is_not_retried_as_a_duplicate_call() -> None:
+    class CrashingRegistry:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def execute(self, _name, _input, _context):
+            self.calls += 1
+            raise RuntimeError("boom")
+
+    registry = CrashingRegistry()
+    result = _execute_single_tool(
+        {"id": "crash", "toolName": "crash", "input": {}},
+        registry,
+        ".",
+        None,
+        None,
+        {},
+        None,
+        1,
+        None,
+        None,
+    )
+
+    assert result.ok is False
+    assert "crashed (RuntimeError)" in result.output
+    assert registry.calls == 1
 
 
 class UnnamedProviderUnavailableModel(ModelAdapter):
@@ -930,3 +1015,209 @@ def test_model_switcher_bounds_custom_openai_host_fallbacks_with_legacy_api_base
     switcher.record_runtime_failure("gpt5.5")
 
     assert switcher._fallback_candidates() == ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"]
+
+
+class ToolAwareResearchModel(ModelAdapter):
+    def __init__(self, tools: ToolRegistry, sequence: list[str]) -> None:
+        self.tools = tools
+        self.sequence = sequence
+        self.calls = 0
+
+    def next(self, messages: list[ChatMessage], on_stream_chunk=None) -> AgentStep:
+        self.calls += 1
+        if all(self.tools.find(name) is None for name in ("web_search", "web_fetch")):
+            return AgentStep(
+                type="assistant",
+                content="根据已经取得并标注日期的来源，现将结果整理如下。",
+            )
+        index = min(self.calls - 1, len(self.sequence) - 1)
+        tool_name = self.sequence[index]
+        tool_input = (
+            {"query": "C罗 近况"}
+            if tool_name == "web_search"
+            else {"url": f"https://example.com/source-{self.calls}"}
+        )
+        return AgentStep(
+            type="tool_calls",
+            calls=[
+                {
+                    "id": f"network-{self.calls}",
+                    "toolName": tool_name,
+                    "input": tool_input,
+                }
+            ],
+        )
+
+
+def _research_tool(name: str, executions: list[str]) -> ToolDefinition:
+    def run(_input_data: dict, _context) -> ToolResult:
+        executions.append(name)
+        if name == "web_search":
+            return ToolResult(
+                ok=True,
+                output=(
+                    "Search results for: C罗 近况\n"
+                    "PROVIDER: Google News RSS\n"
+                    "RELEVANCE_FILTER: strong\n"
+                    "URL: https://example.com/source\n"
+                    "Published: Tue, 01 Sep 2026 08:00:00 GMT"
+                ),
+            )
+        return ToolResult(
+            ok=True,
+            output="URL: https://example.com/source\nSTATUS: 200\nReuters dated report",
+        )
+
+    return ToolDefinition(
+        name=name,
+        description=f"fake {name}",
+        input_schema={"type": "object"},
+        validator=lambda value: value,
+        run=run,
+    )
+
+
+def test_schedule_fetch_counts_only_matching_result_with_date_or_time() -> None:
+    candidate_urls = {"https://www.formula1.com/en/racing/2026"}
+    request = "下一次最近的一场 F1 比赛是什么时候"
+
+    assert _fetch_has_lookup_evidence(
+        request,
+        "URL: https://www.formula1.com/en/racing/2026\nSTATUS: 200\nF1 news and videos",
+        candidate_urls,
+    ) is False
+    assert _fetch_has_lookup_evidence(
+        request,
+        "URL: https://www.formula1.com/en/racing/2026\nSTATUS: 200\nItaly 09-06 21:00",
+        candidate_urls,
+    ) is True
+    assert _fetch_has_lookup_evidence(
+        request,
+        "URL: https://www.formula1.com/en/racing/2026\nSTATUS: 200\nItaly 04 - 06 Sep",
+        candidate_urls,
+    ) is True
+    assert _fetch_has_lookup_evidence(
+        request,
+        "URL: https://example.com/unrelated\nSTATUS: 200\nItaly 09-06 21:00",
+        candidate_urls,
+    ) is False
+
+
+def test_agent_turn_stops_current_lookup_after_one_strong_search_and_fetch() -> None:
+    executions: list[str] = []
+    registry = ToolRegistry(
+        [
+            _research_tool("web_search", executions),
+            _research_tool("web_fetch", executions),
+        ]
+    )
+    model = ToolAwareResearchModel(registry, ["web_search", "web_fetch", "web_fetch"])
+    runtime_events: list[RuntimeEvent] = []
+
+    messages = run_agent_turn(
+        model=model,
+        tools=registry,
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "再给我查查C罗的近况"},
+        ],
+        cwd=".",
+        runtime={"runtimeProfile": "single-deep"},
+        enable_work_chain=False,
+        on_runtime_event=runtime_events.append,
+    )
+
+    assert executions == ["web_search", "web_fetch"]
+    assert model.calls == 3
+    assert model.tools is registry
+    assert messages[-1]["role"] == "assistant"
+    assert any(
+        event.category == "guard" and "足够的相关网页证据" in event.message
+        for event in runtime_events
+    )
+
+
+def test_agent_turn_stops_after_one_cross_source_dated_news_search() -> None:
+    executions: list[str] = []
+
+    def run_search(_input_data: dict, _context) -> ToolResult:
+        executions.append("web_search")
+        return ToolResult(
+            ok=True,
+            output=(
+                "Search results for: C罗 近况\n"
+                "PROVIDER: Google News RSS\n"
+                "RELEVANCE_FILTER: strong\n"
+                "Source: Reuters\nPublished: Tue, 01 Sep 2026 08:00:00 GMT\n"
+                "Source: ESPN\nPublished: Mon, 31 Aug 2026 08:00:00 GMT\n"
+                "Source: USA Today\nPublished: Sun, 30 Aug 2026 08:00:00 GMT\n"
+                "EVIDENCE_READY: cross-source dated news results"
+            ),
+        )
+
+    registry = ToolRegistry(
+        [
+            ToolDefinition(
+                name="web_search",
+                description="fake rich news search",
+                input_schema={"type": "object"},
+                validator=lambda value: value,
+                run=run_search,
+            )
+        ]
+    )
+    model = ToolAwareResearchModel(registry, ["web_search"])
+    runtime_events: list[RuntimeEvent] = []
+    progress_messages: list[str] = []
+
+    messages = run_agent_turn(
+        model=model,
+        tools=registry,
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "C罗近况"},
+        ],
+        cwd=".",
+        runtime={"runtimeProfile": "single-deep"},
+        enable_work_chain=False,
+        on_runtime_event=runtime_events.append,
+        on_progress_message=progress_messages.append,
+    )
+
+    assert executions == ["web_search"]
+    assert model.calls == 2
+    assert messages[-1]["role"] == "assistant"
+    assert any(
+        event.category == "guard" and "足够的相关网页证据" in event.message
+        for event in runtime_events
+    )
+    assert not any("足够的相关网页证据" in message for message in progress_messages)
+
+
+def test_agent_turn_enforces_network_limit_when_model_keeps_searching() -> None:
+    executions: list[str] = []
+    registry = ToolRegistry([_research_tool("web_search", executions)])
+    model = ToolAwareResearchModel(registry, ["web_search"])
+    runtime_events: list[RuntimeEvent] = []
+
+    messages = run_agent_turn(
+        model=model,
+        tools=registry,
+        messages=[
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "查一些资料"},
+        ],
+        cwd=".",
+        runtime={"networkToolLimit": 2},
+        enable_work_chain=False,
+        on_runtime_event=runtime_events.append,
+    )
+
+    assert executions == ["web_search", "web_search"]
+    assert model.calls == 3
+    assert model.tools is registry
+    assert messages[-1]["role"] == "assistant"
+    assert any(
+        event.category == "guard" and "上限（2 次）" in event.message
+        for event in runtime_events
+    )

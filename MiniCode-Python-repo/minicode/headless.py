@@ -62,6 +62,7 @@ def _write_headless_messages_trace(
         "exit_code": _headless_response_exit_code(response_text or error_text or ""),
         "readiness_report": readiness_report,
         "repair_plan": readiness_report.get("repair_plan", []),
+        "runtime_trace": (runtime or {}).get("lastRuntimeTrace"),
         "messages": result_messages or [],
         "assistant_response": response_text,
         "error": error_text,
@@ -146,7 +147,11 @@ def _make_auto_approve_prompt():
     return _auto_approve
 
 
-def run_headless(prompt: str | None = None, allow_edits: bool = False) -> str:
+def run_headless(
+    prompt: str | None = None,
+    allow_edits: bool = False,
+    profile: str | None = None,
+) -> str:
     """Run a single agent turn in headless mode and return the response.
 
     Args:
@@ -159,12 +164,13 @@ def run_headless(prompt: str | None = None, allow_edits: bool = False) -> str:
     Returns:
         The assistant's response text.
     """
-    from minicode.agent_loop import run_agent_turn
+    from minicode.unified_runtime import run_runtime_turn as run_agent_turn
     from minicode.config import load_runtime_config
     from minicode.memory import MemoryManager
     from minicode.model_registry import create_model_adapter
     from minicode.permissions import PermissionManager
     from minicode.prompt import build_system_prompt
+    from minicode.tooling import ToolRegistry
     from minicode.tools import create_default_tool_registry
     from minicode.logging_config import setup_logging, get_logger, structured_logging_requested
 
@@ -207,8 +213,28 @@ def run_headless(prompt: str | None = None, allow_edits: bool = False) -> str:
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
 
+    if profile is not None:
+        runtime["executionProfile"] = profile
+
+    bounded_provider_smoke = os.environ.get(
+        "MINICODE_BOUNDED_PROVIDER_SMOKE",
+        "",
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    if bounded_provider_smoke:
+        # Live smoke validates the real provider and unified Runtime route, not
+        # autonomous repository work.  Disable retries and tools so an Ultra
+        # check is predictably bounded to its deep Worker plus verifier.
+        runtime["runtimeRetryBudget"] = 0
+        runtime["runtimeMaxActiveWorkers"] = 1
+        runtime["runtimeMaxAgents"] = 1
+
     # Initialize components
-    tools = create_default_tool_registry(cwd, runtime=runtime)
+    base_tools = create_default_tool_registry(cwd, runtime=runtime)
+    tools = (
+        ToolRegistry([], disposer=base_tools.dispose)
+        if bounded_provider_smoke
+        else base_tools
+    )
     auto_approve = _allow_edits_requested(cli_flag=allow_edits)
     if auto_approve:
         logger.warning(
@@ -300,6 +326,12 @@ def _build_argument_parser() -> argparse.ArgumentParser:
         help="Auto-approve edits, commands, and out-of-cwd access for this run.",
     )
     parser.add_argument(
+        "--profile",
+        choices=["standard", "ultra"],
+        default=None,
+        help="Unified Runtime execution profile (default: standard)",
+    )
+    parser.add_argument(
         "prompt",
         nargs="*",
         help="Prompt to send; reads stdin when omitted.",
@@ -312,7 +344,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_argument_parser()
     parsed = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
     prompt = " ".join(parsed.prompt) if parsed.prompt else None
-    response = run_headless(prompt, allow_edits=parsed.allow_edits)
+    if parsed.profile is None:
+        response = run_headless(prompt, allow_edits=parsed.allow_edits)
+    else:
+        response = run_headless(
+            prompt,
+            allow_edits=parsed.allow_edits,
+            profile=parsed.profile,
+        )
     print(response)
     return _headless_response_exit_code(response)
 

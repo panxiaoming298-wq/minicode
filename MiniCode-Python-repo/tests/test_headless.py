@@ -85,6 +85,49 @@ def test_run_headless_forwards_runtime_to_agent_turn(monkeypatch, tmp_path: Path
     assert captured["memory_manager"].project_root == tmp_path
 
 
+def test_bounded_provider_smoke_disables_tools_retries_and_fanout(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    import minicode.headless
+
+    runtime = {"model": "fake"}
+    base_registry = ToolRegistry([])
+    captured: dict[str, object] = {}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("MINICODE_BOUNDED_PROVIDER_SMOKE", "1")
+    monkeypatch.setattr("minicode.config.load_runtime_config", lambda cwd: runtime)
+    monkeypatch.setattr(
+        "minicode.tools.create_default_tool_registry",
+        lambda cwd, runtime=None: base_registry,
+    )
+    monkeypatch.setattr("minicode.permissions.PermissionManager", _DummyPermissions)
+    monkeypatch.setattr("minicode.memory.MemoryManager", _DummyMemoryManager)
+    monkeypatch.setattr(
+        "minicode.prompt.build_system_prompt",
+        lambda cwd, permissions, context: "sys",
+    )
+    monkeypatch.setattr(
+        "minicode.model_registry.create_model_adapter",
+        lambda model, tools, runtime=None: object(),
+    )
+
+    def fake_runtime_turn(**kwargs):
+        captured["runtime"] = dict(kwargs["runtime"])
+        captured["tool_count"] = len(kwargs["tools"].list())
+        return [{"role": "assistant", "content": "OK"}]
+
+    monkeypatch.setattr("minicode.agent_loop.run_agent_turn", fake_runtime_turn)
+
+    assert minicode.headless.run_headless("Reply with exactly OK.", profile="ultra") == "OK"
+    assert captured["tool_count"] == 0
+    bounded = captured["runtime"]
+    assert bounded["executionProfile"] == "ultra"
+    assert bounded["runtimeRetryBudget"] == 0
+    assert bounded["runtimeMaxActiveWorkers"] == 1
+    assert bounded["runtimeMaxAgents"] == 1
+
+
 def test_run_headless_provider_failure_uses_runtime_channel_details(
     monkeypatch,
     tmp_path: Path,

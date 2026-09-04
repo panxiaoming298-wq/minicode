@@ -45,7 +45,9 @@ def test_container_files_match_the_packaged_runtime_surface() -> None:
 def test_dev_extra_declares_packaging_test_dependencies() -> None:
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 
-    assert "setuptools>=68" in pyproject["project"]["optional-dependencies"]["dev"]
+    dependencies = pyproject["project"]["optional-dependencies"]["dev"]
+    assert "setuptools>=68" in dependencies
+    assert "httpx2>=2.0.0,<3.0.0" in dependencies
 
 
 def test_console_script_entry_points_import() -> None:
@@ -72,6 +74,7 @@ def test_console_script_entry_points_match_main_lifecycle_contract() -> None:
         **lifecycle_script_targets(),
         "minicode-structure-check": "minicode.structure_check:main",
         "minicode-provider-smoke": "minicode.provider_smoke:main",
+        "minicode-memory": "minicode.paged_memory.admin:main",
         "minicode-web": "minicode.web_api:main",
     }
 
@@ -115,12 +118,26 @@ def test_ci_workflow_runs_release_quality_gates() -> None:
     assert "--hotspots 5 --max-dependency-upstream 4" in content
     assert "--check-material-inventory" in content
     assert "--report .temp/structure-compliance.json" in content
-    assert "--check-structure-compliance-artifact .temp/structure-compliance.json" in content
+    assert (
+        "--check-structure-compliance-artifact .temp/structure-compliance.json"
+        in content
+    )
     assert "python -m minicode.readiness --json" in content
-    assert "python -m minicode.readiness --examples-out .temp/readiness-fallback-examples.json" in content
-    assert "python -m minicode.readiness --doctor-out .temp/readiness-doctor.md" in content
-    assert "python -m minicode.readiness --repair-plan-out .temp/readiness-repair-plan.json" in content
-    assert "python -m minicode.readiness --patch-preview-out .temp/readiness-fallback-patch-preview.json" in content
+    assert (
+        "python -m minicode.readiness --examples-out .temp/readiness-fallback-examples.json"
+        in content
+    )
+    assert (
+        "python -m minicode.readiness --doctor-out .temp/readiness-doctor.md" in content
+    )
+    assert (
+        "python -m minicode.readiness --repair-plan-out .temp/readiness-repair-plan.json"
+        in content
+    )
+    assert (
+        "python -m minicode.readiness --patch-preview-out .temp/readiness-fallback-patch-preview.json"
+        in content
+    )
     assert "python -m minicode.readiness --bundle-out .temp/readiness-bundle" in content
     readiness_commands = [
         line.strip()
@@ -135,14 +152,20 @@ def test_ci_workflow_runs_release_quality_gates() -> None:
     assert "python -m minicode.release_readiness" in content
     assert "--write-artifact-manifest .temp/readiness-artifact-manifest.json" in content
     assert "--check-artifact-manifest .temp/readiness-artifact-manifest.json" in content
-    assert "--check-fallback-patch-preview .temp/readiness-fallback-patch-preview.json" in content
+    assert (
+        "--check-fallback-patch-preview .temp/readiness-fallback-patch-preview.json"
+        in content
+    )
     assert (
         "--check-fallback-simulation "
         ".temp/readiness-bundle/readiness-fallback-simulations.json"
     ) in content
     assert "--check-fallback-switch-smoke" in content
     assert "--check-readiness-bundle .temp/readiness-bundle" in content
-    assert "--artifact patch_preview_json=.temp/readiness-fallback-patch-preview.json" in content
+    assert (
+        "--artifact patch_preview_json=.temp/readiness-fallback-patch-preview.json"
+        in content
+    )
     assert ".temp/readiness-fallback-examples.json" in content
     assert ".temp/readiness-doctor.md" in content
     assert ".temp/readiness-repair-plan.json" in content

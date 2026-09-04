@@ -784,11 +784,57 @@ def load_runtime_config(
             or effective.get("runtimeProfile", "")
             or "single"
         ).strip().lower(),
+        "executionProfile": str(
+            os.environ.get("MINI_CODE_EXECUTION_PROFILE")
+            or effective.get("executionProfile", "")
+            or effective.get("profile", "")
+            or "standard"
+        ).strip().lower(),
+        "runtimeV2": str(
+            os.environ.get("MINI_CODE_RUNTIME_V2")
+            or effective.get("runtimeV2", "")
+            or "true"
+        ).strip().lower() not in {"0", "false", "no", "off", "disabled"},
         "toolProfile": str(
             os.environ.get("MINI_CODE_TOOL_PROFILE")
             or effective.get("toolProfile", "")
             or "core"
         ).strip().lower(),
+        **{
+            key: effective[key]
+            for key in (
+                "memoryV2", "memoryShadowWrite", "memoryModeAuto",
+                "memoryModeDefault", "memoryModeOverride", "memoryBackend",
+                "memoryDatabaseUrl", "memorySqlitePath", "memoryTenantId",
+                "memoryWorkspaceId", "memoryUserId",
+                "memoryWorkingSetContextRatio", "memoryPagedContextRatio",
+                "memoryWorkingSetStepThreshold", "memoryPagedStepThreshold",
+                "memoryToolResultTokenThreshold", "memoryLargeArtifactThreshold",
+                "memoryDowngradeStableSteps", "memoryDependencyMaxDepth",
+                "memoryRecentEventTokenBudget", "memoryWorkingSetTokenBudget",
+                "memorySupplementalTokenBudget", "memoryRawPageTokenLimit",
+                "memoryCandidateLimit", "memoryOutputTokenReserve",
+                "memoryToolTokenReserve", "memorySafetyTokenReserve",
+                "memoryInlineRecentTokenBudget", "memoryArtifactLargeBytes",
+                "memoryLocalSpoolEnabled", "memoryLocalSpoolRoot",
+                "memoryLocalSpoolMaxBytes", "memoryLocalSpoolKey",
+                "memoryIndexerEnabled", "memoryIndexerAsync",
+                "memoryIndexerMaxRetries", "memoryIndexerRetryBackoffSeconds",
+                "memoryRetentionDefaultDays", "memoryArtifactGcGraceHours",
+                "memoryBackupMaxAgeHours", "memoryBackupRoot",
+                "memoryBackupEncryptionKey", "memoryBackupRpoHours",
+                "memoryBackupRtoHours", "memoryLegalHoldDefault",
+                "artifactStoreType", "artifactStoreRoot", "artifactStoreEndpoint",
+                "artifactStoreBucket", "artifactStoreAccessKey",
+                "artifactStoreSecretKey", "artifactStoreRegion", "artifactStoreSecure",
+                "milvusEnabled", "milvusUri", "milvusToken", "milvusDatabase",
+                "milvusCollection", "milvusDenseDim", "milvusMetricType",
+                "milvusIndexType", "milvusSearchParams", "milvusEnableSparse",
+                "milvusEnableHybrid", "milvusRanker", "milvusBatchSize",
+                "milvusTimeoutSeconds",
+            )
+            if key in effective
+        },
         "sourceSummary": f"config: {MINI_CODE_SETTINGS_PATH} > {CLAUDE_SETTINGS_PATH} > process.env",
     }
 
@@ -934,6 +980,11 @@ def validate_config(cwd: str | Path | None = None) -> tuple[bool, list[str]]:
         for name, server in mcp_servers.items():
             if not server.get("command"):
                 errors.append(f"MCP server '{name}' has no command configured")
+        execution_profile = str(config.get("executionProfile", "standard")).lower()
+        if execution_profile not in {"standard", "ultra"}:
+            errors.append(
+                "executionProfile must be 'standard' or 'ultra'; Auto and multi-writer modes are not public"
+            )
         
         return len(errors) == 0, errors + warnings
         

@@ -3,6 +3,7 @@ from __future__ import annotations
 import concurrent.futures
 import inspect
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
@@ -14,6 +15,7 @@ from minicode.model_registry import detect_provider
 from minicode.permissions import PermissionManager
 from minicode.state import Store, AppState, increment_tool_calls, set_busy, set_idle
 from minicode.tooling import ToolContext, ToolRegistry, ToolResult
+from minicode.runtime_protocol import ToolEffect
 from minicode.types import (
     AgentStep,
     ChatMessage,
@@ -34,7 +36,6 @@ from minicode.working_memory import get_working_memory, protect_context
 from minicode.intent_parser import parse_intent
 from minicode.task_object import build_task, TaskObject, TaskState
 from minicode.task_graph import TaskGraph, TaskState as GraphTaskState
-from minicode.pipeline_engine import get_pipeline_engine
 from minicode.capability_registry import get_registry, CapabilityDomain
 from minicode.layered_context import ContextBuilder, LayeredContext
 from minicode.decision_audit import get_auditor, DecisionOutcome
@@ -84,6 +85,33 @@ from minicode.turn_kernel import (
 )
 from minicode.turn_events import AgentTurnCallbacks, AgentTurnEventSink, TurnEvent
 
+
+class _LinkedCancellationEvent:
+    """A per-call cancellation signal that also observes parent cancellation."""
+
+    def __init__(self, parent: Any | None = None) -> None:
+        self._parent = parent
+        self._local = threading.Event()
+
+    def set(self) -> None:
+        self._local.set()
+
+    def is_set(self) -> bool:
+        parent_is_set = getattr(self._parent, "is_set", None)
+        return self._local.is_set() or (
+            callable(parent_is_set) and bool(parent_is_set())
+        )
+
+    def wait(self, timeout: float | None = None) -> bool:
+        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        while not self.is_set():
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            self._local.wait(0.05 if remaining is None else min(0.05, remaining))
+        return True
+
+
 logger = get_logger("agent_loop")
 
 # 甯搁噺锛氶伩鍏嶉噸澶嶇殑鎻愮ず鏂囨湰
@@ -123,6 +151,72 @@ RESUME_AFTER_MAX_TOKENS = (
 
 
 STABLE_TASK_STATE_MARKER = "[Stable task state]"
+_NETWORK_RESEARCH_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
+_CURRENT_LOOKUP_MARKERS = (
+    "近况",
+    "最新",
+    "新闻",
+    "消息",
+    "近期",
+    "最近",
+    "实时",
+    "下一场",
+    "下一次",
+    "什么时候",
+    "赛程",
+    "日程",
+    "today",
+    "latest",
+    "current",
+    "recent",
+    "news",
+    "update",
+    "next race",
+    "next match",
+    "next game",
+    "upcoming",
+    "schedule",
+    "calendar",
+)
+_DEEP_RESEARCH_MARKERS = (
+    "深入",
+    "深度",
+    "全面",
+    "详尽",
+    "详细调研",
+    "完整调研",
+    "系统调研",
+    "多方核实",
+    "deep research",
+    "comprehensive",
+    "exhaustive",
+)
+_SCHEDULE_LOOKUP_MARKERS = (
+    "下一场",
+    "下一次",
+    "什么时候",
+    "赛程",
+    "日程",
+    "next race",
+    "next match",
+    "next game",
+    "upcoming",
+    "schedule",
+    "calendar",
+)
+_SCHEDULE_FACT_PATTERNS = (
+    r"\b20\d{2}[-/.]\d{1,2}(?:[-/.]\d{1,2})?\b",
+    r"(?<!\d)\d{1,2}[-/]\d{1,2}(?!\d)",
+    r"\d{1,2}月\d{1,2}日",
+    r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\s+\d{1,2}\b",
+    r"\b\d{1,2}(?:\s*[-–]\s*\d{1,2})?\s+"
+    r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|"
+    r"jul(?:y)?|aug(?:ust)?|sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|"
+    r"dec(?:ember)?)\b",
+    r"\b\d{1,2}:\d{2}\b",
+)
 _MODEL_FALLBACK_ERROR_HINTS = (
     "no available channel",
     "temporarily unavailable",
@@ -139,6 +233,59 @@ _MODEL_FALLBACK_ERROR_HINTS = (
     "timed out",
     "timeout",
 )
+
+
+def _latest_user_request(messages: list[ChatMessage]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content", "") or "").strip()
+    return ""
+
+
+def _network_research_policy(
+    messages: list[ChatMessage],
+    runtime: dict[str, Any],
+    *,
+    profile_name: str,
+) -> tuple[int, bool]:
+    """Return the per-turn network-call ceiling and whether early evidence stop applies."""
+
+    request = _latest_user_request(messages).casefold()
+    is_current_lookup = any(marker in request for marker in _CURRENT_LOOKUP_MARKERS)
+    is_deep_research = any(marker in request for marker in _DEEP_RESEARCH_MARKERS)
+    simple_current_lookup = is_current_lookup and not is_deep_research
+
+    configured_limit = runtime.get("networkToolLimit")
+    if configured_limit is not None:
+        try:
+            return max(1, min(int(configured_limit), 50)), simple_current_lookup
+        except (TypeError, ValueError):
+            pass
+    if simple_current_lookup:
+        return 3, True
+    return (12 if profile_name == "single-deep" else 8), False
+
+
+def _fetch_has_lookup_evidence(
+    request: str,
+    output: str,
+    candidate_urls: set[str],
+) -> bool:
+    """Only count fetched evidence when it came from a strong search result."""
+
+    fetched_url_match = re.search(r"(?m)^URL:\s*(https?://\S+)", output)
+    if not fetched_url_match or not candidate_urls:
+        return False
+    fetched_url = fetched_url_match.group(1).rstrip("/").casefold()
+    if fetched_url not in candidate_urls:
+        return False
+    lowered_request = request.casefold()
+    if not any(marker in lowered_request for marker in _SCHEDULE_LOOKUP_MARKERS):
+        return True
+    return any(
+        re.search(pattern, output, flags=re.IGNORECASE)
+        for pattern in _SCHEDULE_FACT_PATTERNS
+    )
 
 
 def _with_reasoning_content(
@@ -227,9 +374,9 @@ def _summarize_model_api_failure(
     fallback_errors = fallback_errors or []
     if fallback_errors:
         combined = " ".join(fallback_errors)
-        if (
-            "no viable fallback models were available" in combined.lower()
-            and any(_looks_like_provider_availability_error(item) for item in fallback_errors + [str(error)])
+        if "no viable fallback models were available" in combined.lower() and any(
+            _looks_like_provider_availability_error(item)
+            for item in fallback_errors + [str(error)]
         ):
             runtime = runtime or {}
             guidance_model = (
@@ -239,7 +386,11 @@ def _summarize_model_api_failure(
                 or "the active model"
             )
             model_label = guidance_model or active_model_id or "the active model"
-            provider = detect_provider(guidance_model, runtime).value if guidance_model else "unknown"
+            provider = (
+                detect_provider(guidance_model, runtime).value
+                if guidance_model
+                else "unknown"
+            )
             channel = describe_provider_channel(runtime, provider)
             guidance = describe_fallback_guidance(
                 runtime,
@@ -288,12 +439,16 @@ def _extract_task_description(messages: list[ChatMessage]) -> str:
     for msg in messages:
         if msg.get("role") == "user" and msg.get("content"):
             content = str(msg["content"])
-            if not content.startswith("Continue") and not content.startswith("Your last"):
+            if not content.startswith("Continue") and not content.startswith(
+                "Your last"
+            ):
                 return content[:500]
     return "Unknown task"
 
 
-def _build_work_chain_task(messages: list[ChatMessage]) -> tuple[TaskObject | None, dict]:
+def _build_work_chain_task(
+    messages: list[ChatMessage],
+) -> tuple[TaskObject | None, dict]:
     """Build TaskObject from conversation messages and return it with metadata."""
     raw_input = _extract_task_description(messages)
     if raw_input == "Unknown task":
@@ -309,8 +464,10 @@ def _build_work_chain_task(messages: list[ChatMessage]) -> tuple[TaskObject | No
     }
     logger.info(
         "Work chain: intent=%s action=%s confidence=%.2f complexity=%s",
-        intent.intent_type.value, intent.action_type.value,
-        intent.confidence, intent.complexity_hint,
+        intent.intent_type.value,
+        intent.action_type.value,
+        intent.confidence,
+        intent.complexity_hint,
     )
     return task, metadata
 
@@ -352,6 +509,7 @@ def _register_tool_capabilities(tools: ToolRegistry) -> None:
     for tool_name in tools.list_all():
         try:
             from minicode.capability_registry import CapabilityMetadata, CapabilityScope
+
             tool_def = tools.find(tool_name)
             if not tool_def:
                 continue
@@ -369,18 +527,28 @@ def _register_tool_capabilities(tools: ToolRegistry) -> None:
             elif "memory" in tool_name:
                 domain = CapabilityDomain.MEMORY
             scope = CapabilityScope.READONLY
-            if any(k in tool_name for k in ("write", "modify", "edit", "delete", "create")):
+            if any(
+                k in tool_name for k in ("write", "modify", "edit", "delete", "create")
+            ):
                 scope = CapabilityScope.WRITE
             if any(k in tool_name for k in ("command", "exec", "run")):
                 scope = CapabilityScope.DESTRUCTIVE
             if any(k in tool_name for k in ("web", "fetch", "http")):
                 scope = CapabilityScope.EXTERNAL
             metadata = CapabilityMetadata(
-                name=tool_name, domain=domain, scope=scope,
+                name=tool_name,
+                domain=domain,
+                scope=scope,
                 description=tool_def.description or f"Tool: {tool_name}",
                 tags=["tool", tool_name],
             )
-            registry.register(metadata, lambda **kw: tools.execute(tool_name, kw, ToolContext(cwd=str(Path.cwd()))), None)
+            registry.register(
+                metadata,
+                lambda **kw: tools.execute(
+                    tool_name, kw, ToolContext(cwd=str(Path.cwd()))
+                ),
+                None,
+            )
         except Exception as e:
             logger.debug("Failed to register tool %s as capability: %s", tool_name, e)
 
@@ -397,66 +565,144 @@ def _execute_single_tool(
     on_tool_start: Callable[[str, dict], None] | None,
     on_tool_result: Callable[[str, str, bool], None] | None,
     tool_scheduler: Any | None = None,
+    memory_preflight: Callable[[dict, ToolEffect], str | None] | None = None,
+    memory_result_observer: Callable[[dict, ToolResult], ToolResult | None]
+    | None = None,
 ) -> ToolResult:
     """Execute a single tool call with hooks, state updates, and crash protection.
-    
+
     Used both for serial execution and as a worker function for concurrent execution.
     When running concurrently (store/on_tool_start/on_tool_result are None),
     hooks and UI callbacks are deferred to the result processing phase.
-    
+
     Includes a global exception safety net: any unexpected crash in the tool
     execution pipeline (hooks, state updates, etc.) is caught and converted
     to an error ToolResult, preventing the entire agent loop from crashing.
     """
     tool_name = call["toolName"]
     tool_input = call["input"]
-    
+
+    runtime_context = (runtime or {}).get("_runtimeContext")
+    raw_allowed_effects = (runtime or {}).get("_allowedToolEffects")
+    allowed_effects = None
+    if raw_allowed_effects is not None:
+        allowed_effects = frozenset(
+            item if isinstance(item, ToolEffect) else ToolEffect(str(item))
+            for item in raw_allowed_effects
+        )
+    cancellation_event = _LinkedCancellationEvent(
+        (runtime or {}).get("_cancellationEvent")
+    )
+    tool_context = ToolContext(
+        cwd=cwd,
+        permissions=permissions,
+        session=session,
+        _runtime=runtime,
+        runtime_context=runtime_context,
+        allowed_effects=allowed_effects,
+        cancellation_event=cancellation_event,
+        node_id=(runtime or {}).get("_runtimeNodeId"),
+        attempt_id=(runtime or {}).get("_runtimeAttemptId"),
+        idempotency_key=(runtime or {}).get("_runtimeIdempotencyKey"),
+        run_id=(runtime or {}).get("_runtimeActiveRunId"),
+        tool_call_id=str(
+            call.get("id") or call.get("toolCallId") or f"step-{step}:{tool_name}"
+        ),
+        base_revision=(runtime or {}).get("_runtimeBaseRevision"),
+        raw_result_observer=(
+            (lambda _tool_name, result: memory_result_observer(call, result))
+            if memory_result_observer is not None
+            else None
+        ),
+    )
+
     try:
+        if memory_preflight is not None:
+            tool_definition = tools.find(tool_name)
+            effect = (
+                tool_definition.effect
+                if tool_definition is not None
+                else ToolEffect.PRIVILEGED
+            )
+            blocked_reason = memory_preflight(call, effect)
+            if blocked_reason:
+                return ToolResult(ok=False, output=blocked_reason)
+
         # Pre-tool hooks and UI (only for serial execution)
         if on_tool_start:
             on_tool_start(tool_name, tool_input)
-        
+
         if store:
             store.set_state(set_busy(tool_name))
-        
-        # Execute the tool with timeout protection
-        import concurrent.futures
+
+        # Execute the tool with a bounded wait.  A timed-out call receives its
+        # own cancellation signal, while parent Runtime cancellation remains
+        # visible through the linked event.
         import os
-        _base_timeout = int(os.environ.get("MINICODE_TOOL_TIMEOUT", "120"))
+
+        try:
+            _base_timeout = max(
+                0.0,
+                float(os.environ.get("MINICODE_TOOL_TIMEOUT", "120")),
+            )
+        except ValueError:
+            _base_timeout = 120.0
         TOOL_TIMEOUT = (
-            int(getattr(tool_scheduler, '_force_tool_timeout', _base_timeout))
-            if tool_scheduler and hasattr(tool_scheduler, '_force_tool_timeout')
+            max(
+                0.0,
+                float(getattr(tool_scheduler, "_force_tool_timeout", _base_timeout)),
+            )
+            if tool_scheduler and hasattr(tool_scheduler, "_force_tool_timeout")
             else _base_timeout
         )
-        try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                future = pool.submit(
-                    tools.execute,
-                    tool_name, tool_input,
-                    ToolContext(cwd=cwd, permissions=permissions, session=session, _runtime=runtime),
+        completed = threading.Event()
+        outcome: dict[str, Any] = {}
+
+        def execute_tool() -> None:
+            try:
+                outcome["result"] = tools.execute(
+                    tool_name,
+                    tool_input,
+                    tool_context,
                 )
-                result = future.result(timeout=TOOL_TIMEOUT)
-        except concurrent.futures.TimeoutError:
+            except BaseException as error:
+                outcome["error"] = error
+            finally:
+                completed.set()
+
+        tool_thread = threading.Thread(
+            target=execute_tool,
+            name=f"minicode-tool-{tool_name}",
+            daemon=True,
+        )
+        tool_thread.start()
+        if not completed.wait(TOOL_TIMEOUT):
+            cancellation_event.set()
             result = ToolResult(
                 ok=False,
-                output=f"Tool '{tool_name}' timed out after {TOOL_TIMEOUT}s",
+                output=f"Tool '{tool_name}' timed out after {TOOL_TIMEOUT:g}s",
             )
-        except Exception:
-            result = tools.execute(
-                tool_name, tool_input,
-                ToolContext(cwd=cwd, permissions=permissions, session=session, _runtime=runtime),
-            )  # Fallback: direct execution
-        
+        elif "error" in outcome:
+            error = outcome["error"]
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise error
+            result = ToolResult(
+                ok=False,
+                output=f"Tool '{tool_name}' crashed ({type(error).__name__}): {error}",
+            )
+        else:
+            result = outcome["result"]
+
         # Post-tool state updates (only for serial execution)
         if store:
             store.set_state(increment_tool_calls())
             store.set_state(set_idle())
-        
+
         if on_tool_result:
             on_tool_result(tool_name, result.output, not result.ok)
-        
+
         return result
-    
+
     except (KeyboardInterrupt, SystemExit):
         # Always propagate these
         raise
@@ -466,26 +712,33 @@ def _execute_single_tool(
         # it to an error result. This prevents a single tool crash from
         # cascading into a full session failure.
         import traceback
-        tb_excerpt = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__)[-3:]).strip()
+
+        tb_excerpt = "".join(
+            traceback.format_exception(type(exc), exc, exc.__traceback__)[-3:]
+        ).strip()
         error_type = type(exc).__name__
-        
+
         logger.error("Tool execution pipeline crashed (%s): %s", error_type, exc)
-        
+
         # Ensure state is reset even on crash
         if store:
             try:
                 store.set_state(set_idle())
             except Exception:
                 pass
-        
+
         return ToolResult(
             ok=False,
             output=f"[{error_type}] Tool execution pipeline crashed: {exc}\n"
-                   f"Traceback:\n{tb_excerpt}"
+            f"Traceback:\n{tb_excerpt}",
         )
 
 
-def _format_diagnostics(stop_reason: str | None, block_types: list[str] | None, ignored_block_types: list[str] | None) -> str:
+def _format_diagnostics(
+    stop_reason: str | None,
+    block_types: list[str] | None,
+    ignored_block_types: list[str] | None,
+) -> str:
     parts: list[str] = []
     if stop_reason:
         parts.append(f"stop_reason={stop_reason}")
@@ -496,7 +749,9 @@ def _format_diagnostics(stop_reason: str | None, block_types: list[str] | None, 
     return f" Diagnostics: {'; '.join(parts)}." if parts else ""
 
 
-def _is_recoverable_thinking_stop(*, is_empty: bool, stop_reason: str | None, ignored_block_types: list[str] | None) -> bool:
+def _is_recoverable_thinking_stop(
+    *, is_empty: bool, stop_reason: str | None, ignored_block_types: list[str] | None
+) -> bool:
     if not is_empty:
         return False
     if stop_reason not in {"pause_turn", "max_tokens"}:
@@ -504,7 +759,9 @@ def _is_recoverable_thinking_stop(*, is_empty: bool, stop_reason: str | None, ig
     return "thinking" in (ignored_block_types or [])
 
 
-def _should_treat_assistant_as_progress(*, kind: str | None, content: str, saw_tool_result: bool) -> bool:
+def _should_treat_assistant_as_progress(
+    *, kind: str | None, content: str, saw_tool_result: bool
+) -> bool:
     if kind == "progress":
         return True
     if kind == "final":
@@ -515,6 +772,7 @@ def _should_treat_assistant_as_progress(*, kind: str | None, content: str, saw_t
 
 
 # ── Preemptive context guard (Claude Code-style blocking limit) ─────────────
+
 
 def _is_at_blocking_limit(
     token_count: int,
@@ -570,8 +828,12 @@ def _try_compact_with_breaker(
     except Exception as exc:
         breaker.record_failure()
         bs = breaker.get_state()
-        logger_fn("Compaction failed (breaker=%d/%d): %s",
-                  bs.consecutive_failures, breaker.config.failure_threshold, exc)
+        logger_fn(
+            "Compaction failed (breaker=%d/%d): %s",
+            bs.consecutive_failures,
+            breaker.config.failure_threshold,
+            exc,
+        )
         return current_messages, False
 
 
@@ -624,7 +886,8 @@ def _apply_control_signal(
     ):
         logger.info(
             "FeedbackController: limiting max_steps %d -> %d",
-            max_steps, control_signal.limit_max_steps,
+            max_steps,
+            control_signal.limit_max_steps,
         )
         max_steps = control_signal.limit_max_steps
 
@@ -646,7 +909,8 @@ def _apply_control_signal(
                 tb.budget_per_message = new_budget
             logger.info(
                 "FeedbackController: token budget adjusted to %d (mult=%.2f)",
-                new_budget, control_signal.adjust_token_budget,
+                new_budget,
+                control_signal.adjust_token_budget,
             )
 
     if control_signal.reduce_parallelism:
@@ -667,7 +931,8 @@ def _apply_control_signal(
             tool_scheduler._force_max_workers = cap
         logger.info(
             "FeedbackController: adjust_concurrency=%+d -> max_workers=%d",
-            control_signal.adjust_concurrency, cap,
+            control_signal.adjust_concurrency,
+            cap,
         )
 
     if control_signal.increase_model_level:
@@ -677,7 +942,7 @@ def _apply_control_signal(
             system_state.performance_score(),
         )
         if model_switcher:
-            if hasattr(model_switcher, '_pending_upgrade'):
+            if hasattr(model_switcher, "_pending_upgrade"):
                 model_switcher._pending_upgrade = True  # type: ignore[attr-defined]
 
     if control_signal.decrease_model_level:
@@ -703,7 +968,9 @@ def _apply_control_signal(
         # Queue skill update for next maintenance cycle
         if not hasattr(tool_scheduler, "_pending_skill_update"):
             tool_scheduler._pending_skill_update = True  # type: ignore[attr-defined]
-        logger.info("FeedbackController: skill update queued for next maintenance cycle")
+        logger.info(
+            "FeedbackController: skill update queued for next maintenance cycle"
+        )
 
     if control_signal.reduce_tool_timeout:
         new_timeout = max(5.0, control_signal.reduce_tool_timeout)
@@ -713,9 +980,9 @@ def _apply_control_signal(
             "FeedbackController: tool timeout reduced to %.1fs (high error rate)",
             new_timeout,
         )
-    elif hasattr(tool_scheduler, '_force_tool_timeout'):
+    elif hasattr(tool_scheduler, "_force_tool_timeout"):
         # Reset timeout when signal no longer active
-        if hasattr(tool_scheduler, '_force_tool_timeout'):
+        if hasattr(tool_scheduler, "_force_tool_timeout"):
             del tool_scheduler._force_tool_timeout
 
     if control_signal.increase_nudge_frequency:
@@ -724,8 +991,8 @@ def _apply_control_signal(
             "FeedbackController: nudge frequency increased (stability=%.2f)",
             system_state.stability_score(),
         )
-    elif hasattr(tool_scheduler, '_force_nudge_frequency'):
-        if hasattr(tool_scheduler, '_force_nudge_frequency'):
+    elif hasattr(tool_scheduler, "_force_nudge_frequency"):
+        if hasattr(tool_scheduler, "_force_nudge_frequency"):
             del tool_scheduler._force_nudge_frequency
 
     if control_signal.promote_pattern:
@@ -740,7 +1007,11 @@ def _apply_control_signal(
 
     if control_signal.force_compaction and context_compactor:
         try:
-            compacted = context_compactor.compact_messages() if hasattr(context_compactor, 'compact_messages') else False
+            compacted = (
+                context_compactor.compact_messages()
+                if hasattr(context_compactor, "compact_messages")
+                else False
+            )
             logger.info(
                 "FeedbackController: forced compaction completed (%d messages)",
                 len(compacted) if compacted else 0,
@@ -776,6 +1047,7 @@ def run_agent_turn(
     project_context: str = "",
     enable_work_chain: bool = True,
     callbacks: AgentTurnCallbacks | AgentTurnEventSink | None = None,
+    paged_memory_runtime: Any | None = None,
 ) -> list[ChatMessage]:
     # Prelude: prepare per-turn state before we enter the recurrent think/act loop.
     current_messages = list(messages)
@@ -800,6 +1072,155 @@ def run_agent_turn(
         ),
     )
     max_steps = runtime_profile.max_steps
+    from minicode.paged_memory.service import (
+        ArtifactPersistenceRequired,
+        ContextBudgetExceeded,
+    )
+
+    owns_paged_memory_runtime = False
+    active_paged_memory = paged_memory_runtime
+    paged_memory_shadow_disabled = False
+    if active_paged_memory is None:
+        from minicode.paged_memory.service import PagedMemoryRuntime
+
+        raw_context_limit = (
+            getattr(context_manager, "context_window", 0)
+            or runtime.get("contextWindow", 0)
+            or runtime.get("maxContextTokens", 0)
+            or 128_000
+        )
+        try:
+            memory_context_limit = int(raw_context_limit)
+        except (TypeError, ValueError):
+            memory_context_limit = 128_000
+        active_paged_memory = PagedMemoryRuntime.from_runtime(
+            runtime=runtime,
+            cwd=cwd,
+            messages=current_messages,
+            session=session,
+            model_name=configured_runtime_model,
+            model_context_limit=memory_context_limit,
+        )
+        owns_paged_memory_runtime = active_paged_memory is not None
+
+    def run_paged_memory_operation(
+        operation: str, *args: Any, **kwargs: Any
+    ) -> Any | None:
+        """Keep shadow failures observational; keep enabled failures fail-closed."""
+        nonlocal paged_memory_shadow_disabled
+        if active_paged_memory is None or paged_memory_shadow_disabled:
+            return None
+        try:
+            return getattr(active_paged_memory, operation)(*args, **kwargs)
+        except Exception as error:
+            if active_paged_memory.controls_context:
+                raise
+            paged_memory_shadow_disabled = True
+            logger.warning(
+                "Paged-memory shadow path disabled after %s failed: %s",
+                operation,
+                error,
+            )
+            return None
+
+    if paged_memory_runtime is not None:
+        run_paged_memory_operation("record_initial_messages", current_messages)
+    legacy_context_management_allowed = not (
+        active_paged_memory is not None and active_paged_memory.controls_context
+    )
+
+    paged_tool_receipts: dict[str, tuple[Any, str]] = {}
+    paged_tool_receipts_lock = threading.Lock()
+
+    def observe_raw_tool_result(call: dict, result: ToolResult) -> ToolResult | None:
+        """Persist exact bytes before ToolRegistry's legacy prompt truncation."""
+        if active_paged_memory is None or paged_memory_shadow_disabled:
+            return None
+        try:
+            captured = run_paged_memory_operation(
+                "capture_tool_result",
+                call=call,
+                output=result.output or "",
+                ok=result.ok,
+            )
+        except ArtifactPersistenceRequired as error:
+            replacement = ToolResult(ok=False, output=str(error), awaitUser=True)
+            captured = run_paged_memory_operation(
+                "capture_tool_result",
+                call=call,
+                output=replacement.output,
+                ok=False,
+                force_inline=True,
+            )
+            if captured is not None:
+                with paged_tool_receipts_lock:
+                    paged_tool_receipts[str(call.get("id", ""))] = captured
+            return replacement
+        if captured is not None:
+            with paged_tool_receipts_lock:
+                paged_tool_receipts[str(call.get("id", ""))] = captured
+        return None
+
+    def run_memory_preflight(call: dict, effect: ToolEffect) -> str | None:
+        if active_paged_memory is None or paged_memory_shadow_disabled:
+            return None
+        high_risk = effect is not ToolEffect.READ_ONLY
+        audit = run_paged_memory_operation(
+            "preflight",
+            step_id=active_paged_memory.current_step_id,
+            high_risk=high_risk,
+            idempotency_key=str(call.get("id", "")) if high_risk else "",
+        )
+        if audit is None:
+            return None
+        if audit.allowed:
+            return None
+        return (
+            "[Memory preflight blocked] The operation was not executed because "
+            "required authoritative context could not be proven complete. "
+            f"coverage={audit.resolved_count}/{audit.required_count}; "
+            f"missing={audit.missing_dependency_ids}; "
+            f"unresolved_sources={audit.unresolved_source_ids}; "
+            f"errors={audit.errors}"
+        )
+
+    network_tool_limit, stop_network_when_evidence_ready = _network_research_policy(
+        current_messages,
+        runtime,
+        profile_name=runtime_profile.name,
+    )
+    network_tool_count = 0
+    relevant_search_succeeded = False
+    strong_relevant_search_succeeded = False
+    search_headline_evidence_ready = False
+    successful_network_fetches = 0
+    evidence_network_fetches = 0
+    strong_search_result_urls: set[str] = set()
+    network_guard_active = False
+    adapter_tool_restorations: list[tuple[Any, Any]] = []
+    switcher_tools_original: Any | None = None
+    memory_tools_added = False
+    memory_tool_names: frozenset[str] = frozenset()
+
+    def replace_adapter_tools(adapter: Any, replacement: ToolRegistry) -> None:
+        if not hasattr(adapter, "tools"):
+            return
+        if not any(
+            saved_adapter is adapter for saved_adapter, _ in adapter_tool_restorations
+        ):
+            adapter_tool_restorations.append((adapter, getattr(adapter, "tools")))
+        try:
+            adapter.tools = replacement
+        except Exception:
+            logger.debug("Could not update adapter tool view", exc_info=True)
+
+    def replace_switcher_tools(replacement: ToolRegistry) -> None:
+        nonlocal switcher_tools_original
+        if model_switcher is None or not hasattr(model_switcher, "_tools"):
+            return
+        if switcher_tools_original is None:
+            switcher_tools_original = model_switcher._tools
+        model_switcher._tools = replacement
 
     # Keep the historical callback parameters as the source of truth for
     # existing callers, while exposing one Rust-shaped structured event sink.
@@ -943,14 +1364,12 @@ def run_agent_turn(
     # already enabled those legacy channels; merely subscribing to turn
     # events must not silently change a provider from non-streaming to
     # streaming mode.
-    if (
-        legacy_on_assistant_stream_chunk is None
-        and not bool(getattr(callbacks, "include_stream_chunks", False))
+    if legacy_on_assistant_stream_chunk is None and not bool(
+        getattr(callbacks, "include_stream_chunks", False)
     ):
         on_assistant_stream_chunk = None
-    if (
-        legacy_on_thinking_chunk is None
-        and not bool(getattr(callbacks, "include_thinking_chunks", False))
+    if legacy_on_thinking_chunk is None and not bool(
+        getattr(callbacks, "include_thinking_chunks", False)
     ):
         on_thinking_chunk = None
 
@@ -1030,9 +1449,11 @@ def run_agent_turn(
             prelude.task_slot_key = f"{slot.slot_name}:{slot.task_id}"
             prelude.task_graph.start_task(prelude.task_slot_key)
         prelude.layered_context, prelude.context_builder = _build_layered_context(
-            current_messages, system_prompt, project_context, prelude.task,
+            current_messages,
+            system_prompt,
+            project_context,
+            prelude.task,
         )
-        get_pipeline_engine()
         _register_tool_capabilities(tools)
 
         # 初始化所有工程控制论控制器（通过 Orchestrator 统一管理）
@@ -1054,23 +1475,30 @@ def run_agent_turn(
         logger.info("CyberneticOrchestrator: %d controllers initialized", 15)
         if smart_router and prelude.task:
             try:
-                current_model_id = model.model_id if hasattr(model, 'model_id') else ""
-                task_text = prelude.task.raw_input if hasattr(prelude.task, 'raw_input') else str(current_messages[-1].get('content', ''))
+                current_model_id = model.model_id if hasattr(model, "model_id") else ""
+                task_text = (
+                    prelude.task.raw_input
+                    if hasattr(prelude.task, "raw_input")
+                    else str(current_messages[-1].get("content", ""))
+                )
                 routing, switch_result = smart_router.route_and_switch(
                     task_text,
                     current_model=current_model_id,
                 )
                 logger.info(
                     "SmartRouter: model=%s tier=%s cost=$%.4f reason=%s",
-                    routing.selected_model, routing.tier_name,
-                    routing.estimated_cost, routing.reasoning[:80],
+                    routing.selected_model,
+                    routing.tier_name,
+                    routing.estimated_cost,
+                    routing.reasoning[:80],
                 )
                 # 如果路由推荐了不同模型且切换成功，更新 model 引用
                 if switch_result and switch_result.success:
                     model = switch_result.adapter
                     logger.info(
                         "SmartRouter: switched model %s -> %s",
-                        switch_result.old_model, switch_result.new_model,
+                        switch_result.old_model,
+                        switch_result.new_model,
                     )
             except Exception:
                 pass
@@ -1078,11 +1506,16 @@ def run_agent_turn(
         # 初始化前馈控制器（预判式优化）
         if prelude.task:
             feedforward_controller = FeedforwardController()
-            preemptive_config = feedforward_controller.preconfigure(prelude.task.parsed_intent, prelude.task.raw_input)
-            risk_assessment = feedforward_controller.assess_risks(prelude.task.parsed_intent, preemptive_config)
+            preemptive_config = feedforward_controller.preconfigure(
+                prelude.task.parsed_intent, prelude.task.raw_input
+            )
+            risk_assessment = feedforward_controller.assess_risks(
+                prelude.task.parsed_intent, preemptive_config
+            )
             logger.info(
                 "Feedforward control: config=%s risk=%s",
-                preemptive_config.recommended_model, risk_assessment.risk_level,
+                preemptive_config.recommended_model,
+                risk_assessment.risk_level,
             )
             # Apply feedforward preemptive config to execution parameters
             if preemptive_config.confidence > 0.6:
@@ -1112,16 +1545,19 @@ def run_agent_turn(
         if model_selection_ctrl and prelude.task:
             try:
                 model_signal = ModelSelectionSignal(
-                    task_complexity=getattr(prelude.task, 'complexity', 'moderate') if hasattr(prelude.task, 'complexity') else "moderate",
+                    task_complexity=getattr(prelude.task, "complexity", "moderate")
+                    if hasattr(prelude.task, "complexity")
+                    else "moderate",
                     budget_pressure=0.3,
                     latency_pressure=0.3,
                     recent_failures=0,
-                    current_model=model.model_id if hasattr(model, 'model_id') else "",
+                    current_model=model.model_id if hasattr(model, "model_id") else "",
                 )
                 model_decision = model_selection_ctrl.decide(model_signal)
                 logger.info(
                     "ModelSelectionController: model=%s score=%.2f effort=%s reasons=%s",
-                    model_decision.model, model_decision.score,
+                    model_decision.model,
+                    model_decision.score,
                     model_decision.reasoning_effort.value,
                     ", ".join(model_decision.reasons),
                 )
@@ -1130,7 +1566,7 @@ def run_agent_turn(
 
         # 初始化上下文管理器 (Claude Code-style + Engineering Cybernetics)
         # 必须在 SelfHealingEngine 之前初始化，因为自愈引擎需要委托压缩操作
-        if context_manager:
+        if context_manager and legacy_context_management_allowed:
             compact_config = AutoCompactConfig(
                 threshold_ratio=0.85,
                 circuit_breaker_limit=3,
@@ -1149,6 +1585,7 @@ def run_agent_turn(
             memory_reranker = None
             try:
                 from minicode.memory_reranker import MemoryReranker
+
                 # Use the agent's model for reranking (lightweight prompt, ~500 tokens)
                 memory_reranker = MemoryReranker(model_adapter=model)
             except Exception:
@@ -1163,12 +1600,15 @@ def run_agent_turn(
                 orch._workspace = cwd
                 orch.wire_memory(memory_mgr)
                 if orch.memory_pipeline is not None:
-                    memory_injector = getattr(orch.memory_pipeline, "_injector", memory_injector)
+                    memory_injector = getattr(
+                        orch.memory_pipeline, "_injector", memory_injector
+                    )
             # 记忆注入控制器：根据上下文压力决定注入策略
             if memory_injection_ctrl:
                 try:
                     inj_signal = MemoryInjectionSignal(
-                        context_usage=context_manager.get_stats().usage_percentage / 100.0,
+                        context_usage=context_manager.get_stats().usage_percentage
+                        / 100.0,
                         retrieval_quality=0.5,
                         recent_failure=False,
                     )
@@ -1180,27 +1620,39 @@ def run_agent_turn(
                     )
                     logger.info(
                         "MemoryInjectionController: mode=%s max_mem=%d min_rel=%.2f max_tok=%d",
-                        inj_decision.mode.value, inj_decision.max_memories,
-                        inj_decision.min_relevance, inj_decision.max_tokens_per_memory,
+                        inj_decision.mode.value,
+                        inj_decision.max_memories,
+                        inj_decision.min_relevance,
+                        inj_decision.max_tokens_per_memory,
                     )
                 except Exception:
                     pass
             # 执行实际记忆注入：将相关记忆注入到系统 prompt 中
-            if orch and prelude.task:
+            if legacy_context_management_allowed and orch and prelude.task:
                 try:
-                    task_desc = prelude.task.raw_input if hasattr(prelude.task, 'raw_input') else ""
+                    task_desc = (
+                        prelude.task.raw_input
+                        if hasattr(prelude.task, "raw_input")
+                        else ""
+                    )
                     current_messages = orch.inject_memories(task_desc, current_messages)
                 except Exception:
                     pass
-            elif memory_injector and prelude.task:
+            elif legacy_context_management_allowed and memory_injector and prelude.task:
                 try:
-                    task_desc = prelude.task.raw_input if hasattr(prelude.task, 'raw_input') else ""
+                    task_desc = (
+                        prelude.task.raw_input
+                        if hasattr(prelude.task, "raw_input")
+                        else ""
+                    )
                     injected = memory_injector.inject_for_task(task_desc)
                     if injected:
                         logger.info(
                             "MemoryInjector: injected %d memories (mode=%s)",
                             len(injected),
-                            memory_injector._last_decision.mode.value if memory_injector._last_decision else "?",
+                            memory_injector._last_decision.mode.value
+                            if memory_injector._last_decision
+                            else "?",
                         )
                         # 将注入的记忆追加到系统 prompt
                         memory_context = "\n## Injected Memory\n" + "\n".join(
@@ -1224,15 +1676,25 @@ def run_agent_turn(
             )
             context_cybernetics = ContextCyberneticsOrchestrator(
                 context_compactor,
-                kp=2.0, ki=0.15, kd=0.3,
+                kp=2.0,
+                ki=0.15,
+                kd=0.3,
                 pid_setpoint=0.70,
                 base_threshold=0.85,
                 safety_margin_turns=3,
                 enabled=True,
             )
-            if prelude.task and hasattr(prelude.task, 'parsed_intent') and prelude.task.parsed_intent:
-                context_cybernetics.set_intent(str(prelude.task.parsed_intent.intent_type))
-            logger.info("ContextCybernetics initialized: PID control loop + predictive guard")
+            if (
+                prelude.task
+                and hasattr(prelude.task, "parsed_intent")
+                and prelude.task.parsed_intent
+            ):
+                context_cybernetics.set_intent(
+                    str(prelude.task.parsed_intent.intent_type)
+                )
+            logger.info(
+                "ContextCybernetics initialized: PID control loop + predictive guard"
+            )
             if orch:
                 orch.context_compactor = context_compactor
                 orch.context_cybernetics = context_cybernetics
@@ -1247,29 +1709,41 @@ def run_agent_turn(
                 tool_scheduler=tool_scheduler,
                 compactor=context_compactor,
             )
-        logger.info("Self-healing engine initialized: automated recovery + compaction delegation")
+        logger.info(
+            "Self-healing engine initialized: automated recovery + compaction delegation"
+        )
 
         # ── Micro-compaction + circuit breaker (CC-style layered defense) ─────
-        logger.info("Micro-compactor + circuit breaker initialized for layered context defense")
+        logger.info(
+            "Micro-compactor + circuit breaker initialized for layered context defense"
+        )
 
         # 初始化成本控制闭环 (CostTracker → PID → ToolResultBudgetManager)
         cost_control = orch.cost_control if orch else None
         if cost_control is None:
             cost_control = CostControlLoop(
                 target_cost_per_min=0.50,
-                kp=1.5, ki=0.08, kd=0.2,
+                kp=1.5,
+                ki=0.08,
+                kd=0.2,
                 enabled=True,
             )
         if orch:
             orch.cost_control = cost_control
-        logger.info("CostControlLoop initialized: BudgetPIDController for cost regulation")
+        logger.info(
+            "CostControlLoop initialized: BudgetPIDController for cost regulation"
+        )
 
     # 检查上下文状态 + 运行 Claude Code-style 预请求优化管线
-    if context_manager:
+    if context_manager and legacy_context_management_allowed:
         context_manager.messages = current_messages
         stats = context_manager.get_stats()
-        logger.info("Context: %d tokens (%.0f%%), %d messages",
-                   stats.total_tokens, stats.usage_percentage, stats.messages_count)
+        logger.info(
+            "Context: %d tokens (%.0f%%), %d messages",
+            stats.total_tokens,
+            stats.usage_percentage,
+            stats.messages_count,
+        )
 
         # ── Layer 1: Micro-compaction (lightest defense) ───────────────────
         current_messages, mc_stats = micro_compactor.compact(current_messages)
@@ -1291,21 +1765,31 @@ def run_agent_turn(
                     total_tokens=stats.total_tokens,
                     total_calls=max(turn_state.step, 1),
                 )
-                if context_compactor and hasattr(context_compactor, '_tool_budget') and context_compactor._tool_budget:
+                if (
+                    context_compactor
+                    and hasattr(context_compactor, "_tool_budget")
+                    and context_compactor._tool_budget
+                ):
                     cost_control.apply_to_budget_manager(context_compactor._tool_budget)
                 elif adj and adj.budget_multiplier < 0.8:
                     logger.warning(
                         "CostControl: budget tightened (mult=%.2f reason=%s) but no compactor active",
-                        adj.budget_multiplier, adj.reason,
+                        adj.budget_multiplier,
+                        adj.reason,
                     )
 
             if compaction_breaker.is_allowed():
                 try:
-                    cyber_messages, cyber_result, cyber_action = context_cybernetics.run_cycle(
-                        current_messages,
-                        error_rate=float(turn_state.tool_error_count) / max(turn_state.step, 1) if turn_state.step > 0 else 0.0,
-                        avg_latency=turn_state.step * 2.0,
-                        turn_id=turn_state.step,
+                    cyber_messages, cyber_result, cyber_action = (
+                        context_cybernetics.run_cycle(
+                            current_messages,
+                            error_rate=float(turn_state.tool_error_count)
+                            / max(turn_state.step, 1)
+                            if turn_state.step > 0
+                            else 0.0,
+                            avg_latency=turn_state.step * 2.0,
+                            turn_id=turn_state.step,
+                        )
                     )
                 except Exception as exc:
                     compaction_breaker.record_failure()
@@ -1321,14 +1805,18 @@ def run_agent_turn(
                         cyber_result.strategy.value,
                         cyber_action.compaction_intensity if cyber_action else 0,
                         cyber_result.tokens_freed,
-                        cyber_result.summary_text[:80] if cyber_result.summary_text else "",
+                        cyber_result.summary_text[:80]
+                        if cyber_result.summary_text
+                        else "",
                     )
             else:
                 logger.warning("Cybernetics compaction blocked by circuit breaker")
         elif context_compactor:
             if compaction_breaker.is_allowed():
                 try:
-                    compaction_result = context_compactor.process_request(current_messages)
+                    compaction_result = context_compactor.process_request(
+                        current_messages
+                    )
                 except Exception as exc:
                     compaction_breaker.record_failure()
                     logger.warning("Compactor raised: %s", exc)
@@ -1349,7 +1837,9 @@ def run_agent_turn(
             if compaction_breaker.is_allowed():
                 try:
                     logger.warning("Context near limit, auto-compacting...")
-                    current_messages = getattr(context_manager, 'compact_messages', lambda: current_messages)()
+                    current_messages = getattr(
+                        context_manager, "compact_messages", lambda: current_messages
+                    )()
                     compaction_breaker.record_success()
                 except Exception as exc:
                     compaction_breaker.record_failure()
@@ -1369,18 +1859,31 @@ def run_agent_turn(
                 previous_policy=previous_policy,
                 current_policy=current_policy,
             )
+            if active_paged_memory is not None:
+                run_paged_memory_operation(
+                    "begin_step",
+                    step,
+                    user_input=_latest_user_request(current_messages),
+                    phase=str(
+                        getattr(current_policy, "phase", "EXECUTION")
+                        or "EXECUTION"
+                    ),
+                )
             if policy_message:
                 turn_state.set_progress_summary(policy_message)
                 emit_runtime_event(category="phase", message=policy_message)
                 logger.info("Turn policy update: %s", policy_message)
             if (
                 current_policy.should_compact_aggressively
+                and legacy_context_management_allowed
                 and context_manager
                 and context_manager.should_auto_compact()
                 and compaction_breaker.is_allowed()
             ):
                 try:
-                    current_messages = getattr(context_manager, 'compact_messages', lambda: current_messages)()
+                    current_messages = getattr(
+                        context_manager, "compact_messages", lambda: current_messages
+                    )()
                     compaction_breaker.record_success()
                 except Exception as exc:
                     compaction_breaker.record_failure()
@@ -1435,7 +1938,9 @@ def run_agent_turn(
                         timestamp=time.time(),
                         response_time=step * 2.0,  # 估算响应时间
                         success_rate=1.0 - (turn_state.tool_error_count / max(step, 1)),
-                        context_length=context_manager.get_stats().total_tokens if context_manager else 0,
+                        context_length=context_manager.get_stats().total_tokens
+                        if context_manager
+                        else 0,
                         error_count=turn_state.tool_error_count,
                         tool_calls=0,
                     )
@@ -1449,10 +1954,12 @@ def run_agent_turn(
                                 observed_state.internal_load,
                             )
                         if observed_state.hidden_errors > 0.5 and self_healing_engine:
-                            self_healing_engine.detect_and_heal({
-                                "error_rate": observed_state.hidden_errors * 5.0,
-                                "context_usage": observed_state.context_pressure,
-                            })
+                            self_healing_engine.detect_and_heal(
+                                {
+                                    "error_rate": observed_state.hidden_errors * 5.0,
+                                    "context_usage": observed_state.context_pressure,
+                                }
+                            )
                         if observed_state.system_degradation > 0.4:
                             logger.warning(
                                 "StateObserver: system degradation=%.2f confidence=%.2f",
@@ -1464,8 +1971,12 @@ def run_agent_turn(
                 if predictive_controller:
                     if context_manager:
                         stats = context_manager.get_stats()
-                        predictive_controller.update("context_usage", stats.usage_percentage / 100.0)
-                    predictive_controller.update("error_rate", turn_state.tool_error_count / max(step, 1))
+                        predictive_controller.update(
+                            "context_usage", stats.usage_percentage / 100.0
+                        )
+                    predictive_controller.update(
+                        "error_rate", turn_state.tool_error_count / max(step, 1)
+                    )
 
                     if step > 2:
                         actions = predictive_controller.generate_predictive_actions()
@@ -1473,14 +1984,18 @@ def run_agent_turn(
                             action = actions[0]
                             logger.info(
                                 "Predictive action: %s urgency=%.2f horizon=%s",
-                                action.recommended_action, action.urgency,
-                                getattr(action, 'horizon', 'unknown'),
+                                action.recommended_action,
+                                action.urgency,
+                                getattr(action, "horizon", "unknown"),
                             )
                             # Execute predictive actions via dispatch
                             dispatch: dict[str, Callable[[], None]] = {
                                 "trigger_compaction": lambda: (
-                                    context_cybernetics.try_reactive_recover(current_messages, "predictive")
-                                    if context_cybernetics else None
+                                    context_cybernetics.try_reactive_recover(
+                                        current_messages, "predictive"
+                                    )
+                                    if context_cybernetics
+                                    else None
                                 ),
                                 "enable_safe_mode": lambda: logger.info(
                                     "Predictive: safe_mode recommended (reduce concurrency, extend timeouts)"
@@ -1496,16 +2011,24 @@ def run_agent_turn(
                                 except Exception as exc:
                                     logger.warning(
                                         "Predictive action %s failed: %s",
-                                        action.recommended_action, exc,
+                                        action.recommended_action,
+                                        exc,
                                     )
                             # Also run self-healing for corroboration
                             if self_healing_engine:
-                                healing_actions = self_healing_engine.detect_and_heal({
-                                    "context_usage": stats.usage_percentage / 100.0 if context_manager else 0.0,
-                                    "error_rate": turn_state.tool_error_count / max(step, 1),
-                                })
+                                healing_actions = self_healing_engine.detect_and_heal(
+                                    {
+                                        "context_usage": stats.usage_percentage / 100.0
+                                        if context_manager
+                                        else 0.0,
+                                        "error_rate": turn_state.tool_error_count
+                                        / max(step, 1),
+                                    }
+                                )
                                 if healing_actions:
-                                    logger.info("Self-healing: %s", healing_actions[0].strategy)
+                                    logger.info(
+                                        "Self-healing: %s", healing_actions[0].strategy
+                                    )
 
             if metrics_collector:
                 metrics_collector.start_turn(step)
@@ -1513,7 +2036,12 @@ def run_agent_turn(
             next_step: AgentStep
             try:
                 # ── Layer 0: Preemptive context guard (CC-style blocking limit)
-                if context_manager:
+                # Paged memory builds a bounded source-linked request below, so
+                # the legacy full-history guard must not stop it first.
+                if context_manager and not (
+                    active_paged_memory is not None
+                    and active_paged_memory.controls_context
+                ):
                     cm_stats = context_manager.get_stats()
                     if _is_at_blocking_limit(
                         cm_stats.total_tokens,
@@ -1537,15 +2065,86 @@ def run_agent_turn(
                         )
                         return current_messages
 
+                model_input_messages = current_messages
+                if active_paged_memory is not None:
+                    combined_system_context = "\n\n".join(
+                        str(message.get("content", ""))
+                        for message in current_messages
+                        if message.get("role") == "system"
+                    )
+                    prepared_memory = run_paged_memory_operation(
+                        "prepare_model_messages",
+                        current_messages,
+                        step_id=active_paged_memory.current_step_id,
+                        phase_boundary=bool(policy_message),
+                        system_context=combined_system_context,
+                    )
+                    if prepared_memory is not None:
+                        model_input_messages, memory_packet = prepared_memory
+                        if active_paged_memory.controls_context:
+                            if memory_packet.memory_mode.value != "INLINE":
+                                if not memory_tools_added:
+                                    from minicode.paged_memory.tools import (
+                                        create_paged_memory_tools,
+                                    )
+
+                                    memory_tool_definitions = create_paged_memory_tools(
+                                        active_paged_memory
+                                    )
+                                    memory_tool_names = frozenset(
+                                        definition.name
+                                        for definition in memory_tool_definitions
+                                    )
+                                    tools = tools.with_additional_tools(
+                                        memory_tool_definitions
+                                    )
+                                    memory_tools_added = True
+                            elif memory_tools_added:
+                                tools = tools.filtered_without_names(memory_tool_names)
+                                memory_tools_added = False
+                            # Model switches can replace the active adapter between
+                            # iterations, so refresh its non-owning tool view too.
+                            replace_adapter_tools(model, tools)
+                            replace_switcher_tools(tools)
+                            run_paged_memory_operation(
+                                "enforce_provider_budget",
+                                model_input_messages,
+                                tool_definitions=tools.list(),
+                            )
                 next_step = _model_next(
                     model,
-                    current_messages,
+                    model_input_messages,
                     on_stream_chunk=on_assistant_stream_chunk,
                     on_thinking_chunk=on_thinking_chunk,
                     store=store,
                 )
+                if active_paged_memory is not None:
+                    run_paged_memory_operation(
+                        "record_model_step", next_step, sequence_no=step
+                    )
             except KeyboardInterrupt:
                 raise  # Let Ctrl-C propagate
+            except ContextBudgetExceeded as error:
+                fallback = (
+                    "Context budget exceeded before the model call "
+                    f"({error.estimated_tokens} / {error.input_limit} input tokens). "
+                    "No required source was discarded; reduce the task/input scope or "
+                    "increase the configured context window."
+                )
+                logger.warning("Paged-memory hard budget guard: %s", error)
+                turn_state.set_stop_reason("blocked")
+                emit_runtime_event(
+                    category="stop",
+                    message=fallback,
+                    emit_progress=False,
+                    stop_reason="blocked",
+                )
+                if on_assistant_message:
+                    on_assistant_message(fallback)
+                current_messages.append({"role": "assistant", "content": fallback})
+                if metrics_collector:
+                    metrics_collector.end_turn(total_tokens=0)
+                return current_messages
             except ConnectionError as error:
                 fallback = f"Network error (connection failed or dropped): {error}"
                 logger.error("Model API connection error: %s", error)
@@ -1592,9 +2191,19 @@ def run_agent_turn(
 
                 # Reactive Compact: 控制论恢复路径
                 error_str = str(error).lower()
-                needs_recovery = "prompt" in error_str and ("too long" in error_str or "exceeds" in error_str)
-                if context_cybernetics and needs_recovery:
-                    recovered_messages, recovery_result = context_cybernetics.try_reactive_recover(current_messages, error_str)
+                needs_recovery = "prompt" in error_str and (
+                    "too long" in error_str or "exceeds" in error_str
+                )
+                if (
+                    legacy_context_management_allowed
+                    and context_cybernetics
+                    and needs_recovery
+                ):
+                    recovered_messages, recovery_result = (
+                        context_cybernetics.try_reactive_recover(
+                            current_messages, error_str
+                        )
+                    )
                     if recovery_result and recovery_result.effective:
                         current_messages = recovered_messages
                         if context_manager:
@@ -1604,8 +2213,14 @@ def run_agent_turn(
                             recovery_result.tokens_freed,
                         )
                         continue
-                elif context_compactor and needs_recovery:
-                    recovery_result = context_compactor.reactive_recover(current_messages, error_str)
+                elif (
+                    legacy_context_management_allowed
+                    and context_compactor
+                    and needs_recovery
+                ):
+                    recovery_result = context_compactor.reactive_recover(
+                        current_messages, error_str
+                    )
                     if recovery_result and recovery_result.effective:
                         current_messages = recovery_result.messages
                         if context_manager:
@@ -1617,14 +2232,22 @@ def run_agent_turn(
                         continue
 
                 # ModelSwitcher: 尝试切换到备用模型并重试
-                if model_switcher and "rate" not in error_str and _should_attempt_model_fallback(error_str):
+                if (
+                    model_switcher
+                    and "rate" not in error_str
+                    and _should_attempt_model_fallback(error_str)
+                ):
                     try:
                         if hasattr(model_switcher, "sync_current_model"):
-                            model_switcher.sync_current_model(active_model_id, adapter=model)
+                            model_switcher.sync_current_model(
+                                active_model_id, adapter=model
+                            )
                         if hasattr(model_switcher, "record_runtime_failure"):
                             model_switcher.record_runtime_failure(active_model_id)
                         if runtime is not None:
-                            runtime["recentFailures"] = int(runtime.get("recentFailures", 0) or 0) + 1
+                            runtime["recentFailures"] = (
+                                int(runtime.get("recentFailures", 0) or 0) + 1
+                            )
                         switch_result = model_switcher.switch_to(
                             "",  # Let switcher pick fallback
                             reason=f"{error_type}: {error_str[:80]}",
@@ -1677,7 +2300,9 @@ def run_agent_turn(
                     step_kind=getattr(next_step, "kind", None),
                     stop_reason=diagnostics.stopReason if diagnostics else None,
                     block_types=diagnostics.blockTypes if diagnostics else None,
-                    ignored_block_types=diagnostics.ignoredBlockTypes if diagnostics else None,
+                    ignored_block_types=diagnostics.ignoredBlockTypes
+                    if diagnostics
+                    else None,
                     is_empty=is_empty,
                     treat_as_progress=(
                         not is_empty
@@ -1690,7 +2315,9 @@ def run_agent_turn(
                     is_recoverable_thinking_stop=_is_recoverable_thinking_stop(
                         is_empty=is_empty,
                         stop_reason=diagnostics.stopReason if diagnostics else None,
-                        ignored_block_types=diagnostics.ignoredBlockTypes if diagnostics else None,
+                        ignored_block_types=diagnostics.ignoredBlockTypes
+                        if diagnostics
+                        else None,
                     ),
                     format_diagnostics=_format_diagnostics,
                     nudge_continue=NUDGE_CONTINUE,
@@ -1704,7 +2331,9 @@ def run_agent_turn(
 
                 if assistant_decision.kind == "progress":
                     if assistant_decision.assistant_content:
-                        turn_state.set_progress_summary(assistant_decision.assistant_content)
+                        turn_state.set_progress_summary(
+                            assistant_decision.assistant_content
+                        )
                         if assistant_decision.runtime_event_category is not None:
                             emit_runtime_event(
                                 category=assistant_decision.runtime_event_category,
@@ -1821,7 +2450,8 @@ def run_agent_turn(
                     turn_state.set_stop_reason(assistant_decision.stop_reason)
                     emit_runtime_event(
                         category="stop",
-                        message=assistant_decision.assistant_content or "Turn completed.",
+                        message=assistant_decision.assistant_content
+                        or "Turn completed.",
                         emit_progress=False,
                         stop_reason=assistant_decision.stop_reason,
                         evidence_summary=(
@@ -1844,7 +2474,10 @@ def run_agent_turn(
                             next_step.reasoningContent,
                         )
                     )
-                if assistant_decision.protect_final_answer and assistant_decision.assistant_content:
+                if (
+                    assistant_decision.protect_final_answer
+                    and assistant_decision.assistant_content
+                ):
                     protect_context(
                         content=assistant_decision.assistant_content[:500],
                         entry_type="key_decision",
@@ -1854,7 +2487,11 @@ def run_agent_turn(
                 return current_messages
 
             if next_step.content:
-                role = "assistant_progress" if next_step.contentKind == "progress" else "assistant"
+                role = (
+                    "assistant_progress"
+                    if next_step.contentKind == "progress"
+                    else "assistant"
+                )
                 if role == "assistant_progress":
                     turn_state.set_progress_summary(next_step.content)
                     if on_progress_message:
@@ -1882,7 +2519,11 @@ def run_agent_turn(
                         )
                     )
 
-            if not next_step.calls and next_step.content and next_step.contentKind != "progress":
+            if (
+                not next_step.calls
+                and next_step.content
+                and next_step.contentKind != "progress"
+            ):
                 turn_state.set_stop_reason("done")
                 emit_runtime_event(
                     category="stop",
@@ -1899,6 +2540,9 @@ def run_agent_turn(
             # --- Concurrent tool execution ---
             # Classify calls into concurrent-safe (read-only) vs serial (writes/commands)
             calls = next_step.calls
+            if active_paged_memory is not None:
+                for call in calls:
+                    run_paged_memory_operation("record_tool_call", call)
             _results: list[tuple[dict, ToolResult]] = []
 
             if len(calls) <= 1:
@@ -1907,8 +2551,19 @@ def run_agent_turn(
                 if metrics_collector:
                     metrics_collector.start_tool(call["toolName"])
                 result = _execute_single_tool(
-                    call, tools, cwd, permissions, session, runtime, store, step,
-                    on_tool_start, on_tool_result, tool_scheduler,
+                    call,
+                    tools,
+                    cwd,
+                    permissions,
+                    session,
+                    runtime,
+                    store,
+                    step,
+                    on_tool_start,
+                    on_tool_result,
+                    tool_scheduler,
+                    run_memory_preflight,
+                    observe_raw_tool_result,
                 )
                 if metrics_collector:
                     metrics_collector.end_tool(
@@ -1918,7 +2573,9 @@ def run_agent_turn(
                 _results.append((call, result))
             else:
                 # Multiple calls — use ToolScheduler for intelligent partitioning
-                concurrent_calls, serial_calls = tool_scheduler.schedule_calls(calls, tools)
+                concurrent_calls, serial_calls = tool_scheduler.schedule_calls(
+                    calls, tools
+                )
 
                 _results.clear()  # Reuse outer declaration
 
@@ -1931,7 +2588,7 @@ def run_agent_turn(
                         recent_failures=turn_state.tool_error_count,
                     )
                     # Apply cybernetic concurrency cap if FeedbackController reduced parallelism
-                    force_cap = getattr(tool_scheduler, '_force_max_workers', None)
+                    force_cap = getattr(tool_scheduler, "_force_max_workers", None)
                     if force_cap:
                         max_workers = min(max_workers, force_cap)
                     if tool_scheduler.last_decision:
@@ -1949,8 +2606,20 @@ def run_agent_turn(
                         future_to_call = {
                             pool.submit(
                                 _execute_single_tool,
-                                call, tools, cwd, permissions, session, runtime, None, step,
-                                None, None, tool_scheduler,  # No UI callbacks during concurrent phase
+                                call,
+                                tools,
+                                cwd,
+                                permissions,
+                                session,
+                                runtime,
+                                None,
+                                step,
+                                None,
+                                None,
+                                tool_scheduler,
+                                run_memory_preflight,
+                                observe_raw_tool_result,
+                                # No UI callbacks during concurrent phase
                             ): call
                             for call in concurrent_calls
                         }
@@ -1959,7 +2628,10 @@ def run_agent_turn(
                             try:
                                 result = future.result()
                             except Exception as exc:
-                                result = ToolResult(ok=False, output=f"Concurrent execution error: {exc}")
+                                result = ToolResult(
+                                    ok=False,
+                                    output=f"Concurrent execution error: {exc}",
+                                )
                             _results.append((call, result))
 
                 # Phase 2: Run serial tools sequentially (in original order)
@@ -1968,8 +2640,19 @@ def run_agent_turn(
                         if metrics_collector:
                             metrics_collector.start_tool(call["toolName"])
                         result = _execute_single_tool(
-                            call, tools, cwd, permissions, session, runtime, store, step,
-                            on_tool_start, on_tool_result, tool_scheduler,
+                            call,
+                            tools,
+                            cwd,
+                            permissions,
+                            session,
+                            runtime,
+                            store,
+                            step,
+                            on_tool_start,
+                            on_tool_result,
+                            tool_scheduler,
+                            run_memory_preflight,
+                            observe_raw_tool_result,
                         )
                         if metrics_collector:
                             metrics_collector.end_tool(
@@ -1981,7 +2664,7 @@ def run_agent_turn(
                         if result.awaitUser:
                             # Still need to process remaining results for messages
                             break
-            
+
             # Process all results and build messages (preserve original call order)
             call_order = {call["id"]: idx for idx, call in enumerate(calls)}
             _results.sort(key=lambda pair: call_order.get(pair[0]["id"], 999))
@@ -2003,12 +2686,64 @@ def run_agent_turn(
                         next_step.reasoningContent,
                     )
                 )
-            
+
+            paged_step_success = True
             for call, result in _results:
+                paged_result_output: str | None = None
+                with paged_tool_receipts_lock:
+                    captured_result = paged_tool_receipts.pop(
+                        str(call.get("id", "")), None
+                    )
+                if captured_result is not None:
+                    _, persisted_result_output = captured_result
+                    if (
+                        active_paged_memory is not None
+                        and not paged_memory_shadow_disabled
+                        and active_paged_memory.controls_context
+                    ):
+                        paged_result_output = persisted_result_output
+                elif active_paged_memory is not None:
+                    try:
+                        captured_result = run_paged_memory_operation(
+                            "capture_tool_result",
+                            call=call,
+                            output=result.output,
+                            ok=result.ok,
+                        )
+                        if captured_result is not None:
+                            _, persisted_result_output = captured_result
+                        else:
+                            persisted_result_output = result.output
+                        if (
+                            not paged_memory_shadow_disabled
+                            and active_paged_memory.controls_context
+                        ):
+                            paged_result_output = persisted_result_output
+                    except ArtifactPersistenceRequired as error:
+                        # The tool may have executed, but its large receipt is not
+                        # durably available.  Never trim it and pretend success.
+                        result = ToolResult(
+                            ok=False,
+                            output=str(error),
+                            awaitUser=True,
+                        )
+                        captured_error = run_paged_memory_operation(
+                            "capture_tool_result",
+                            call=call,
+                            output=result.output,
+                            ok=False,
+                            force_inline=True,
+                        )
+                        if captured_error is not None:
+                            _, paged_result_output = captured_error
+                if not result.ok:
+                    paged_step_success = False
                 # Fire hooks and UI callbacks for concurrent calls (deferred)
                 tool_def = tools.find(call["toolName"])
-                is_concurrent = tool_def and tool_def.is_concurrency_safe and len(calls) > 1
-                
+                is_concurrent = (
+                    tool_def and tool_def.is_concurrency_safe and len(calls) > 1
+                )
+
                 if is_concurrent:
                     # Deferred UI callbacks for concurrent tools
                     if on_tool_start:
@@ -2024,7 +2759,7 @@ def run_agent_turn(
                         tool_input=call["input"],
                         step=step,
                     )
-                
+
                 # Hook: post-tool-use
                 fire_hook_sync(
                     HookEvent.POST_TOOL_USE,
@@ -2033,13 +2768,44 @@ def run_agent_turn(
                     is_error=not result.ok,
                     step=step,
                 )
-                
+
                 if is_concurrent:
                     if on_tool_result:
                         on_tool_result(call["toolName"], result.output, not result.ok)
-                
+
                 tool_summary = f"{call['toolName']}: {result.output[:200]}"
                 turn_state.record_tool_result(result.ok, summary=tool_summary)
+                if call["toolName"] in _NETWORK_RESEARCH_TOOL_NAMES:
+                    network_tool_count += 1
+                    if call["toolName"] == "web_search" and result.ok:
+                        relevance_match = re.search(
+                            r"(?m)^RELEVANCE_FILTER:\s*(strong|moderate|passed)\s*$",
+                            result.output,
+                        )
+                        if relevance_match:
+                            relevant_search_succeeded = True
+                            if relevance_match.group(1) == "strong":
+                                strong_relevant_search_succeeded = True
+                                strong_search_result_urls.update(
+                                    url.rstrip("/").casefold()
+                                    for url in re.findall(
+                                        r"(?m)^\s*URL:\s*(https?://\S+)",
+                                        result.output,
+                                    )
+                                )
+                            if (
+                                "EVIDENCE_READY: cross-source dated news results"
+                                in result.output
+                            ):
+                                search_headline_evidence_ready = True
+                    elif call["toolName"] == "web_fetch" and result.ok:
+                        successful_network_fetches += 1
+                        if _fetch_has_lookup_evidence(
+                            _latest_user_request(current_messages),
+                            result.output,
+                            strong_search_result_urls,
+                        ):
+                            evidence_network_fetches += 1
                 tool_decision = decide_tool_turn(
                     tool_name=call["toolName"],
                     result_output=result.output,
@@ -2049,20 +2815,34 @@ def run_agent_turn(
                     turn_state.set_progress_summary(tool_decision.progress_summary)
                 if not result.ok:
                     # Use ErrorClassifier for intelligent error handling
-                    classified = ErrorClassifier.classify(result.output, tool_name=call["toolName"])
-                    nudge = NudgeGenerator.generate(classified, retry_count=turn_state.tool_error_count)
+                    classified = ErrorClassifier.classify(
+                        result.output, tool_name=call["toolName"]
+                    )
+                    nudge = NudgeGenerator.generate(
+                        classified, retry_count=turn_state.tool_error_count
+                    )
                     # Append nudge to tool result content for model context
-                    result_output = result.output + "\n\n[System note: " + nudge + "]"
+                    result_output = (
+                        (paged_result_output or result.output)
+                        + "\n\n[System note: "
+                        + nudge
+                        + "]"
+                    )
                 else:
-                    result_output = result.output
+                    result_output = paged_result_output or result.output
                     # Increased nudge frequency: provide steering even on success
-                    if getattr(tool_scheduler, '_force_nudge_frequency', False):
+                    if getattr(tool_scheduler, "_force_nudge_frequency", False):
                         success_nudge = (
                             f"Tool '{call['toolName']}' succeeded. "
                             "The system is under stability pressure — prefer smaller, "
                             "incremental steps and verify each result before proceeding."
                         )
-                        result_output = result.output + "\n\n[System note: " + success_nudge + "]"
+                        result_output = (
+                            (paged_result_output or result.output)
+                            + "\n\n[System note: "
+                            + success_nudge
+                            + "]"
+                        )
 
                 # Record conflicts between concurrent tools if both failed
                 if not result.ok and len(calls) > 1:
@@ -2070,7 +2850,9 @@ def run_agent_turn(
                         if other_call["id"] == call["id"]:
                             continue
                         if not other_result.ok:
-                            tool_scheduler.record_conflict(call["toolName"], other_call["toolName"])
+                            tool_scheduler.record_conflict(
+                                call["toolName"], other_call["toolName"]
+                            )
 
                 # ReadDedup: 去重相同文件的重复读取，节省上下文空间
                 if (
@@ -2083,8 +2865,12 @@ def run_agent_turn(
                         dedup_mgr = context_compactor.read_dedup
                         if dedup_mgr.should_dedup(file_path, result_output):
                             result_output = dedup_mgr.get_stub(file_path)
-                            logger.debug("ReadDedup replaced content for %s (stub)", file_path)
-                        dedup_mgr.register_read(file_path, result_output, len(current_messages))
+                            logger.debug(
+                                "ReadDedup replaced content for %s (stub)", file_path
+                            )
+                        dedup_mgr.register_read(
+                            file_path, result_output, len(current_messages)
+                        )
 
                 current_messages.append(
                     {
@@ -2115,22 +2901,83 @@ def run_agent_turn(
                     )
                     if metrics_collector:
                         metrics_collector.end_turn(total_tokens=0)
+                    if active_paged_memory is not None:
+                        run_paged_memory_operation("finalize_step", success=False)
                     return current_messages
+
+            if active_paged_memory is not None:
+                run_paged_memory_operation("finalize_step", success=paged_step_success)
+
+            network_evidence_ready = (
+                stop_network_when_evidence_ready
+                and relevant_search_succeeded
+                and (
+                    search_headline_evidence_ready
+                    or (
+                        strong_relevant_search_succeeded
+                        and evidence_network_fetches >= 1
+                    )
+                    or successful_network_fetches >= 2
+                )
+            )
+            network_limit_reached = network_tool_count >= network_tool_limit
+            if not network_guard_active and (
+                network_evidence_ready or network_limit_reached
+            ):
+                tools = tools.filtered_without_names(_NETWORK_RESEARCH_TOOL_NAMES)
+                replace_adapter_tools(model, tools)
+                replace_switcher_tools(tools)
+                network_guard_active = True
+                if network_evidence_ready:
+                    guard_message = (
+                        "已取得足够的相关网页证据；停止继续搜索，正在整理为中文回答。"
+                    )
+                    guard_reason = "enough relevant sources were collected"
+                else:
+                    guard_message = (
+                        f"联网检索已达到本次任务上限（{network_tool_limit} 次）；"
+                        "停止继续搜索，正在用现有可靠结果作答。"
+                    )
+                    guard_reason = "the per-turn network research limit was reached"
+                turn_state.set_progress_summary(guard_message)
+                emit_runtime_event(
+                    category="guard",
+                    message=guard_message,
+                    emit_progress=False,
+                )
+                current_messages.append(
+                    {
+                        "role": "system",
+                        "content": (
+                            "NETWORK_RESEARCH_STOP. Do not call web_search or web_fetch again: "
+                            f"{guard_reason}. Answer the user's original request now in the user's language. "
+                            "Discard irrelevant or stale results, prefer the strongest dated sources already "
+                            "collected, and name source/date when useful. If the evidence is insufficient, say "
+                            "that plainly. Do not expose raw XML, tool mechanics, or another progress-only update."
+                        ),
+                    }
+                )
 
             # 工具执行完成后的控制论反馈
             if enable_work_chain:
                 # 多变量解耦：消除工具间的耦合影响
                 if decoupling_controller:
-                    decoupling_controller.record_measurement({
-                        "token_usage_to_latency": (
-                            context_manager.get_stats().usage_percentage / 100.0 if context_manager else 0.0,
-                            step * 2.0 / 60.0,
-                        ),
-                        "context_pressure_to_errors": (
-                            context_manager.get_stats().usage_percentage / 100.0 if context_manager else 0.0,
-                            turn_state.tool_error_count / max(step, 1),
-                        ),
-                    })
+                    decoupling_controller.record_measurement(
+                        {
+                            "token_usage_to_latency": (
+                                context_manager.get_stats().usage_percentage / 100.0
+                                if context_manager
+                                else 0.0,
+                                step * 2.0 / 60.0,
+                            ),
+                            "context_pressure_to_errors": (
+                                context_manager.get_stats().usage_percentage / 100.0
+                                if context_manager
+                                else 0.0,
+                                turn_state.tool_error_count / max(step, 1),
+                            ),
+                        }
+                    )
                     decoupling_controller.compute_decoupling_matrix()
 
                 if orch:
@@ -2156,12 +3003,22 @@ def run_agent_turn(
                     if self_healing_engine:
                         metrics_for_healing = {
                             "error_rate": turn_state.tool_error_count / max(step, 1),
-                            "context_usage": context_manager.get_stats().usage_percentage / 100.0 if context_manager else 0.0,
-                            "oscillation_index": feedback_controller._compute_oscillation() if feedback_controller else 0.0,
+                            "context_usage": context_manager.get_stats().usage_percentage
+                            / 100.0
+                            if context_manager
+                            else 0.0,
+                            "oscillation_index": feedback_controller._compute_oscillation()
+                            if feedback_controller
+                            else 0.0,
                         }
-                        healing_actions = self_healing_engine.detect_and_heal(metrics_for_healing)
+                        healing_actions = self_healing_engine.detect_and_heal(
+                            metrics_for_healing
+                        )
                         if healing_actions:
-                            logger.info("Self-healing triggered: %s", healing_actions[0].strategy)
+                            logger.info(
+                                "Self-healing triggered: %s",
+                                healing_actions[0].strategy,
+                            )
 
                     # 进度控制：检测任务是否卡住或完成
                     if progress_controller:
@@ -2176,7 +3033,10 @@ def run_agent_turn(
                             max_steps=turn_state.max_steps,
                         )
                         progress_decision = progress_controller.decide(progress_signal)
-                        if progress_decision.action in (ProgressAction.STOP, ProgressAction.REQUEST_CONFIRMATION):
+                        if progress_decision.action in (
+                            ProgressAction.STOP,
+                            ProgressAction.REQUEST_CONFIRMATION,
+                        ):
                             logger.warning(
                                 "ProgressController: action=%s health=%.2f stall=%.2f reasons=%s",
                                 progress_decision.action.value,
@@ -2188,9 +3048,11 @@ def run_agent_turn(
             # Tool execution completed for this step; ask the model for the next turn
             # instead of falling through to the max-step fallback.
             if metrics_collector:
-                total_tokens = sum(
-                    estimate_message_tokens(m) for m in current_messages
-                ) if context_manager else 0
+                total_tokens = (
+                    sum(estimate_message_tokens(m) for m in current_messages)
+                    if context_manager
+                    else 0
+                )
                 metrics_collector.end_turn(total_tokens=total_tokens)
             continue
 
@@ -2211,6 +3073,42 @@ def run_agent_turn(
         current_messages.append({"role": "assistant", "content": fallback})
         return current_messages
     finally:
+        paged_memory_finalization_error: Exception | None = None
+        if active_paged_memory is not None:
+            try:
+                if (
+                    not paged_memory_shadow_disabled
+                    and not active_paged_memory.step_finalized
+                ):
+                    run_paged_memory_operation(
+                        "finalize_step",
+                        success=(
+                            turn_state.tool_error_count == 0
+                            and str(turn_state.stop_reason or "")
+                            not in {"blocked", "error", "max_steps"}
+                        ),
+                    )
+            except Exception as error:
+                logger.error(
+                    "Paged memory checkpoint/finalization failed; state was not advanced: %s",
+                    error,
+                )
+                if active_paged_memory.controls_context:
+                    paged_memory_finalization_error = error
+            finally:
+                if owns_paged_memory_runtime:
+                    active_paged_memory.close()
+        for adapter, original_tools in reversed(adapter_tool_restorations):
+            try:
+                adapter.tools = original_tools
+            except Exception:
+                logger.debug("Could not restore adapter tool view", exc_info=True)
+        if (
+            switcher_tools_original is not None
+            and model_switcher is not None
+            and hasattr(model_switcher, "_tools")
+        ):
+            model_switcher._tools = switcher_tools_original
         # Emit the terminal snapshot before coda bookkeeping so every return
         # path (including an exception) produces exactly one structured Done
         # event with the messages accumulated by the loop.
@@ -2229,9 +3127,11 @@ def run_agent_turn(
         )
         step = turn_state.step
         if metrics_collector and metrics_collector._current_turn is not None:
-            total_tokens = sum(
-                estimate_message_tokens(m) for m in current_messages
-            ) if context_manager else 0
+            total_tokens = (
+                sum(estimate_message_tokens(m) for m in current_messages)
+                if context_manager
+                else 0
+            )
             metrics_collector.end_turn(total_tokens=total_tokens)
 
         context_usage = 0.0
@@ -2333,24 +3233,27 @@ def run_agent_turn(
                     )
                     logger.info(
                         "AgentReflection: success=%s confidence=%.2f lessons=%d improvements=%d",
-                        reflection.success, reflection.confidence,
-                        len(reflection.lessons_learned), len(reflection.suggested_improvements),
+                        reflection.success,
+                        reflection.confidence,
+                        len(reflection.lessons_learned),
+                        len(reflection.suggested_improvements),
                     )
                 except Exception:
                     pass
 
             # 记忆质量反馈：任务成功→注入的记忆 usage_count+1
-            if memory_injector and hasattr(memory_injector, '_cached_result'):
+            if memory_injector and hasattr(memory_injector, "_cached_result"):
                 try:
                     from minicode.memory import MemoryScope
+
                     for mem in memory_injector._cached_result:
-                        if not hasattr(mem, 'id'):
+                        if not hasattr(mem, "id"):
                             continue
                         try:
                             _mgr = memory_mgr
                         except NameError:
                             continue
-                        for scope_name in ['project', 'local', 'user']:
+                        for scope_name in ["project", "local", "user"]:
                             try:
                                 scope = MemoryScope(scope_name)
                                 if scope in _mgr.memories:
@@ -2359,7 +3262,9 @@ def run_agent_turn(
                                         entry = mem_store._id_index.get(mem.id)
                                         if entry:
                                             entry.usage_count += (
-                                                2 if turn_state.tool_error_count == 0 else -1
+                                                2
+                                                if turn_state.tool_error_count == 0
+                                                else -1
                                             )
                                             entry.last_accessed = time.time()
                                             break
@@ -2386,7 +3291,9 @@ def run_agent_turn(
                         duration_ms=turn_state.step * 2000.0,
                         cost_usd=0.0,
                         tool_errors=turn_state.tool_error_count,
-                        model_switches=model_switcher.switch_count() if model_switcher else 0,
+                        model_switches=model_switcher.switch_count()
+                        if model_switcher
+                        else 0,
                     )
                     smart_router.learner().record_outcome(outcome)
                 except Exception:
@@ -2394,9 +3301,7 @@ def run_agent_turn(
 
         # 控制论反馈：记录模式有效性
         if enable_work_chain and feedback_controller and prelude.task:
-            pattern_id = (
-                f"{prelude.task_metadata.get('intent_type', 'unknown')}_{prelude.task.id}"
-            )
+            pattern_id = f"{prelude.task_metadata.get('intent_type', 'unknown')}_{prelude.task.id}"
             feedback_controller.record_pattern_effectiveness(
                 pattern_id, turn_state.tool_error_count == 0
             )
@@ -2404,11 +3309,14 @@ def run_agent_turn(
         # 稳定性监测：记录快照
         if stability_monitor:
             from minicode.stability_monitor import MetricSnapshot
+
             snapshot = MetricSnapshot(
                 timestamp=time.time(),
                 error_rate=float(turn_state.tool_error_count) / max(turn_state.step, 1),
                 avg_latency=step * 2.0,  # 简化估算
-                context_usage=context_manager.get_stats().usage_percentage if context_manager else 0.0,
+                context_usage=context_manager.get_stats().usage_percentage
+                if context_manager
+                else 0.0,
                 active_tasks=1,
             )
             stability_monitor.record_snapshot(snapshot)
@@ -2425,7 +3333,9 @@ def run_agent_turn(
             # 预测控制器报告
             if predictive_controller:
                 pred_summary = predictive_controller.get_prediction_summary()
-                logger.info("Prediction summary: accuracy=%s", pred_summary.get("accuracy", {}))
+                logger.info(
+                    "Prediction summary: accuracy=%s", pred_summary.get("accuracy", {})
+                )
 
             # 自愈引擎统计
             if self_healing_engine:
@@ -2435,7 +3345,10 @@ def run_agent_turn(
             # 多变量解耦状态
             if decoupling_controller:
                 coupling_status = decoupling_controller.get_coupling_status()
-                logger.info("Coupling status: strong=%s", coupling_status.get("strong_couplings", []))
+                logger.info(
+                    "Coupling status: strong=%s",
+                    coupling_status.get("strong_couplings", []),
+                )
 
         # 上下文管理管线统计 (Claude Code-style + Cybernetics)
         if context_compactor:
@@ -2491,45 +3404,60 @@ def run_agent_turn(
                 )
             # Apply outer-loop ControlSignal to runtime parameters
             if control_signal.confidence > 0.6:
-                if control_signal.limit_max_steps and control_signal.limit_max_steps < max_steps:
+                if (
+                    control_signal.limit_max_steps
+                    and control_signal.limit_max_steps < max_steps
+                ):
                     logger.info(
                         "FeedbackController: limiting max_steps %d → %d",
-                        max_steps, control_signal.limit_max_steps,
+                        max_steps,
+                        control_signal.limit_max_steps,
                     )
                     max_steps = control_signal.limit_max_steps
                 if control_signal.adjust_token_budget != 1.0:
-                    if context_compactor and hasattr(context_compactor, '_tool_budget') and context_compactor._tool_budget:
+                    if (
+                        context_compactor
+                        and hasattr(context_compactor, "_tool_budget")
+                        and context_compactor._tool_budget
+                    ):
                         new_budget = max(
                             1000,
-                            int(context_compactor._tool_budget.budget_per_message * control_signal.adjust_token_budget),
+                            int(
+                                context_compactor._tool_budget.budget_per_message
+                                * control_signal.adjust_token_budget
+                            ),
                         )
                         context_compactor._tool_budget.budget_per_message = new_budget
                         logger.info(
                             "FeedbackController: token budget adjusted to %d (mult=%.2f)",
-                            new_budget, control_signal.adjust_token_budget,
+                            new_budget,
+                            control_signal.adjust_token_budget,
                         )
                 if control_signal.reduce_parallelism:
                     # Cap tool concurrency at 2
-                    if not hasattr(tool_scheduler, '_force_max_workers'):
+                    if not hasattr(tool_scheduler, "_force_max_workers"):
                         tool_scheduler._force_max_workers = 2
                     logger.info(
                         "FeedbackController: reduce_parallelism → max_workers=2 "
-                        "(oscillation=%.2f)", control_signal.oscillation_index,
+                        "(oscillation=%.2f)",
+                        control_signal.oscillation_index,
                     )
                 if control_signal.adjust_concurrency != 0:
                     cap = max(1, 4 + control_signal.adjust_concurrency)
                     tool_scheduler._force_max_workers = cap
                     logger.info(
                         "FeedbackController: adjust_concurrency=%+d → max_workers=%d",
-                        control_signal.adjust_concurrency, cap,
+                        control_signal.adjust_concurrency,
+                        cap,
                     )
                 if control_signal.increase_model_level:
                     logger.info(
                         "FeedbackController: model upgrade recommended (errors=%.2f perf=%.2f)",
-                        system_state.error_frequency, system_state.performance_score(),
+                        system_state.error_frequency,
+                        system_state.performance_score(),
                     )
                     if model_switcher:
-                        if hasattr(model_switcher, '_pending_upgrade'):
+                        if hasattr(model_switcher, "_pending_upgrade"):
                             model_switcher._pending_upgrade = True  # type: ignore[attr-defined]
                 if control_signal.decrease_model_level:
                     logger.info(
@@ -2538,15 +3466,17 @@ def run_agent_turn(
                     )
                 if control_signal.suggest_memory_persistence:
                     logger.info("FeedbackController: persisting working memory")
-                    if context_compactor and hasattr(context_compactor, '_tool_budget'):
+                    if context_compactor and hasattr(context_compactor, "_tool_budget"):
                         try:
                             context_compactor._tool_budget.flush()
                         except Exception:
                             pass
                 if control_signal.recommend_skill_update:
-                    logger.info("FeedbackController: skill update recommended (pattern=%.2f)",
-                               system_state.pattern_reuse_rate)
-                    if not hasattr(tool_scheduler, '_pending_skill_update'):
+                    logger.info(
+                        "FeedbackController: skill update recommended (pattern=%.2f)",
+                        system_state.pattern_reuse_rate,
+                    )
+                    if not hasattr(tool_scheduler, "_pending_skill_update"):
                         tool_scheduler._pending_skill_update = True
 
                 if control_signal.reduce_tool_timeout:
@@ -2557,8 +3487,8 @@ def run_agent_turn(
                         "FeedbackController: tool timeout reduced to %.1fs",
                         new_timeout,
                     )
-                elif hasattr(tool_scheduler, '_force_tool_timeout'):
-                    if hasattr(tool_scheduler, '_force_tool_timeout'):
+                elif hasattr(tool_scheduler, "_force_tool_timeout"):
+                    if hasattr(tool_scheduler, "_force_tool_timeout"):
                         del tool_scheduler._force_tool_timeout
 
                 if control_signal.increase_nudge_frequency:
@@ -2567,8 +3497,8 @@ def run_agent_turn(
                         "FeedbackController: nudge frequency increased (stability=%.2f)",
                         system_state.stability_score(),
                     )
-                elif hasattr(tool_scheduler, '_force_nudge_frequency'):
-                    if hasattr(tool_scheduler, '_force_nudge_frequency'):
+                elif hasattr(tool_scheduler, "_force_nudge_frequency"):
+                    if hasattr(tool_scheduler, "_force_nudge_frequency"):
                         del tool_scheduler._force_nudge_frequency
 
                 if control_signal.promote_pattern:
@@ -2580,18 +3510,33 @@ def run_agent_turn(
                         control_signal.promote_pattern,
                     )
 
-                if control_signal.force_compaction and context_compactor:
+                if (
+                    control_signal.force_compaction
+                    and legacy_context_management_allowed
+                    and context_compactor
+                ):
                     try:
-                        compacted = context_compactor.compact_messages() if hasattr(context_compactor, 'compact_messages') else False
+                        compacted = (
+                            context_compactor.compact_messages()
+                            if hasattr(context_compactor, "compact_messages")
+                            else False
+                        )
                         logger.info(
                             "FeedbackController: forced compaction (%d messages)",
                             len(compacted) if compacted else 0,
                         )
                     except Exception as exc:
-                        logger.warning("FeedbackController: forced compaction failed: %s", exc)
+                        logger.warning(
+                            "FeedbackController: forced compaction failed: %s", exc
+                        )
 
             # 自适应PID调参：每20轮自动调节内外环PID参数
-            if adaptive_pid_tuner and step > 0 and step % 20 == 0 and feedback_controller:
+            if (
+                adaptive_pid_tuner
+                and step > 0
+                and step % 20 == 0
+                and feedback_controller
+            ):
                 try:
                     stability_error = 1.0 - system_state.stability_score()
                     perf_score = system_state.performance_score()
@@ -2609,8 +3554,12 @@ def run_agent_turn(
                             logger.info(
                                 "AdaptivePIDTuner: context PID tuned kp=%.3f ki=%.3f kd=%.3f "
                                 "method=%s perf=%.2f",
-                                tuned.kp, tuned.ki, tuned.kd,
-                                adaptive_pid_tuner._active_method.value if hasattr(adaptive_pid_tuner, '_active_method') else 'unknown',
+                                tuned.kp,
+                                tuned.ki,
+                                tuned.kd,
+                                adaptive_pid_tuner._active_method.value
+                                if hasattr(adaptive_pid_tuner, "_active_method")
+                                else "unknown",
                                 avg_perf,
                             )
                 except Exception:
@@ -2621,7 +3570,9 @@ def run_agent_turn(
             supervisor_snapshots = []
             if context_cybernetics:
                 supervisor_snapshots.append(
-                    cybernetic_supervisor.snapshot_from_context(context_cybernetics.get_stats())
+                    cybernetic_supervisor.snapshot_from_context(
+                        context_cybernetics.get_stats()
+                    )
                 )
             if cost_control:
                 supervisor_snapshots.append(
@@ -2641,3 +3592,5 @@ def run_agent_turn(
                 supervisor_report.risk_level.value,
                 "; ".join(supervisor_report.recommended_actions[:3]),
             )
+        if paged_memory_finalization_error is not None:
+            raise paged_memory_finalization_error
