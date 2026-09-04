@@ -1,576 +1,417 @@
 ---
-status: draft
+status: implemented
 date: 2026-09-02
-scope: multi-agent-runtime-v2
+scope: unified-runtime-ultra-v1
 companion-acceptance-plan: 2026-09-02-multi-agent-runtime-v2-acceptance.md
+implementation-status: ultra-v1-complete
 ---
 
-# MiniCode 多 Agent Runtime V2 升级方案
+# MiniCode 统一 Runtime 与 Ultra V1 升级方案
 
-## 1. 目标
+## 1. 目标、范围与判定口径
 
-在不推翻现有 `run_agent_turn`、工具系统、权限管理、记忆、会话和恢复能力的前提下，把当前“主 Agent 通过 `task` Tool 同步调用子 Agent”的实现升级为统一、可验证、可恢复的任务运行时。
+本方案把 MiniCode 现有的模型—工具循环纳入一个统一、可审计、可恢复的 Runtime。Standard 和 Ultra 是同一个 Runtime 的 `ExecutionProfile`，不是“旧 AgentLoop”和“新 Task Runtime”两套系统。两者共享协议、PlanGraph、Reducer、Scheduler、权限/审批语义、Session/Checkpoint、结果与最终完成条件，只在推理预算、执行拓扑和验证强度上取不同配置。
 
-升级后的系统同时支持两条执行路径：
+本轮交付范围是统一 Runtime 和 Ultra V1：
 
 ```text
-简单任务：Interpreter -> Contract -> Fast Plan -> Validator
-         -> Runtime/Scheduler -> 单 Worker -> Verifier -> Deliverer
-
-复杂任务：Interpreter -> Contract -> Model Plan -> Validator
-         -> Runtime/Scheduler -> 多 Worker -> Node Verifier
-         -> Final Verifier -> Deliverer
+并行只读 Explorer/Reviewer
+  -> 结构化 Evidence 聚合
+  -> 唯一 Writer 在隔离 workspace 修改并集成
+  -> 独立只读 Verifier 验收集成后的工作区
+  -> CompletionGate 决定是否交付
 ```
 
-两条路径必须共用同一组任务契约、状态机、权限、证据、验证和交付协议。简单任务只省略不必要的模型规划和并行调度，不得绕过安全与验收边界。
+配套验收见 [统一 Runtime 与 Ultra V1 验收计划](./2026-09-02-multi-agent-runtime-v2-acceptance.md)。文档中“本轮”表示必须落实到代码和自动化测试；“deferred”只表示保留协议或设计，不构成本轮完成声明。
 
-## 2. 当前基线
+## 2. 真实基线与约束
 
-当前仓库已经具备可复用基础：
+以下是本轮实施前审计确认的可复用边界；本轮已按第 12 节迁移映射将它们接入统一 Runtime：
 
-- `minicode/agent_loop.py`：成熟的单 Agent 模型—工具循环，可作为 Worker Kernel。
-- `minicode/tools/task.py`：`explore`、`plan`、`general` 三种同步子 Agent。
-- `minicode/task_graph.py`：Task DAG、依赖、优先级、slot 和持久化数据结构。
-- `minicode/agent_intelligence.py`：工具调用并发安全分类和并发度控制。
-- `minicode/turn_kernel.py`：单次 Agent Turn 的 explore/execute/verify 阶段与证据门禁。
-- `minicode/permissions.py`：路径、命令和编辑审批。
-- `minicode/verification_controller.py`：验证计划生成。
-- `minicode/session.py`：会话持久化、重放、checkpoint 和 rewind。
-- `minicode/memory.py`、`memory_pipeline.py`、`working_memory.py`：记忆检索和回注。
-- `minicode/cybernetic_orchestrator.py`：上下文、成本、稳定性和恢复控制。
+- `minicode/agent_loop.py::run_agent_turn` 是成熟的单 Worker 模型—工具循环；本轮以 `WorkerRunner` 包装，不重写其内部主循环。
+- `minicode/turn_kernel.py::TurnKernel` 管理一个 Worker 内的 explore/execute/verify 与 evidence guard；它不是任务级 Final Verifier。
+- `minicode/agent_intelligence.py::ToolScheduler` 只并发一个 Worker 发出的工具调用；它不是 Worker Scheduler。
+- `minicode/tools/task.py` 实施前会直接启动子 `AgentLoop`，并对结果做 8,000 字符截断；本轮已改为 `DelegationGateway`，完整大结果进 Artifact Store。
+- `minicode/task_graph.py::TaskGraph` 是现有任务图入口；本轮使其成为/适配唯一 Canonical PlanGraph，不再增加另一份可独立推进的 Plan 状态。
+- `minicode/pipeline_engine.py::PipelineEngine` 当前主要服务兼容测试和控制器适配；它不再拥有产品执行权，逐步收敛为 `PlanCompiler`/legacy adapter。
+- `minicode/cybernetic_supervisor.py::CyberneticSupervisor` 继续提供成本、进度、上下文与稳定性信号，只能生成结构化 Decision/Command，不能直接改 Runtime 状态。
+- `minicode/permissions.py::PermissionManager` 保持 Worker 侧交互与兼容能力，由中央 Policy/Approval 适配器统一解释。
+- `minicode/session.py`、`minicode/session_contract.py`、现有 checkpoint/rewind 与 `minicode/memory.py` 继续作为兼容基础；Runtime 扩展写入 Session extension 或 MiniCode 状态目录。
 
-当前主要缺口：
+基线行为必须先由 golden/regression tests 冻结。简单 Standard 的关键基线是：单次任务只有现有 Worker 所需的模型调用，不额外引入 LLM Planner、LLM Plan Validator 或 LLM Final Verifier。
 
-1. Router 主要选择模型，不选择 answer-only、fast、single-agent 或 multi-agent 执行拓扑。
-2. `TaskGraph` 没有成为 `task` 子 Agent 的真实 ready-node 调度源。
-3. `PipelineEngine` 没有接入产品主链，且计划步骤与真实 Worker/Tool Invocation 脱节。
-4. `task` Tool 同步等待子 Agent 完成，多个子 Agent 默认串行。
-5. 子 Agent 结果是文本摘要，不是可机器验收的结构化结果。
-6. Turn 级验证不能替代节点级和任务级验收。
-7. General 子 Agent 与父 Agent 共用工作目录，缺少并行写隔离和合并协议。
-8. 权限审批没有形成绑定到 invocation、参数、资源版本和有效期的授权凭证。
-9. 缺少统一 DeliveryManifest、Partial Delivery 和任务恢复协议。
+## 3. 四个正交维度
 
-## 3. 非目标
+以下维度不得重新绑定：
 
-V2 首版不做以下事项：
+| 维度 | 值 | 说明 |
+|---|---|---|
+| 用户模式 | `standard`, `ultra` | 产品入口；首版不公开 Auto |
+| 推理预算 | low/medium/high 或统一预算对象 | 经 `BudgetPolicy` 转为供应商调用配置，不能散落供应商字段 |
+| 执行拓扑 | `standard-single`, `deep-single`, `ultra-read-fanout` | 由可审计路由决定 |
+| 验证强度 | `light`, `strict` | 共用 Verifier/CompletionGate 接口 |
 
-- 不实现去中心化 Agent Team、leader election 或任意 Agent 间点对点通信。
-- 不让多个写 Agent 直接并发修改同一 checkout。
-- 不用新的 Planner 替换现有模型适配层。
-- 不删除现有 `task` Tool；它在迁移期作为兼容入口。
-- 不把 `CyberneticSupervisor` 改造成业务编排器；它继续负责运行健康信号。
-- 不把模型的“我已完成”当作验收证据。
-- 不以 stub、mock 成功值或跳过测试冒充能力完成。
+因此 Standard 可以自适应 low/medium，Ultra 可以因强耦合选择 high-budget `deep-single`；Ultra 不等于必须启动多个 Agent，Standard 也不等于强制最低推理。
 
-## 4. 设计原则
+## 4. Profile 与 route
 
-### 4.1 一个控制面，多个执行形态
+### 4.1 Standard
 
-Fast、Single-Agent 和 Multi-Agent 只产生不同形状的合法 Plan，后续全部进入同一个 Runtime、Scheduler、Policy、Verifier 和 Deliverer。
+- 默认对外 profile；`max_active_workers=1`。
+- 简单请求编译为确定性单节点 Plan。
+- 默认不调用 LLM Planner、LLM Plan Validator、LLM Final Verifier。
+- 复用现有 AgentLoop、TurnKernel、工具权限、Memory、Session、Checkpoint、Rewind。
+- 保留 `task` 兼容行为时，DelegationRequest 仍由统一 Scheduler 登记并串行执行。
+- 使用 `light` CompletionGate。
 
-### 4.2 Reducer 是任务状态的唯一写入口
+### 4.2 Ultra 与 deep-single
 
-Worker、Tool Runner、Verifier 和 Deliverer 只产生事件，不能直接散改任务状态。Reducer 按 `task_id + plan_revision + event_id` 归并状态，保证重放和恢复确定性。
+Ultra 启用更高预算、更严格验证和最多多个 Worker，但必须先生成 `TopologyDecision`。若任务强耦合、独立子问题不足、写冲突高、共享上下文依赖高或预算不足，选择内部 `deep-single`，并向 trace/TUI 说明原因。这是合法成功路径，不是降级错误。
 
-### 4.3 Claim 必须引用 Evidence
+### 4.3 Ultra V1 read fan-out
 
-WorkerResult 中的每个可验收 Claim 必须引用 EvidenceRef。文本摘要只用于人读，不能使节点进入 `verified`。
+仅当至少两个子问题可独立输入、输出和验证，并行收益高于协调成本，且没有未隔离写入，才选择 `ultra-read-fanout`。中央 Plan 预先创建只读节点；`dynamic_worker_delegation=false`，`max_delegation_depth=1`。所有 Explorer/Reviewer 完成后，由唯一 Writer 修改，再由独立只读 Verifier 针对集成结果验收。
 
-### 4.4 能力最小化
-
-Scheduler 根据节点声明发放最小工具集、路径范围、网络范围和预算。只读 Worker 不获得写工具；写 Worker 不自动继承父任务的全部授权。
-
-### 4.5 先安全串行，再受控并行
-
-第一阶段只并行无共享写副作用的节点。写节点必须串行，直到 worktree、资源 ownership 和 merge 验证全部落地。
-
-### 4.6 复用现有 Worker Kernel
-
-`run_agent_turn` 保持单 Worker 职责。任务分解、跨 Worker 调度和最终验收放在外层，不把更多全局状态继续塞入 `agent_loop.py`。
-
-## 5. 目标架构
+## 5. 统一架构
 
 ```mermaid
 flowchart TD
-    U[User Turn] --> CI[Conversation / Turn Interpreter]
-    CI -->|answer only| AO[Answer-only Responder]
-    CI -->|new task or revision| TC[Task Contract / Amendment]
-    CI -->|control command| CMD[Typed Command Handler]
-
-    TC --> IR[Intent / Complexity Router]
-    IR -->|missing required data| NI[Needs Input]
-    IR -->|deterministic| FP[Fast Plan Builder]
-    IR -->|single worker| SP[Single-Agent Plan Builder]
-    IR -->|complex| MP[Model Planner]
-
-    FP --> PV[Plan Validator]
-    SP --> PV
-    MP --> PV
-    PV -->|repairable| PR[Bounded Plan Repair]
-    PR --> PV
-    PV -->|valid| RT[Task Runtime / Reducer]
-    PV -->|invalid| TF[Task Failed]
-
-    RT --> SCH[Scheduler]
-    SCH --> IS[Invocation Spec]
-    IS --> CB[Context Builder]
-    CB --> PE[Policy Engine]
-    PE -->|allowed| WR[Worker / Tool Runner]
-    PE -->|approval required| AP[Waiting Approval]
-    PE -->|denied| RT
-    AP -->|bound grant valid| WR
-    AP -->|denied or expired| RT
-
-    WR --> ES[Evidence / Artifact Store]
-    WR --> AR[Structured Result]
-    ES --> NV[Node Verifier]
-    AR --> NV
-    NV -->|pass| RT
-    NV -->|bounded retry| SCH
-    NV -->|replan| RG[Replan Gate]
-    NV -->|needs input| NI
-    NV -->|unrecoverable| TF
-    RG --> MP
-
-    RT -->|all required nodes verified| FV[Final Task Verifier]
-    FV -->|pass| D[Deliverer + DeliveryManifest]
-    FV -->|partial| PD[Partial Deliverer]
-    FV -->|replan| RG
-    FV -->|fail| TF
-
-    NI -->|user amendment| TC
+    U[User Request] --> E[TaskEnvelope / TaskContract]
+    E --> PR[ProfileResolver]
+    PR --> TD[TopologyDecision]
+    TD --> PC[PlanCompiler]
+    PC --> PV[Structural PlanValidator]
+    PV --> RC[RunCoordinator]
+    RC <--> R[Single Reducer]
+    RC --> S[Single TaskScheduler]
+    S --> WR[WorkerRunner]
+    WR --> AL[Existing AgentLoop]
+    AL --> TK[TurnKernel]
+    AL --> ITS[Intra-worker ToolScheduler]
+    WR --> AR[AgentResult / Evidence / Artifact]
+    AR --> R
+    R --> VR[Verifier Registry]
+    VR --> CG[CompletionGate]
+    CG --> D[Deliverer]
+    PM[PermissionManager Adapter] --> WR
+    CS[CyberneticSupervisor Decisions] --> R
+    SS[Session / Checkpoint / Runtime Store] <--> R
 ```
 
-## 6. 核心数据契约
+Standard fast path仍经过同一组件，但组件可执行零模型、常量时间的确定性工作：
 
-所有契约使用可序列化的 dataclass/TypedDict，并提供显式 `schema_version`。持久化数据禁止保存不可重建的进程内对象。
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant RT as Unified Runtime
+    participant S as TaskScheduler(1)
+    participant W as WorkerRunner/AgentLoop
+    participant G as Light CompletionGate
+    U->>RT: request + profile=standard
+    RT->>RT: envelope + deterministic one-node plan
+    RT->>S: submit plan
+    S->>W: one claimed attempt
+    W-->>S: structured AgentResult
+    S-->>RT: reducer-applied event
+    RT->>G: integrated workspace + contract
+    G-->>U: final
+```
 
-### 6.1 TaskContract
+Ultra V1 调用链：
 
-| 字段 | 要求 |
-| --- | --- |
-| `task_id` | 全局稳定 ID |
-| `revision` | 从 1 开始递增；Amendment 后产生新 revision |
-| `goal` | 单一、可验收目标 |
-| `scope` | 允许读取、修改和调用的资源范围 |
-| `constraints` | 用户、仓库、权限、成本和时间约束 |
-| `required_outputs` | 必须交付的结果类型和路径 |
-| `acceptance_criteria` | 可由 Verifier 判定的条件 |
-| `risk_class` | `low`、`medium`、`high`、`critical` |
-| `conversation_refs` | 形成契约的用户消息引用 |
-| `status` | `draft`、`needs_input`、`active`、`completed`、`partial`、`failed` |
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant RT as Unified Runtime
+    participant S as TaskScheduler
+    participant E as Read-only Workers
+    participant W as Exclusive Writer
+    participant V as Independent Verifier
+    U->>RT: request + profile=ultra
+    RT->>RT: TopologyDecision + validated DAG
+    par independent investigations
+        S->>E: explorer A
+        S->>E: explorer B..N
+    end
+    E-->>RT: EvidenceRefs + ArtifactRefs
+    S->>W: exclusive write lease + aggregated evidence
+    W-->>RT: isolated changes + integration record
+    S->>V: read-only verify integrated workspace
+    V-->>RT: VerificationRecords
+    RT-->>U: strict CompletionGate + delivery
+```
 
-### 6.2 TaskAmendment
+## 6. 唯一权威与组件职责
 
-Amendment 必须记录：原 revision、变更字段、变更原因、用户消息引用、受影响节点集合和新 revision。未受影响且输入版本一致的已验证节点可以复用；其他节点必须失效并重新规划或验证。
+| 组件 | 本轮权威职责 | 明确禁止 |
+|---|---|---|
+| `RunCoordinator` | 组装命令、驱动计划、恢复与交付 | 直接绕过 Reducer 改状态 |
+| `Reducer` | 串行应用所有 Runtime Command/Result/Event | Worker、Policy、Verifier 直接改全局状态 |
+| `TaskScheduler` | Worker 创建、ready/claim、Attempt、lease、fencing、并发、retry、cancel | 第二个 Scheduler；用 ToolScheduler 调 Worker |
+| `TaskGraph` / Canonical PlanGraph | 当前 PlanVersion、节点依赖与版本关系 | PipelineEngine 持有平行可执行图 |
+| `WorkerRunner` / `AgentLoop` | 单 Worker 模型—工具循环 | 修改全局 DAG；生成未登记 Worker |
+| `TurnKernel` | Worker 内阶段与 evidence guard | 代替集成 Final Gate |
+| `ToolScheduler` | Worker 内并发安全的工具调用 | Worker claim/lease |
+| `DelegationGateway` | 将 `task` 转成 `DelegationRequest` | 直接 import/call/实例化 AgentLoop |
+| `PermissionManager` adapter | 执行已由中央 Policy/Approval 约束的 Worker 操作 | Worker 自建不一致审批语义 |
+| `CyberneticSupervisor` | 输出成本/稳定性/恢复 Decision/Command | 任意修改 state/plan |
+| `PipelineEngine` | legacy Plan adapter / 离线控制器兼容 | 产品 Runtime、第二 Scheduler |
+| Verifier Registry | 确定性优先的节点/最终验证 | 把 PolicyDenied/ApprovalExpired 当验证失败 |
 
-### 6.3 Plan 与 PlanNode
+## 7. 核心协议
 
-| 字段 | 要求 |
-| --- | --- |
-| `plan_id` / `revision` | 每次 replan 产生新 revision |
-| `node_id` | plan 内唯一且稳定 |
-| `kind` | `tool` 或 `agent` |
-| `capability` | 所需能力，不直接绑定实现名称 |
-| `dependencies` | 只引用同 plan 的节点，形成 DAG |
-| `input_refs` | TaskContract、Artifact 或 Evidence 引用 |
-| `expected_outputs` | 节点必须产生的结果 |
-| `write_scope` | 写资源集合；只读节点为空 |
-| `verification_spec` | verifier 类型、断言和必要证据 |
-| `retry_policy` | 最大次数、可重试错误、退避策略 |
-| `approval_policy` | 是否需要审批及审批范围 |
-| `budget` | step、token、cost、timeout 上限 |
-| `required` | 是否影响最终任务完成 |
+所有对象有 `schema_version`，使用 Enum/dataclass/TypedDict 形式，必须可 JSON 序列化、可恢复。
 
-### 6.4 InvocationSpec
+### 7.1 Task 与 Profile
 
-Scheduler 输出 InvocationSpec，至少包含：
+- `TaskEnvelope`: `run_id`, `request`, `workspace`, `requested_profile`, `created_at`, compatibility/session refs。
+- `TaskContract`: envelope + `contract_revision`, constraints, acceptance criteria, expected outputs, budgets。
+- `TaskAmendment`: amendment id、base/next contract revision、changed fields、affected node hints。
+- `ExecutionProfile`: `requested_mode`, `selected_route`, `reasoning_budget`, `planner_budget`, `verifier_budget`, `max_active_workers`, `max_agents`, `max_tokens`, `max_cost`, `deadline`, `retry_budget`, `max_delegation_depth`, `verification_level`, `write_isolation`。
 
-- `invocation_id`、`task_id`、`plan_revision`、`node_id`；
-- Worker 类型和模型选择；
-- 输入 Artifact/Evidence 的不可变引用；
-- 工具白名单与能力范围；
-- 读写路径、网络、命令和环境变量范围；
-- 工作目录或 worktree ID；
-- deadline、budget、retry attempt 和 idempotency key；
-- 父 invocation 与 delegation depth；
-- 所需 ApprovalGrant 引用。
+### 7.2 可审计 TopologyDecision
 
-Context Builder 必须在 Worker 启动前根据 InvocationSpec 构建最小上下文。
+必须包含：`requested_profile`, `selected_route`, `independent_subproblems`, `shared_context_dependency`, `write_conflict_risk`, `expected_parallel_gain`, `deterministic_verifiability`, `estimated_extra_cost`, `reasons`, `rejected_routes`。
 
-### 6.5 WorkerResult
+选择 fan-out 必须同时满足：独立子问题数至少 2；各自有明确输入/输出/验收；可独立验证；能降低墙钟或显著增覆盖；共享上下文依赖低；无未隔离并行写；收益大于协调成本；不超 agents/token/cost/deadline。任一条件失败则选择 `deep-single`。
+
+示例：
+
+```json
+{
+  "requested_profile": "ultra",
+  "selected_route": "ultra-read-fanout",
+  "independent_subproblems": ["audit call sites", "audit state recovery"],
+  "shared_context_dependency": "low",
+  "write_conflict_risk": "none",
+  "expected_parallel_gain": 0.37,
+  "deterministic_verifiability": true,
+  "estimated_extra_cost": 0.08,
+  "reasons": ["two independently verifiable read-only investigations"],
+  "rejected_routes": {"deep-single": "lower expected coverage per wall-clock"}
+}
+```
+
+### 7.3 Run → PlanVersion → PlanNode → NodeAttempt
+
+- Replan/TaskAmendment 创建新 `PlanVersion`；旧节点结果可复用，但受影响节点必须 `SUPERSEDED`。
+- Retry 只创建同一逻辑 `PlanNode` 的新 `NodeAttempt`。
+- Attempt 含 `attempt_number`, `lease_owner`, `lease_expiry`, `fencing_token`, idempotency key。
+- 节点状态：`PENDING`, `READY`, `CLAIMED`, `RUNNING`, `WAITING_APPROVAL`, `WAITING_INPUT`, `VERIFYING`, `FAILED_RETRYABLE`, `FAILED_TERMINAL`, `SUCCEEDED`, `CANCELED`, `SUPERSEDED`。
+- Reducer 拒绝过期 lease、旧 fencing token、superseded 节点、非当前 Attempt 与重复完成结果。
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> READY: dependencies satisfied
+    READY --> CLAIMED: Scheduler claim + lease
+    CLAIMED --> RUNNING: worker starts
+    RUNNING --> WAITING_APPROVAL: approval required
+    RUNNING --> WAITING_INPUT: information required
+    WAITING_APPROVAL --> RUNNING: valid grant
+    WAITING_INPUT --> SUPERSEDED: TaskAmendment / new plan version
+    RUNNING --> VERIFYING: result accepted by Reducer
+    VERIFYING --> SUCCEEDED: verification accepted
+    VERIFYING --> FAILED_RETRYABLE: bounded retry
+    FAILED_RETRYABLE --> CLAIMED: new Attempt
+    RUNNING --> FAILED_TERMINAL: terminal failure
+    PENDING --> CANCELED: cancel propagation
+    READY --> CANCELED: cancel propagation
+    RUNNING --> CANCELED: cancel propagation
+    SUCCEEDED --> SUPERSEDED: later amendment invalidates result
+```
+
+### 7.4 Invocation、Context、Result 与 Evidence
+
+- `AgentInvocationSpec` 固化角色、objective、工具 effect scope、上下文与预算。
+- `ContextManifest` 记录 contract revision、plan version、node、repo/base revision、included file hashes、dependency/artifact refs、memory record/version、policy/prompt versions、tool capability scope、budget allocation。
+- `AgentResult` 包含 run/plan/node/attempt/status/base revision、summary、evidence/artifact refs、changed resources、verification records、usage、warnings、failure。
+- `EvidenceRef` 包含 type、path/resource、line/page/range、content hash、claim、producer node、base revision。
+- `ArtifactRef` 包含 artifact id、content hash、size、media type、store path/key。
+- 超过内联容量的完整输出原子写入 Artifact Store；结果只保存明确摘要和引用，禁止静默 8,000 字符截断。Verifier 必须可读完整 Artifact。
+
+### 7.5 Command、Event 与 execution result
+
+Typed Command 与 Event、TaskAmendment、Execution Result 相互独立：
 
 ```text
-WorkerResult
-  summary
-  status: succeeded | blocked | failed | cancelled
-  claims[]: { claim, evidence_refs[] }
-  artifacts[]: ArtifactRef
-  files_inspected[]
-  files_changed[]
-  commands_executed[]
-  side_effects[]
-  unresolved[]
-  suggested_followups[]
-  usage: { steps, tokens, cost, elapsed_ms }
+Commands: ApproveToolCall | RejectToolCall | AmendTask | CancelRun | ResumeRun
+Events:   ToolCallApproved | ToolCallRejected | TaskAmended | RunCanceled | RunResumed
+Results:  PolicyDenied | ApprovalExpired | ToolFailed | WorkerTimedOut | VerificationFailed
 ```
 
-WorkerResult 不直接宣告节点通过；它只是 Node Verifier 的输入。
+`ApprovalRequest/Grant` 绑定 `approval_id`, run/node/attempt/tool-call ids、`operation_digest`, cwd、arguments、environment scope、base revision、expiry、single-use。任一绑定字段改变即失效。PolicyDenied/ApprovalExpired 先进入 Reducer，再由其决定等待、终止、重规划或请求输入，不能直接送入 Verifier。
 
-### 6.6 EvidenceRef 与 ArtifactRef
+Needs Input 恢复流：
 
-Evidence 必须包含来源类型、内容摘要、完整性哈希、产生 invocation、时间、资源版本和可重放定位信息。ArtifactRevision 必须带父 revision、patch/文件清单和工作区基线 commit。
-
-### 6.7 VerificationResult
-
-```text
-VerificationResult
-  verdict: pass | fail | inconclusive | needs_input
-  assertions[]
-  evidence_refs[]
-  failed_criteria[]
-  retryable
-  replan_required
-  verifier_id
-  verifier_version
+```mermaid
+flowchart LR
+    WI[WAITING_INPUT] --> UA[User Amendment]
+    UA --> CR[New Contract Revision]
+    CR --> IA[Identify Affected Nodes]
+    IA --> PV[New PlanVersion / local revalidation]
+    PV --> RS[Resume same Run]
 ```
 
-### 6.8 ApprovalRequest / ApprovalGrant
+### 7.6 Budget、lease 与 replay
 
-Grant 必须绑定：
+`BudgetEnvelope` 统一限制 agents、active workers、delegation depth、tokens、cost、deadline、retry。取消必须传播到子 Worker、工具/子进程、lease、等待审批与临时 workspace。
 
-- task、plan revision、node 和 invocation；
-- 规范化 action、参数、资源范围和资源版本；
-- `issued_at`、`expires_at` 和使用次数；
-- grant 哈希与用户决定引用。
+工具调用 replay policy：`safe`、`idempotent_with_key`、`verify_before_retry`、`never_auto_retry`。外部副作用不承诺绝对 exactly-once；结果不明确的非幂等操作为 `never_auto_retry`。
 
-任何 action、参数、路径、版本或 invocation 变化都使旧 Grant 失效。
+## 8. Tool effect、工作区隔离与唯一 Writer
 
-### 6.9 DeliveryManifest
+工具必须有显式 effect，不再用 `concurrency_safe` 推断只读：
 
-最终交付必须包含：任务与 plan revision、完成/部分完成状态、required output、Artifact、通过的验收条件、关键 Evidence、未解决项、已知风险、执行与成本摘要，以及用户可执行的下一步。
+| effect | 典型操作 | Ultra Explorer | Ultra Writer | 默认 replay |
+|---|---|---:|---:|---|
+| `read_only` | read/list/grep/diff/static inspect | 允许 | 允许 | safe |
+| `workspace_write` | write/edit/patch/delete/move | 拒绝 | 独占 lease 后允许 | verify_before_retry |
+| `external_side_effect` | 外部提交、发布、写 API | 拒绝 | Policy/Approval 后允许 | 按工具声明 |
+| `privileged` | shell、动态委派、敏感管理 | 默认拒绝 | Policy/Approval 后允许 | never_auto_retry |
 
-## 7. 状态机与不变量
+Ultra Explorer/Reviewer 的 registry 只能暴露 `read_only`。Policy 层还要拒绝未知/误标写入，并用工作区 hash 测试证明零修改。Verifier 默认只读。
 
-### 7.1 任务状态
+Writer 必须取得全局独占 workspace-write lease，并通过 `WorkspaceProvider` 工作：优先临时 workspace/worktree/patch workspace；集成前校验每个目标的 base hash/revision，发生漂移或冲突即停止，不覆盖用户无关修改。非 Git workspace 使用 temp-copy/patch fallback，能力边界记录在 result。成功、失败、取消均清理隔离目录。本轮严禁两个 Writer 并行，不实现 AI merge arbiter。
 
-```text
-draft -> needs_input -> planned -> running
-running -> waiting_approval | replanning | verifying
-verifying -> completed | partial | failed | replanning
-waiting_approval -> running | needs_input | failed
+## 9. Verifier Registry 与 CompletionGate
+
+Registry 顺序固定为确定性优先：exit code/schema → unit → integration → lint/format → type → static → invariant → browser/render → 必要时 model judgment。代码、文档、数据、Web 可注册不同 verifier；Browser 只是其中一种。
+
+Node Verifier 检查节点 acceptance criteria；Final Verifier 必须针对集成后的最终 workspace 与完整最新 TaskContract。CompletionGate 共用接口：Standard=`light`，Ultra=`strict`，至少检查条款覆盖、集成状态、必需 verification records、冲突、审批、Policy violation、Artifact/Evidence、仍运行/失联 Worker 与当前 PlanVersion。任一强制项缺失不得 final。
+
+## 10. DelegationGateway
+
+`minicode/tools/task.py` 只构造：
+
+```yaml
+run_id: run-...
+parent_node_id: node-...
+requested_role: explore
+objective: inspect session recovery
+context_requirements: [contract, repository]
+allowed_tool_capabilities: [read_only]
+proposed_budget: {max_tokens: 4000, deadline_seconds: 60}
+delegation_depth: 1
+idempotency_key: ...
 ```
 
-### 7.2 节点状态
+它将请求交给当前 Runtime 的 `DelegationGateway`。Scheduler 注册 child Node/Attempt，Reducer 接收 Result；Standard 兼容提交采用父 slot 的受控串行执行，仍受全局预算与取消控制。Ultra V1 的 Worker 动态提交固定禁用，中央 Plan 负责 fan-out。工具没有 Runtime context 时返回结构化治理错误，不回退到影子 AgentLoop。
 
-```text
-pending -> ready -> scheduled -> running -> produced
-produced -> verifying -> verified
-running/verifying -> retry_wait -> ready
-running/verifying -> blocked | failed | cancelled
-verified -> invalidated  # 仅 Amendment/Replan 影响输入时
+## 11. 配置与兼容
+
+```yaml
+runtimeV2: true
+profile: standard
+standard:
+  max_active_workers: 1
+  verification_level: light
+ultra:
+  max_active_workers: 4
+  max_agents: 6
+  max_delegation_depth: 1
+  dynamic_worker_delegation: false
+  verification_level: strict
+  write_isolation: temporary-workspace
 ```
 
-### 7.3 强制不变量
-
-1. Plan 必须无环，所有依赖和输入引用存在。
-2. 只有依赖节点已 `verified` 的节点才能进入 `ready`。
-3. 同一 `task_id + plan_revision + node_id + attempt` 最多有一个有效执行 lease。
-4. 同一资源范围不能同时存在两个未隔离写 lease。
-5. Required node 未验证时，任务不能进入 `completed`。
-6. Claim 没有 EvidenceRef 时，相关验收断言不得通过。
-7. ApprovalGrant 必须与实际 invocation 完全匹配。
-8. Retry、replan、delegation depth、token、cost 和 elapsed time 都受全局预算约束。
-9. 旧 plan revision 的迟到结果只能归档，不能覆盖当前 revision 状态。
-10. Reducer 对相同事件重复应用必须幂等。
-
-## 8. 组件职责
-
-### 8.1 Conversation / Turn Interpreter
-
-负责把输入分类为 answer-only、新任务、TaskAmendment、控制命令或审批决定。它不做任务执行，也不自行修改 runtime 状态。
-
-### 8.2 Intent / Complexity Router
-
-输出 `answer_only`、`fast`、`single_agent`、`multi_agent` 或 `needs_input`。路由依据必须包含任务风险、未知量、预计副作用、依赖数量和可并行性，而不只使用关键词长度。
-
-### 8.3 Plan Builders
-
-- Fast Plan Builder：确定性模板，通常生成一个 tool/worker 节点和一个验证节点。
-- Single-Agent Plan Builder：生成一个有完整验收要求的 Agent 节点。
-- Model Planner：只生成结构化 Plan，不执行工具。
-
-三者输出相同 Plan schema。
-
-### 8.4 Plan Validator
-
-验证 schema、DAG、引用、能力、预算、权限、验证覆盖、写冲突和最终目标覆盖。确定性错误先由正规化器修复；只有语义缺失才允许一次有界模型修复。修复后仍不合法则进入 `needs_input` 或 `failed`，不得无限回到 Planner。
-
-### 8.5 Task Runtime / Reducer
-
-持有任务、plan revision、节点状态、lease、budget、approval、artifact 和 event cursor。它是恢复、重放和 UI 状态的权威来源。
-
-### 8.6 Scheduler
-
-只调度 `ready` 节点，执行能力匹配、优先级、资源锁、并发槽和预算检查。Scheduler 不判断业务正确性。
-
-### 8.7 Worker Runtime
-
-复用 `run_agent_turn` 作为 Agent Worker Kernel。Tool Invocation 可直接调用现有 ToolRegistry。Worker Runtime 负责将旧消息结果正规化为 WorkerResult，并产生完整事件。
-
-### 8.8 Context Builder
-
-按 InvocationSpec 装配：任务目标、当前节点、必要依赖摘要、相关记忆、允许资源、验收标准和预算。默认不注入父会话完整历史，也不把无关 Worker 过程传给其他 Worker。
-
-### 8.9 Policy Engine
-
-把现有 PermissionManager 适配为统一 PolicyDecision。策略在 Worker 启动前和每次 Tool Invocation 前都执行；审批只授予绑定后的 Grant，不授予模糊的“以后都允许”。
-
-### 8.10 Evidence / Artifact Store
-
-持久化工具回执、页面快照、命令输出摘要、测试报告、patch、文件 revision 和 WorkerResult。大对象可落盘，事件中只保存哈希和引用。
-
-### 8.11 Verifier Registry
-
-按 verification spec 选择执行器：
-
-- code：pytest、lint、type check、diff invariant；
-- web：隔离 Browser Verifier；
-- document：schema、render、link check；
-- research：claim/source/citation consistency；
-- generic：文件存在、哈希、命令退出码和结构断言。
-
-Verifier 必须与产生结果的 Worker 解耦，禁止同一模型仅凭自述完成自验收。
-
-### 8.12 Deliverer
-
-Deliverer 只打包已被 Final Verifier 接受的事实，不重新判断任务是否成功。部分完成必须明确区分已验证、未完成和失败部分。
-
-## 9. 现有模块迁移映射
-
-| 现有模块 | V2 处置 |
-| --- | --- |
-| `agent_loop.py` | 保留为 Worker Kernel；移出全局编排职责 |
-| `turn_kernel.py` | 保留单 Worker 阶段控制和局部 evidence guard |
-| `tools/task.py` | 先返回结构化 WorkerResult；随后改为 Scheduler 兼容 facade |
-| `task_object.py` | 迁移/适配为 TaskContract |
-| `task_graph.py` | 升级为 PlanGraph 与 node state projection |
-| `pipeline_engine.py` | 停止作为第二套执行器；可降级为 Fast/Single Plan Builder 兼容层 |
-| `agent_router.py` | 保留模型路由；新增独立 Execution Router，避免概念混用 |
-| `agent_intelligence.py` | ToolScheduler 保留；新增 TaskScheduler，不共用隐式安全规则 |
-| `verification_controller.py` | 生成 VerificationSpec；实际执行交给 Verifier Registry |
-| `permissions.py` | 作为 Policy Engine 的本地权限 adapter |
-| `session.py` | 持久化 task events、artifact refs、approval 和 delivery manifest |
-| `product_surfaces.py` | 展示真实 Agent Invocation，而不是只展示后台 shell task |
-| `cybernetic_supervisor.py` | 保持健康监控，不承担 workflow supervisor 语义 |
-
-## 10. 建议新增模块
-
-| 文件 | 单一职责 |
-| --- | --- |
-| `minicode/task_contract.py` | TaskContract、Amendment 和验收条件 |
-| `minicode/plan_model.py` | Plan、PlanNode、RetryPolicy、Budget |
-| `minicode/plan_builders.py` | Fast、Single、Model Planner adapter |
-| `minicode/plan_validator.py` | 确定性计划验证和有界修复协议 |
-| `minicode/task_events.py` | 事件 schema、版本和序列化 |
-| `minicode/task_runtime.py` | Reducer、projection、恢复与 plan revision |
-| `minicode/task_scheduler.py` | ready-node 调度、lease、资源锁和并发槽 |
-| `minicode/invocation.py` | InvocationSpec、InvocationResult 和幂等标识 |
-| `minicode/worker_runtime.py` | Agent/Tool Worker adapter 与结构化结果 |
-| `minicode/policy_engine.py` | PolicyDecision、ApprovalRequest/Grant |
-| `minicode/evidence_store.py` | Evidence、Artifact 和完整性索引 |
-| `minicode/verifier_registry.py` | Node/Final verifier 注册和执行 |
-| `minicode/delivery.py` | DeliveryManifest 和 Partial Delivery |
-
-每个新增模块都必须有对应镜像测试；不得将所有协议和执行逻辑堆入一个新的巨型 orchestrator 文件。
-
-## 11. 分阶段实施计划
-
-### Phase 0：冻结基线与兼容边界
-
-目标：在任何迁移前记录当前行为，避免升级过程中把单 Agent 产品链路改坏。
-
-任务：
-
-1. 为 `task` Tool、TaskGraph、Turn Kernel、PermissionManager 和 session replay 增加 characterization tests。
-2. 记录当前简单任务、工具任务和子 Agent 任务的事件序列。
-3. 建立 `multiAgentRuntimeV2` feature flag，默认关闭。
-4. 定义旧 `task` Tool 输出与新 WorkerResult 的兼容 adapter。
-
-退出条件：旧行为有自动化基线；关闭 flag 时输出和权限行为不变。
-
-### Phase 1：任务契约、事件和 Reducer
-
-目标：建立后续所有组件共享的权威状态模型。
-
-任务：
-
-1. 实现 TaskContract、TaskAmendment、PlanNode、TaskEvent schema。
-2. 实现纯函数 Reducer 和 projection。
-3. 实现事件幂等、schema migration、持久化和 replay。
-4. 把 Needs Input、Approval、Cancellation 和 Failure 变为显式状态。
-5. 在 session inspect/replay 中展示 task revision 和节点状态。
-
-退出条件：相同 event log 重放产生字节级等价 projection；进程中断后可恢复。
-
-### Phase 2：统一 Router、Plan Builder 与 Plan Validator
-
-目标：让简单和复杂任务进入同一个合法 Plan 协议。
-
-任务：
-
-1. 增加 answer-only、fast、single-agent、multi-agent、needs-input 路由结果。
-2. 实现 Fast Plan 和 Single-Agent Plan 的确定性模板。
-3. 为 Model Planner 定义严格结构化输出。
-4. 实现 Plan Validator 全部不变量。
-5. 实现最多一次的语义修复；记录原计划、错误和修复结果。
-
-退出条件：任何进入 Runtime 的 Plan 都通过同一 Validator；无验证器旁路。
-
-### Phase 3：Invocation、Context 与 Policy
-
-目标：把“谁执行、能看什么、能做什么”变成显式契约。
-
-任务：
-
-1. 实现 InvocationSpec、lease、idempotency key 和 deadline。
-2. 把 `run_agent_turn` 包装为 Agent Worker adapter。
-3. 把 ToolRegistry 包装为 Tool Worker adapter。
-4. 实现最小 Context Builder 和父/子 trace。
-5. 将 PermissionManager 接入 PolicyDecision。
-6. 实现与 action、参数、资源和版本绑定的 ApprovalGrant。
-7. 增加 delegation depth、全局 token/cost/step/time budget。
-
-退出条件：权限不能因委派扩大；修改 invocation 后旧审批不能复用。
-
-### Phase 4：结构化结果、Evidence Store 与验证器
-
-目标：把“模型说完成了”替换为“可独立验证的结果”。
-
-任务：
-
-1. `task` Tool 和 Worker adapter 输出 WorkerResult。
-2. 实现 EvidenceRef、ArtifactRevision 和内容哈希。
-3. 实现 Verifier Registry、Node Verifier 和 Final Task Verifier。
-4. 将 VerificationController 改为生成 VerificationSpec。
-5. 实现 claim-to-evidence 完整性检查。
-6. 实现 retry、replan、needs-input 和 unrecoverable 分流。
-
-退出条件：没有 Evidence 的 Claim 不能通过；required node 未验证不能交付 completed。
-
-### Phase 5：Task Scheduler 与受控只读并行
-
-目标：首次交付真实多 Worker 调度，同时保持共享工作区安全。
-
-任务：
-
-1. Scheduler 以 Plan DAG 的 ready nodes 为唯一输入。
-2. 增加任务级 slot、优先级、lease 和取消传播。
-3. 并行运行无共享写副作用的 explore/research/verify 节点。
-4. 写节点继续串行，并显式声明 write scope。
-5. 把旧 `task` Tool 转为 Scheduler facade；禁止无界递归 task 调用。
-6. Product surfaces 展示 node、worker、attempt、budget 和最新 evidence。
-
-退出条件：至少两个独立只读 Agent 可真实并行；失败、取消和重试可观察、可恢复。
-
-### Phase 6：写隔离、Patch 收敛与合并
-
-目标：允许多个实现 Worker 安全并行，而不是直接并发写当前 checkout。
-
-任务：
-
-1. 将 WorktreeIsolator 接入 InvocationSpec。
-2. 每个写 Worker 使用独立 worktree 或 Artifact Workspace。
-3. Worker 只交付 patch/artifact revision，不直接合并主工作区。
-4. 实现 merge arbiter、基线版本检查和冲突状态。
-5. 合并后重新执行受影响验证器。
-6. 正常、失败、取消和进程崩溃路径都清理 lease 与临时 worktree。
-
-退出条件：并行写不共享 checkout；有冲突时停止并报告，不能静默覆盖。
-
-### Phase 7：交付、兼容迁移与默认启用
-
-目标：形成用户可感知、可回滚的完整产品链路。
-
-任务：
-
-1. 实现 DeliveryManifest 和 Partial Delivery。
-2. 把 task event、approval、artifact 和 delivery 写入 session replay。
-3. 实现旧会话和旧 `task` 输出 schema 迁移。
-4. 先 shadow 生成新 Plan，再对 opt-in 会话执行 V2。
-5. 达到验收门禁后逐步默认启用 fast/single，再启用 multi-agent。
-6. 至少保留一个版本的 V1 fallback，并记录触发原因。
-
-退出条件：V2 默认路径通过验收计划；V1 fallback 有明确移除条件。
-
-## 12. 里程碑
-
-| 里程碑 | 包含阶段 | 可交付能力 |
-| --- | --- | --- |
-| M0 Baseline | Phase 0 | 可回归的旧运行时基线 |
-| M1 Typed Runtime | Phase 1-2 | 契约、计划、验证和可恢复 Reducer |
-| M2 Verified Single Worker | Phase 3-4 | 统一权限、结构化证据、节点/最终验证 |
-| M3 Multi-Agent MVP | Phase 5 | 只读多 Worker 并行、单写 Worker 串行 |
-| M4 Isolated Writers | Phase 6 | worktree 并行实现和受控合并 |
-| M5 Default V2 | Phase 7 | 完整交付、迁移、回滚和默认启用 |
-
-M3 是首个可对外称为“DAG 多 Agent 调度”的版本。M3 之前只能称为“受控子 Agent 委派”。
-
-## 13. Rollout 与回滚
-
-1. `off`：只执行 V1；用于基线与紧急回滚。
-2. `shadow`：V1 执行，V2 只生成/验证 Plan，不产生副作用。
-3. `single`：answer-only、fast 和 single-agent 使用 V2；multi-agent 仍回退 V1。
-4. `readonly-multi`：允许 V2 只读多 Agent，并保持单 writer。
-5. `isolated-write-multi`：启用 worktree 写 Agent。
-6. `default`：V2 默认，V1 仅显式 fallback。
-
-出现以下任一情况必须自动回退或停止 rollout：
-
-- 未授权副作用；
-- 事件重放不能恢复一致状态；
-- 旧审批被新 invocation 复用；
-- 写冲突造成用户改动丢失；
-- required node 未验证却交付 completed；
-- orphan process/worktree/lease 持续存在；
-- 简单任务额外触发不必要的 Planner 模型调用。
-
-## 14. 风险与缓解
-
-| 风险 | 缓解措施 |
-| --- | --- |
-| 编排逻辑继续膨胀 `agent_loop.py` | 外层 TaskRuntime 组合现有 Worker Kernel；建立依赖边界测试 |
-| 多 Agent token/cost 失控 | task 全局 budget + invocation 子预算 + hard stop |
-| Planner 产生伪 DAG | 确定性 Plan Validator；非法计划不进入 Scheduler |
-| 子 Agent 递归委派 | delegation depth 和 descendant budget；默认 Worker 不拥有 task capability |
-| 摘要丢失证据 | WorkerResult 只引用 EvidenceStore；摘要不承担验收 |
-| 只读声明与真实副作用不一致 | 工具 capability 元数据 + Policy 二次检查 + 测试夹具审计 |
-| 并发写覆盖用户工作区 | M3 单 writer；M4 worktree + patch merge + base revision 检查 |
-| replan 覆盖旧结果 | plan revision 隔离；迟到结果只归档 |
-| 宕机造成重复执行 | event log、lease expiry、idempotency key |
-| 验证器与 Worker 共同犯错 | 独立 verifier、不同工具链、确定性断言优先 |
-| V1/V2 长期双轨漂移 | 兼容 adapter 有移除里程碑；禁止复制两套工具执行逻辑 |
-
-## 15. Definition of Done
-
-只有同时满足以下条件，V2 升级方案才算完成：
-
-1. Fast、Single 和 Multi Plan 共用同一 schema 与 Validator。
-2. TaskRuntime 可由持久事件确定性重放。
-3. Scheduler 只运行合法 ready node，并实施 lease、预算和资源冲突控制。
-4. Agent 与 Tool Invocation 都有显式 Context 和 Policy 边界。
-5. Worker 产出结构化 Result，Claim 可追溯到 Evidence。
-6. Node Verifier 与 Final Verifier 都是强制门禁。
-7. M3 至少支持两个只读 Worker 真并行；M4 支持隔离写与受控合并。
-8. ApprovalGrant 精确绑定且不会跨 invocation 扩权。
-9. Needs Input、replan、retry、partial、cancel 和 crash recovery 均可恢复。
-10. DeliveryManifest 与 session replay 能说明做了什么、凭什么通过、还有什么没完成。
-11. 兼容、性能、安全和故障注入达到配套验收计划的全部发布门禁。
-
-## 16. 配套验收
-
-本方案的需求编号、测试场景、量化阈值、证据产物和发布判定，见：
-
-- [MiniCode 多 Agent Runtime V2 方案验收计划](./2026-09-02-multi-agent-runtime-v2-acceptance.md)
-
+- CLI/TUI/config 只公开 Standard/Ultra，缺省为 Standard；旧配置缺 profile 时等价 Standard。
+- `runtimeV2` 是当前配置字段，仅作灰度迁移工具，不是永久双 Runtime。关闭时仅用于紧急回退到已冻结的串行 Worker 行为。
+- 旧 Session/Checkpoint/rewind 数据继续加载；新 Runtime 信息位于可选 extension，旧 reader 可忽略。
+- V2 内部错误在尚未产生副作用且策略允许时可安全回退 `standard-single`；不得在结果不明确的外部副作用后重放。
+- Milvus 如未来接入，只能索引 Memory/Evidence；Run/Plan/Node/Attempt/Approval/Artifact revision 的权威是 Runtime State/Event Store。
+
+## 12. 现有模块迁移映射
+
+| 现有路径 | 本轮迁移 | 状态目标 |
+|---|---|---|
+| `minicode/agent_loop.py` | 保留 `run_agent_turn`；由 WorkerRunner 调用并注入 Runtime context | Worker-local |
+| `minicode/turn_kernel.py` | 保留 worker evidence guard | 非 Final Gate |
+| `minicode/agent_intelligence.py::ToolScheduler` | 保留单 Worker工具并发 | 非 Worker scheduler |
+| `minicode/tools/task.py` | 改为 DelegationGateway client | 无直接 AgentLoop |
+| `minicode/tooling.py` | 增加 `ToolEffect`/`ReplayPolicy` 和 effect filter | 显式能力治理 |
+| `minicode/task_graph.py` | Canonical PlanGraph compatibility facade | 唯一图语义 |
+| `minicode/pipeline_engine.py` | 标记/收敛为 legacy PlanAdapter | 不参与产品执行 |
+| `minicode/cybernetic_supervisor.py` | 只产出 command/decision/snapshot | 不写全局 state |
+| `minicode/permissions.py` | Worker-side adapter for central policy | 统一审批 digest |
+| `minicode/session.py`, `session_contract.py` | optional runtime extensions | 旧数据兼容 |
+| `minicode/main.py`, `headless.py`, `tui/input_handler.py`, `web_worker.py` | 接入统一入口 | Standard 默认 |
+
+## 13. 实施 Phase 0–7
+
+| Phase | 本轮内容 | 退出条件 | 实测状态 |
+|---|---|---|---|
+| 0 | 冻结旧行为、golden tests、基线指标 | 旧 AgentLoop/task/permission/session/turn tests 可重复 | `passed`；20 样本 + 3 warmup 校准已落盘 |
+| 1 | 统一协议、序列化、PlanGraph 模型，不改拓扑 | schema/state round-trip 测试通过 | `passed` |
+| 2 | AgentLoop Worker 化；Scheduler 以 max workers=1 接管 Standard | 无额外 Planner/Verifier 模型调用 | `passed` |
+| 3 | Reducer、持久状态、Approval、Needs Input、Cancel、Recovery | fake clock/fault tests 通过 | `passed` |
+| 4 | 并行只读 Worker、ContextManifest、Evidence/Artifact | barrier 证明真实并行且工作区零修改 | `passed` |
+| 5 | 隔离唯一 Writer、Verifier Registry、Integrated Final Gate | base drift/cancel/integration failure 被阻止 | `passed` |
+| 6 | Standard/Ultra 入口、TopologyDecision、预算路由与 trace | route 表驱动、兼容、性能门禁通过 | `passed`；G4 定量校准与 G6 live smoke 已通过 |
+| 7 | 多 Writer 实验设计（deferred） | 本轮不进入实现；需隔离/merge/冲突形式化前置 | `deferred` |
+
+## 14. Milestone M0–M5
+
+| Milestone | 进入条件 | 退出条件 / 独立交付物 | 回滚 | 验收映射 | 实测状态 |
+|---|---|---|---|---|---|
+| M0 Baseline | 仓库测试可运行 | golden、调用次数、延迟/token 基线 | 无代码路径变更 | R17, R30 / G0-G1 | `passed` |
+| M1 Protocol | M0 | 可序列化协议、Canonical PlanGraph、Reducer invariants | flag off，旧 Session 忽略 extension | R01-R08, R18 / G0-G1 | `passed` |
+| M2 Unified Standard | M1 | Standard 经 Scheduler/Reducer/WorkerRunner，task 受治理 | `runtimeV2=false` 串行兼容 | R10, R17, R19-R21 / G1-G2 | `passed` |
+| M3 Read Fan-out | M2 | Ultra route、只读并行、预算/cancel、Artifact | route 强制 deep-single | R11-R13, R22-R27 / G2-G4 | `passed`；等价可拆分负载 p95 改善 36.3853% |
+| M4 Exclusive Writer | M3 | isolation、唯一 lease、Verifier、Final Gate | Ultra 强制 deep-single/Standard | R14-R16, R28-R35 / G3-G5 | `passed` |
+| M5 Product Ready | M4 | CLI/TUI、兼容、全仓/性能证据、文档回写 | profile 默认 Standard、临时 flag off | 全部本轮 R / G0-G6 | `accepted` |
+
+## 15. 风险、灰度与回滚
+
+- 状态分叉：Reducer 单写 + event id 去重；禁止 Runtime 外直接改 Plan。
+- 并发写污染：只读 registry + workspace hash；唯一 writer lease + fencing。
+- 旧配置/session 回归：profile 缺省、可选 extension、golden tests。
+- 简单任务成本回归：确定性 compiler/validator/gate；记录模型调用数与 token。
+- 不确定副作用重放：replay policy；`never_auto_retry` 为默认保守策略。
+- Artifact 元数据不一致：内容原子写、hash 校验、孤儿清理/恢复扫描。
+- 灰度发现问题：禁止新 fan-out、选择 deep-single；若仍失败且无副作用，临时 flag 回退旧串行路径。最终移除 flag 与旧产品入口，不能长期维护双 Runtime。
+
+## 16. 明确非目标
+
+- 不公开 Auto profile。
+- 不实现远程/分布式 Worker。
+- 不实现递归动态委派；Ultra V1 动态委派关闭，深度上限 1。
+- 不实现多 Writer、并行写或 AI Merge Arbiter。
+- 不把 Milvus 或向量数据库作为 Runtime 权威状态库；如以后需要安装存储中间件，统一放入 Docker Desktop 同一 MiniCode 应用组。
+- 不让每个节点默认调用高推理 Model Verifier。
+- 不承诺外部副作用绝对 exactly-once。
+
+## 17. Definition of Done
+
+本轮只有在下列条件全部成立时才能声明 Ultra V1 完成：
+
+1. Standard/Ultra 共用统一入口、Canonical PlanGraph、Reducer、Scheduler、Result 与 CompletionGate。
+2. Standard 默认、单活跃 Worker，简单任务没有额外 LLM planner/final verifier 调用，兼容性能满足 G4。
+3. `task` 不直接启动 AgentLoop；child Node/Attempt、预算、取消和结果均由 Scheduler/Reducer 管理。
+4. Ultra 有可审计 TopologyDecision，可合法选择 deep-single。
+5. fan-out 至少两个只读 Worker真并行，工具 effect 显式，仓库零修改。
+6. Ultra 任一时刻仅一个有效 writer lease；隔离修改、base drift 与清理经过测试。
+7. lease/fencing/attempt/version stale result 全被拒绝；重复 result 幂等。
+8. 大结果完整存 Artifact，AgentResult 可恢复，Verifier 可读取，禁止静默截断。
+9. Approval/Needs Input/Amendment/Cancel/Resume 为一级状态，完整 digest 绑定且可恢复。
+10. 确定性 Verifier 优先；Final Gate 验证集成后的最终 workspace，能阻止节点均成功但集成失败的交付。
+11. Session/Checkpoint/Rewind 和旧配置兼容；所有关键决定/状态可序列化、追踪、恢复。
+12. [验收计划](./2026-09-02-multi-agent-runtime-v2-acceptance.md) 的 G0–G5 全部通过；G6 live smoke 若受环境阻塞须如实记录，不得伪造。
+
+Phase 7 多 Writer 永远不计入本轮 DoD。
+
+## 18. 本轮实施回填（2026-09-02）
+
+功能代码已落在真实产品入口，不是空协议：
+
+- 协议、状态与调度：`minicode/runtime_protocol.py`、`minicode/runtime_state.py`、`minicode/runtime_scheduler.py`、`minicode/unified_runtime.py`。
+- Worker 与委派：`minicode/worker_runtime.py`、`minicode/delegation.py`、`minicode/tools/task.py`；`task.py` 不再 import/call AgentLoop。
+- 安全与恢复：`minicode/tooling.py`、`minicode/runtime_policy.py`、`minicode/permissions.py`、`minicode/tools/run_command.py`；operation digest 进入真实工具调用上下文，allow-once 不跨操作复用，deadline/cancel 可终止子进程。
+- 隔离、结果与验收：`minicode/workspace_provider.py`、`minicode/runtime_artifacts.py`、`minicode/verifier_registry.py`；确定性命令 Verifier 在集成状态的临时副本上运行，不污染用户工作区。
+- 兼容与产品入口：`minicode/config.py`、`minicode/main.py`、`minicode/headless.py`、`minicode/tui/input_handler.py`、`minicode/web_worker.py`、`minicode/session.py`、`minicode/session_contract.py`。
+
+实际验证：Runtime V2 专项测试 `104 passed`；全仓为 `1512 passed, 2 skipped, 1 warning`，无失败。两个 skip 是未设置 `ANTHROPIC_API_KEY` 时按设计跳过的原有 Anthropic live API 用例；Windows junction/hardlink 安全场景均以真实文件系统对象通过。CI 参数的 `ruff minicode/` 通过；`mypy` 全仓保持 224 个历史基线错误，低于 CI 上限 225，新增 Runtime V2 模块单独检查为 0 个错误；`compileall` 和 `git diff --check` 通过。
+
+G4 已由 `benchmarks/runtime_v2_calibration.py` 的 20 个测量样本与 3 次 warmup 通过：Standard 成功率差 0pp、p95 +3.1578%、token +0%、model call +0；Ultra 对等可拆分负载 p95 墙钟改善 36.3853%。G6 也已在真实 DeepSeek `deepseek-v4-pro` 上通过：Standard=`standard-single`，Ultra 对不可拆分 smoke 合法选择 `deep-single`；脱敏证据位于 `benchmarks/runtime_v2_provider_smoke_standard.json` 与 `benchmarks/runtime_v2_provider_smoke_ultra.json`。
+
+验收状态为 `accepted`，G0–G5 全部通过且无一票否决项，可选 G6 同样通过。Phase 7 仍为 deferred。本轮未引入 Milvus、向量库或其他存储中间件；如后续需要，仍必须放入 Docker Desktop 同一 MiniCode 应用组，且不得成为 Runtime 权威状态库。

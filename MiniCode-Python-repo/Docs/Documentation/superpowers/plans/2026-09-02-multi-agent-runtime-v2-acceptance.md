@@ -1,588 +1,281 @@
 ---
-status: draft
+status: accepted
 date: 2026-09-02
-scope: multi-agent-runtime-v2-acceptance
+scope: unified-runtime-ultra-v1-acceptance
 companion-upgrade-plan: 2026-09-02-multi-agent-runtime-v2-upgrade.md
+implementation-status: ultra-v1-complete
 ---
 
-# MiniCode 多 Agent Runtime V2 方案验收计划
+# MiniCode 统一 Runtime 与 Ultra V1 验收计划
 
-## 1. 验收目标
+## 1. 目标与适用范围
 
-验证 V2 不仅“存在多个 Agent”，而且满足以下产品事实：
+本计划验收 [统一 Runtime 与 Ultra V1 升级方案](./2026-09-02-multi-agent-runtime-v2-upgrade.md)：Standard 与 Ultra 共用唯一 Runtime；Ultra V1 只实现“并行只读探索/审查 → 唯一 Writer → 独立只读 Verifier → 集成 Final Gate”。本轮不验收多 Writer、远程 Worker、公开 Auto 或递归动态委派。
 
-- 简单任务没有被多 Agent 编排拖慢或额外消耗模型调用；
-- 复杂任务由合法 DAG 驱动，多个 Worker 的并行、失败和重试可控；
-- 所有副作用经过权限与审批绑定；
-- 所有完成声明都有独立证据；
-- 进程中断、用户补充、replan 和旧结果迟到不会破坏状态；
-- 并行写不会覆盖用户或其他 Worker 的修改；
-- 最终交付能区分完成、部分完成、失败和未验证。
+对外只有 `standard` 与 `ultra` 两个 Profile；验收的内部 route 固定为 `standard-single`、`deep-single`和 `ultra-read-fanout`。
 
-本验收计划对应：[MiniCode 多 Agent Runtime V2 升级方案](./2026-09-02-multi-agent-runtime-v2-upgrade.md)。
+所有“通过”必须有实际命令和持久证据。Provider、OS 权限或工具缺失造成的未运行项标为 `blocked`，不得写成 passed。每个测试使用 fake adapter、fake clock、barrier/event 或临时仓库，禁止靠长 `sleep` 猜并发。
 
-## 2. 验收原则
+## 2. 编号修订说明
 
-1. 以可重放事件、Artifact、Evidence、测试输出和 DeliveryManifest 为证据，不接受口头演示作为唯一依据。
-2. 模型不能给自己判定通过；确定性检查优先于模型判断。
-3. 离线测试必须可重复，不依赖真实 provider 可用性。
-4. Live provider smoke 是独立发布证据，不能替代本地正确性门禁。
-5. 任何未授权副作用、用户改动丢失或错误 completed 都是一票否决。
-6. 失败测试必须保留真实失败，不允许使用 skip、空实现或固定成功结果绕过。
+R01–R18 保留原编号。其语义已按统一 Runtime 校正：原“多个 builder/可并行 writer/双路径 runtime”等表述不再成立；R14 明确为 Ultra V1 唯一 Writer，Multi-Writer deferred；R17 的 flag 仅用于迁移，不能形成永久双 Runtime。新增要求从 R19 连续编号至 R36。
 
-## 3. 验收对象与版本冻结
+状态词：`implemented`=代码已接入真实调用链；`passed`=对应功能与安全自动化验证实际通过；`calibration-pending`=功能已实现但尚缺可信量化基线；`environment-blocked`=代码之外的平台能力阻塞；`deferred`=明确不在本轮。本轮最终状态为 `accepted`，仅 Phase 7 非目标保持 `deferred`。
 
-每轮候选验收必须记录：
+## 3. 测试环境
 
-- Git commit、dirty worktree 状态和 Python 版本；
-- Task/Plan/Event/WorkerResult/Evidence/Approval/Delivery schema version；
-- feature flag 模式；
-- 模型与 fake provider 版本；
-- OS、文件系统和 worktree 支持状态；
-- 测试命令、开始/结束时间、退出码；
-- 验收 manifest 的 SHA-256。
+- E0：纯单元，fake clock/fake adapter，无网络。
+- E1：Runtime 集成，临时目录/临时 Git 仓库，真实线程与受控 barrier。
+- E2：MiniCode 全仓回归、compile、lint/type/static（以项目已声明工具为准）。
+- E3：真实 Provider smoke，可选 G6；不影响离线安全门禁结论，但阻塞必须记录。
 
-候选代码、测试夹具和验收阈值冻结后，不得在同一轮验收中静默修改。阈值变化必须新建验收 revision 并写明原因。
+本轮实测快照（2026-09-02, Windows, Python 3.11）：Runtime V2 专项集 `104 passed`；全仓回归为 `1512 passed, 2 skipped, 1 warning`，无失败。两个 skip 是仓库原有、仅在设置 `ANTHROPIC_API_KEY` 时运行的 Anthropic live API 用例；本轮另以已配置的 DeepSeek Provider 完成 G6。Windows junction 与 hardlink 使用真实文件系统对象覆盖，不再依赖创建 symlink 的账户权限。`ruff` 按 CI 参数检查 `minicode/` 全绿，`mypy` 全仓仍为 224 个历史基线错误（CI 上限 225），新增 Runtime V2 模块单独检查 0 个错误；`compileall` 与 `git diff --check` 通过。G4 受控基准 20 个测量样本加 3 次 warmup 通过，G6 Standard/Ultra live smoke 均通过。
 
-## 4. 测试环境分层
+## 4. Requirement → code → test → evidence 追踪矩阵
 
-### E0：纯单元环境
+以下每行都包含 Requirement ID、场景、前置条件、步骤、预期、证据、代码、自动化测试与 Gate；状态已按本轮真实代码与命令结果回填。
 
-- 不调用网络和真实模型。
-- 覆盖 schema、Reducer、Plan Validator、Scheduler 决策、权限绑定和 verifier 纯逻辑。
-- 使用确定性时钟、ID 和 in-memory/fake event store，但不得伪造被验收功能的成功结果。
+| ID / 状态 | 场景 | 前置条件 | 执行步骤 | 预期结果 | 证据 | 实现位置 | 自动化测试位置 | Gate |
+|---|---|---|---|---|---|---|---|---|
+| R01 `passed` | TaskContract 与 Amendment 版本化 | revision=1 的 Run | 序列化；提交 amendment；重载 | revision=2，同一 run，changed/affected 字段明确 | contract/amendment JSON | `minicode/runtime_protocol.py` | `tests/test_runtime_protocol.py`, `tests/test_runtime_reducer.py` | G0,G1 |
+| R02 `passed` | 唯一 Canonical PlanGraph | 一个含依赖的 contract | compiler 生成 PlanVersion；TaskGraph round-trip | 仅一份当前 Plan 状态；Run→Version→Node→Attempt 分离 | plan snapshot | `minicode/runtime_protocol.py`, `minicode/task_graph.py` | `tests/test_runtime_architecture.py`, `tests/test_runtime_reducer.py` | G0,G1 |
+| R03 `passed` | Structural PlanValidator | 循环、缺依赖、两个 writer 夹具 | 逐个验证 | 非法 DAG 和 >1 writer 被执行前拒绝；合法图不调用模型 | validation records/model call count=0 | `minicode/unified_runtime.py` | `tests/test_plan_validator_v2.py` | G1,G2 |
+| R04 `passed` | Reducer 是唯一状态写入口 | 空 RuntimeState | 发送合法/重复/越序 command/result | 只经 reducer 变更；事件幂等；越序拒绝 | event log + rejection reason | `minicode/runtime_state.py` | `tests/test_runtime_reducer.py`, `tests/test_runtime_recovery.py` | G1,G3 |
+| R05 `passed` | ContextManifest 完整且可失效 | 已 hash 的文件/依赖/artifact | 构建 manifest；改变 revision；提交旧 result | 字段齐全；旧 context result 不进入当前 Plan | manifest JSON + rejection | `minicode/worker_runtime.py`, `minicode/runtime_state.py` | `tests/test_context_manifest.py`, `tests/test_runtime_recovery.py` | G1,G2 |
+| R06 `passed` | 中央 Policy/Approval | Worker 请求受控工具 | 创建 request/grant；由 PermissionManager adapter 执行 | 所有 Worker 使用相同规则；denied/expired 是结构化 result | approval event log + operation digest | `minicode/runtime_policy.py`, `minicode/permissions.py`, `minicode/tooling.py` | `tests/test_runtime_approval.py`, `tests/test_runtime_recovery.py` | G1,G3 |
+| R07 `passed` | Structured AgentResult 四类终态 | fake workers success/fail/wait/cancel | 运行并 round-trip | 结果含 run/version/node/attempt/base/usage/warnings/failure | result JSON | `minicode/runtime_protocol.py`, `minicode/worker_runtime.py` | `tests/test_runtime_protocol.py`, `tests/test_runtime_recovery.py`, `tests/test_runtime_replay.py` | G0,G1 |
+| R08 `passed` | Evidence/Artifact 完整性 | 小/大输出、源码位置、路径别名 | put/get/restart/hash tamper；替换为 hardlink | hash/size/producer/base 可追踪；篡改、越界及别名读取拒绝 | artifact files + metadata | `minicode/runtime_artifacts.py`, `minicode/path_safety.py` | `tests/test_runtime_artifacts.py`, `tests/test_large_agent_result.py` | G1,G3 |
+| R09 `passed` | Node 与 Final verification 分离 | 节点均成功但集成 invariant 失败 | node verify；final verify | node record 保留，Final Gate 拒绝 completed | verification/gate records | `minicode/verifier_registry.py`, `minicode/unified_runtime.py` | `tests/test_completion_gate.py`, `tests/test_standard_runtime.py` | G2,G3 |
+| R10 `passed` | 唯一 Scheduler 驱动 DAG | 有依赖/无依赖节点 | submit/claim/complete/cancel | 依赖顺序正确；创建/claim/retry 只在 Scheduler | attempt/event trace | `minicode/runtime_scheduler.py` | `tests/test_runtime_scheduler.py`, `tests/test_runtime_recovery.py` | G1,G2 |
+| R11 `passed` | 真实只读并行 | 两个 read-only 节点、barrier | 同时启动；释放 barrier | 重叠运行；并发不超上限；workspace hash 零变化 | timestamps/barrier/hash diff | `minicode/runtime_scheduler.py`, `minicode/tooling.py` | `tests/test_ultra_read_fanout.py`, `tests/test_runtime_scheduler.py` | G2,G3 |
+| R12 `passed` | Retry 与 replan 分离 | retry_budget=1；amendment | 首 attempt retryable；再试；amend | retry 新 Attempt 不新 Node；amend 新 PlanVersion | version/attempt trace | `minicode/runtime_state.py`, `minicode/runtime_scheduler.py` | `tests/test_runtime_recovery.py`, `tests/test_runtime_reducer.py` | G1,G3 |
+| R13 `passed` | 全局预算、深度与取消 | 小 agents/token/cost/deadline/depth | 请求超限、运行中 cancel | 停止扩张；状态结构化；所有 child 最终取消 | budget ledger/resource census | `minicode/runtime_scheduler.py` | `tests/test_runtime_budget_cancel.py`, `tests/test_task_delegation_gateway.py`, `tests/test_runtime_command_cancel.py` | G2,G3 |
+| R14 `passed` | 唯一 Writer 隔离 | 两 writer claim + temp workspace | 并发 claim；写变更；集成 | 仅一 write lease；第二个被结构验证拒绝；无多 writer | lease log + patch/integration record | `minicode/workspace_provider.py`, `minicode/runtime_scheduler.py` | `tests/test_plan_validator_v2.py`, `tests/test_workspace_provider.py`, `tests/test_ultra_read_fanout.py` | G3 |
+| R15 `passed` | 崩溃恢复与 cancel cleanup | 持久 state、fake clock、路径别名 | 在指定故障点重启/取消；注入 hardlink/junction | claim 可回收；无 worker/process/lease/temp workspace 遗留；持久状态不跟随别名 | recovery log + resource census | `minicode/runtime_state.py`, `minicode/runtime_scheduler.py`, `minicode/tools/run_command.py`, `minicode/path_safety.py` | `tests/test_runtime_recovery.py`, `tests/test_runtime_command_cancel.py`, `tests/test_workspace_provider.py`, `tests/test_runtime_artifacts.py`, `tests/test_session.py` | G3,G5 |
+| R16 `passed` | Delivery/CompletionGate | 最新 contract、集成 workspace | 用缺证据/审批/冲突/运行 worker 场景 final | 仅全部强制条件满足才 deliver | DeliveryManifest + gate reasons | `minicode/verifier_registry.py`, `minicode/unified_runtime.py` | `tests/test_completion_gate.py`, `tests/test_standard_runtime.py` | G2,G3 |
+| R17 `passed` | Standard 兼容与临时 flag | 旧配置/session、flag on/off | 同一 golden task 两路径；恢复 | 默认 Standard；行为兼容；flag 是可移除迁移手段 | golden diff + model-call trace | `minicode/config.py`, `minicode/unified_runtime.py`, product entries | `tests/test_standard_runtime.py`, existing CLI/headless regression tests | G2,G4,G5 |
+| R18 `passed` | 审计、Session 与可观察性 | 运行 Standard/Ultra | 保存/重启/读 trace | route、command/event、attempt、usage、verification 可序列化且不写入 Runtime credential config | session extension + trace | `minicode/session.py`, `minicode/session_contract.py`, `minicode/runtime_state.py` | `tests/test_runtime_session.py`, `tests/test_runtime_recovery.py` | G1,G5 |
+| R19 `passed` | 两个公开 Profile、三个内部 route | 无 profile/standard/ultra config | resolve profiles | 缺省 standard；仅公开 standard/ultra；route 为规定三值 | profile snapshots | `minicode/runtime_protocol.py`, `minicode/unified_runtime.py`, `minicode/config.py` | `tests/test_topology_resolver.py`, `tests/test_standard_runtime.py`, existing config tests | G0,G1 |
+| R20 `passed` | Ultra TopologyDecision | 可拆分/强耦合/冲突/预算不足/异常 hint 表 | resolve 每一行 | fan-out 或 deep-single 符合八条件，含 reasons/rejected；false/NaN/负值 fail closed | decision JSON | `minicode/unified_runtime.py` | `tests/test_topology_resolver.py` | G1,G2 |
+| R21 `passed` | task 不能绕过 Scheduler | Runtime context + task tool | 调 task；检查 import/calls/trace | DelegationRequest 注册 Node/Attempt；无直接 AgentLoop；Standard 串行；Ultra 动态拒绝 | scheduler/delegation trace + static grep | `minicode/tools/task.py`, `minicode/delegation.py`, `minicode/runtime_scheduler.py` | `tests/test_task_delegation_gateway.py` | G0,G2,G3 |
+| R22 `passed` | lease/fencing 安全 | fake clock 与两 token | 过期、旧 token、重复完成 | 100% stale 拒绝；同节点同时仅一个有效 Attempt | rejection events | `minicode/runtime_state.py`, `minicode/runtime_scheduler.py` | `tests/test_runtime_reducer.py`, `tests/test_runtime_recovery.py` | G1,G3 |
+| R23 `passed` | 显式 ToolEffect | 所有 default tools 注册 | 审计 metadata；给 explorer 写调用 | 每个工具 effect/replay 明确；explorer registry 仅 read_only；写尝试 PolicyDenied | registry audit + result | `minicode/tooling.py`, `minicode/tools/__init__.py` | `tests/test_tool_effects.py` | G0,G3 |
+| R24 `passed` | 取消旧 8,000 静默截断 | 输出 >8,000 chars | task/worker 完成；读取 ref | 完整字节可取、hash/size 正确、摘要明确说明 artifact | byte-for-byte comparison | `minicode/tools/task.py`, `minicode/runtime_artifacts.py`, `minicode/worker_runtime.py` | `tests/test_large_agent_result.py` | G1,G3 |
+| R25 `passed` | Approval 完整 digest 绑定 | grant 对应固定 args/cwd/base | 改任一字段并复用 | 每种修改均拒绝；single-use/expiry 生效；PermissionManager allow-once 不跨操作复用 | digest matrix/event | `minicode/runtime_policy.py`, `minicode/tooling.py`, `minicode/permissions.py` | `tests/test_runtime_approval.py` | G3 |
+| R26 `passed` | WAITING_INPUT 从原 Run 恢复 | node waiting_input | 提交 TaskAmendment；局部 replan | 同 run，新 contract/plan；只 supersede 受影响节点 | before/after graph | `minicode/runtime_state.py`, `minicode/unified_runtime.py` | `tests/test_runtime_reducer.py`, `tests/test_runtime_recovery.py` | G1,G3 |
+| R27 `passed` | superseded/current-attempt 隔离 | plan v1 running，v2 current | v1 迟到提交；v2 提交 | v1 不污染；v2 唯一有效；duplicate no-op | reducer audit | `minicode/runtime_state.py` | `tests/test_runtime_reducer.py`, `tests/test_runtime_recovery.py` | G1,G3 |
+| R28 `passed` | Writer lease 与 fencing | writer attempt 过期并重领 | 旧/新 writer 各提交 | 旧 writer 100% 拒绝；新 writer 可集成 | lease/integration trace | `minicode/runtime_scheduler.py`, `minicode/workspace_provider.py` | `tests/test_runtime_reducer.py`, `tests/test_runtime_recovery.py`, `tests/test_workspace_provider.py` | G3 |
+| R29 `passed` | Verifier 确定性优先 | registry 含 deterministic/model | 执行可由 tests 判定的任务 | 顺序固定；确定性足够时 model call=0；crash 不误成功 | invocation order/count | `minicode/verifier_registry.py`, `minicode/unified_runtime.py` | `tests/test_verifier_registry.py`, `tests/test_completion_gate.py`, `tests/test_standard_runtime.py` | G1,G2 |
+| R30 `passed` | Standard 快路径成本/性能 | deterministic golden set + legacy path | 20 次测量、3 次 warmup，比较 calls/token/p95/success | success +0pp；p95 +3.1578%；token +0%；model calls +0，均在门限内 | `benchmarks/runtime_v2_calibration_results.json` | `minicode/unified_runtime.py`, `benchmarks/runtime_v2_calibration.py` | `tests/test_standard_runtime.py`, `tests/test_runtime_v2_calibration.py` | G4 |
+| R31 `passed` | Ultra 收益门禁 | 五个可拆分等价逻辑单元 | serial Standard vs read-fanout 各 20 次测量 | success +0pp；Ultra p95 墙钟降低 36.3853%，超过 25% 门限 | `benchmarks/runtime_v2_calibration_results.json` | `minicode/unified_runtime.py`, `benchmarks/runtime_v2_calibration.py` | `tests/test_ultra_read_fanout.py`, `tests/test_runtime_v2_calibration.py` | G4 |
+| R32 `passed` | replay policy/副作用安全 | 四 replay policy fake tools | 制造成功后持久化前崩溃/unknown result | safe/idempotent 按约束；id key 复用；unknown non-idempotent 自动 retry=0 | tool invocation ledger | `minicode/tooling.py`, `minicode/runtime_scheduler.py`, `minicode/worker_runtime.py` | `tests/test_runtime_replay.py`, `tests/test_runtime_recovery.py`, `tests/test_runtime_approval.py` | G3 |
+| R33 `passed` | Session/Checkpoint/Rewind 不回归 | 旧 bundle 与 checkpoints | load/save/rewind；加入 runtime extension | 旧数据可读；新 extension 可选；文件恢复语义不变 | compatibility fixtures | `minicode/session.py`, `minicode/session_contract.py` | `tests/test_runtime_session.py`, existing session/checkpoint/rewind tests | G5 |
+| R34 `passed` | workspace base drift/cleanup | temp repo + user concurrent edit + alias | writer 修改；源变化；apply/cancel/crash；第二文件 commit 故障 | 停止冲突 apply；原子回滚已应用文件；不覆盖无关修改；拒绝 junction/hardlink；所有路径清理 | file hashes + temp-dir census | `minicode/workspace_provider.py`, `minicode/path_safety.py` | `tests/test_workspace_provider.py`, `tests/test_ultra_read_fanout.py` | G3 |
+| R35 `passed` | CLI/TUI/config 入口 | 旧/new settings | parse no profile、standard、ultra、auto | 默认 standard；standard/ultra 可见；auto/multi-writer 不公开；progress 展示 selected route/reason | CLI/progress/config assertions | `minicode/config.py`, `minicode/main.py`, `minicode/headless.py`, `minicode/tui/input_handler.py`, `minicode/web_worker.py` | `tests/test_topology_resolver.py`, `tests/test_standard_runtime.py`, existing CLI/TUI/Web tests | G2,G5 |
+| R36 `passed` | 执行权威与非目标边界 | 全仓源码 | 静态搜索 + runtime probes | AgentLoop/TurnKernel/ToolScheduler/Pipeline/Supervisor 无全局调度越权；无 remote/multiwriter/Milvus authority | architecture audit | listed production modules | `tests/test_runtime_architecture.py`, `tests/test_plan_validator_v2.py` | G0,G5 |
 
-### E1：Fake Provider 集成环境
+## 5. 关键端到端场景
 
-- 使用可脚本化 ModelAdapter，返回预定义 tool calls、plan、错误、空响应和迟到结果。
-- 使用真实 Agent Loop、ToolRegistry、TaskRuntime 和 event persistence。
-- 用于验证端到端状态转换，不评价模型智能。
+### A. Standard 快路径
 
-### E2：本地仓库夹具环境
+运行一个简单读取问答和一个简单改名任务。断言默认 profile 为 Standard、`max_active_workers=1`、确定性单节点 Plan、模型适配器调用次数与旧 AgentLoop 相同、planner/final-model verifier 调用为零。调用 `task` 时必须看到 DelegationRequest、Node、Attempt 与 Reducer event，并证明父子串行。复跑现有 PermissionManager、Session、Checkpoint、Rewind 与 TurnKernel evidence guard 测试。
 
-- 使用临时 Git 仓库和真实 worktree。
-- 使用真实文件、patch、命令、测试和 PermissionManager。
-- 覆盖写隔离、合并、冲突、清理、checkpoint 和恢复。
+### B. Ultra 路由
 
-### E3：真实 Provider Smoke
+表驱动输入至少含：两个独立只读调查方向、强耦合根因调试、高写冲突、预算不足。第一项选择 `ultra-read-fanout`，其余选择 `deep-single`；所有 decision 都包含输入指标、reasons、rejected routes。Ultra 选择 deep-single 不失败，也不伪造多个 Worker。
 
-- 显式 opt-in；默认 CI 不执行。
-- 只跑低成本、无破坏性、固定验收标准的场景。
-- Provider 不可用标记为 provider risk，不能把本地逻辑错误伪装成 provider 问题。
+### C. 调度一致性
 
-## 5. 需求追踪矩阵
+用 fake clock 令 claim 过期，再发旧 fencing result；用 barrier 制造重复 result、同节点竞争 claim、Plan v1 迟到与 claim 后崩溃。有效提交数必须始终为 1，stale/superseded 结果拒绝率必须为 100%，重启后能回收 claim。
 
-| ID | 需求 | 最低场景 | 必要证据 | 发布门禁 |
-| --- | --- | --- | --- | --- |
-| R01 | 统一 TaskContract/Amendment | 新任务、补充信息、revision 递增 | contract JSON + event log | M1 |
-| R02 | 统一 Plan schema | fast/single/multi 三种 plan | plan artifact + schema validation | M1 |
-| R03 | Plan Validator 强制执行 | 环、悬空依赖、缺验证、写冲突 | validator report | M1 |
-| R04 | Reducer 确定性和幂等 | 重放、重复事件、乱序迟到结果 | projection hashes | M1 |
-| R05 | 最小 Context | 子 Worker 只收到必要上下文 | invocation/context manifest | M2 |
-| R06 | Policy/Approval 精确绑定 | 参数、路径、revision、TTL 改变 | policy decision log | M2 |
-| R07 | WorkerResult 结构化 | success/blocked/failed/cancelled | WorkerResult artifact | M2 |
-| R08 | Claim/Evidence 完整性 | 无 evidence claim 被拒绝 | verification report | M2 |
-| R09 | Node/Final 双层验证 | 节点通过但目标未覆盖 | node + final reports | M2 |
-| R10 | DAG Scheduler | 依赖、ready、priority、lease | scheduler event trace | M3 |
-| R11 | 只读多 Worker 并行 | 两个独立 explore/research 节点 | overlapping timestamps | M3 |
-| R12 | 有界 retry/replan | transient、semantic failure、replan | attempts + plan revisions | M3 |
-| R13 | 全局预算与递归限制 | token/cost/step/time/depth 超限 | budget stop event | M3 |
-| R14 | 写隔离与合并 | 双 worktree、无冲突、冲突 | patch/merge reports | M4 |
-| R15 | Crash recovery/cancel | 调度、执行、验证时中断 | replay + cleanup report | M4 |
-| R16 | DeliveryManifest/partial | 完成、部分完成、失败 | delivery manifest | M5 |
-| R17 | V1 兼容与回滚 | flag off、shadow、fallback | differential report | M5 |
-| R18 | 可观察性 | session inspect/replay/TUI | UI snapshot + serialized state | M5 |
+### D. 只读隔离与唯一 Writer
 
-## 6. 功能验收场景
+对两个 Explorer 使用只读 registry 和受控 barrier，运行前后递归 hash 工作区，差异为 0。尝试调用 write tool 应得到 `PolicyDenied`。随后两个 Writer 竞争 write lease，仅一个成功；Writer 在隔离 workspace 产出 changed_resources，再基于 hash 安全集成。Verifier 的工作区前后 hash 也为 0。
 
-### A. Conversation、Contract 与 Router
+### E. Result、Artifact 与 Evidence
 
-#### A01 Answer-only 不启动 Task Runtime
+生成超过 8,000 字符且包含尾部哨兵的输出；重启 store 后通过 ArtifactRef 逐字节取回，尾部哨兵、hash、size 均正确。篡改内容时读取失败。Evidence 可定位源码范围、producer node 与 base revision，Verifier 使用完整 artifact 而非摘要。
 
-输入一个无需工具的稳定知识问题。
+### F. Approval、Input 与恢复
 
-期望：
+对 approval 的 arguments、cwd、environment scope、base revision、operation digest 逐项变更，旧 grant 均失效；过期与拒绝均由 Reducer 处理，不进入 Verifier。进程在 WAITING_APPROVAL/WAITING_INPUT 重启后恢复；TaskAmendment 只使依赖变更字段的节点 superseded。
 
-- Router 输出 `answer_only`；
-- 不创建 Plan、Worker lease、Approval 或 Artifact Workspace；
-- 不产生额外 Planner 模型调用；
-- 回复仍进入普通会话记录。
+### G. 取消、预算与副作用
 
-#### A02 信息不足进入可恢复 Needs Input
+在 Explorer、Writer、Verifier、审批等待各阶段取消，最终资源清单必须没有 child worker、process、lease、临时 workspace。分别触发 max_agents/tokens/cost/deadline/retry/depth；Runtime 停止扩张或受控失败。结果不明确的 `never_auto_retry` 工具调用次数必须为 1，`idempotent_with_key` 重试复用同一 key。
 
-输入一个缺少必要目标路径的写任务。
+### H. Verification
 
-期望：
+构造节点 acceptance 分别通过、集成测试失败的仓库；Final Gate 必须拒绝完成。Registry 记录确定性 verifier 的顺序；只有确定性工具不足且预算允许时才调用 model verifier。Standard light 与 Ultra strict 共用接口；严格模式缺 Evidence/Artifact、存在冲突或活跃 Worker 时一律失败。
 
-- TaskContract 为 `needs_input`；
-- 没有写 invocation；
-- 用户补充后产生 TaskAmendment 和新 revision；
-- runtime 从原 task 恢复，不创建无关联新任务。
+## 6. 故障注入矩阵
 
-#### A03 路由拓扑正确
+| 故障点 | 注入方式 | 必须观察到的安全结果 | 对应需求 |
+|---|---|---|---|
+| claim 后、Worker 启动前崩溃 | hook 抛异常 + fake clock 过 lease | claim 回收，新 fencing；旧 result 拒绝 | R15,R22 |
+| 工具成功后、Result 持久化前崩溃 | commit hook 中断 | replay policy 生效；非幂等 unknown 不重试 | R15,R32 |
+| Event/State 写入中断 | atomic writer failpoint | 旧 snapshot+完整 event 恢复或事务拒绝，无半状态 | R04,R15,R18 |
+| lease 过期 Worker 继续提交 | advance fake clock | 100% rejected | R22,R28 |
+| Worker 中 TaskContract 被修改 | barrier 后 amendment | 旧 context/plan result superseded | R05,R26,R27 |
+| 审批等待中重启 | persist/recreate coordinator | 仍 WAITING_APPROVAL；grant 校验后恢复 | R06,R25 |
+| Provider 429/timeout/invalid | fake adapter scripted errors | bounded retry，预算扣减，terminal reason 结构化 | R12,R13 |
+| Writer 中途取消 | writer hook/barrier | 无集成半成品，write lease/temp 清理 | R14,R34 |
+| Verifier 自身崩溃 | verifier raises | VerificationFailed；不得 completed | R09,R29 |
+| Artifact 内容成功、元数据失败 | metadata failpoint | 可恢复孤儿或安全重写；不返回无效 ref | R08,R15 |
+| patch/worktree apply 冲突 | 改源 base hash | 停止 apply；保留用户修改；Final Gate fail | R14,R34 |
 
-覆盖 answer-only、确定性工具、单 Agent、多 Agent 和高风险任务。
+## 7. Gate G0–G6
 
-期望：路由理由包含风险、依赖、未知量、副作用和可并行性；模型档位选择与执行拓扑选择可独立审计。
+### G0：静态、schema 与文档门禁
 
-### B. Plan 与 Validator
+本轮结果：`passed`。
 
-#### B01 三类 Builder 输出同一 schema
+- 所有协议可序列化且 version 明确；Enum/state 无非法重复。
+- 两份文档链接有效、代码块闭合、Mermaid 基本可解析、R01–R36 连续唯一、Gate 映射完整。
+- 静态审计证明 `tools/task.py` 不 import/call AgentLoop；产品只有一个 Worker Scheduler/Reducer/Canonical PlanGraph 权威。
+- 所有 default tools 有显式 effect/replay；无公开 Auto/multi-writer/remote route。
 
-Fast、Single 和 Model Planner 对等地产生合法 PlanArtifact，并通过同一 schema loader。
+### G1：单元与状态机门禁
 
-#### B02 非法 DAG 被拒绝
+本轮结果：`passed`。
 
-至少覆盖：循环依赖、未知依赖、重复 node ID、缺 input ref、required node 无 verification spec。
+- protocol、Reducer、PlanValidator、lease/fencing、approval digest、artifact、context、verifier registry 测试全通过。
+- 过期 lease/fencing 与 superseded result 拒绝率 100%；重复 Result 有效提交次数恰为 1。
+- fake clock 驱动时间测试，不因墙钟 sleep 产生偶发结果。
 
-#### B03 写冲突在调度前暴露
+### G2：统一 Runtime 离线集成门禁
 
-两个节点声明相同 write scope 且没有隔离策略。
+本轮结果：`passed`。
 
-期望：Validator 拒绝，或正规化为明确串行依赖；不得把冲突留给运行时随机发生。
+- Standard、deep-single、read-fanout 均经过同一 Runtime/Scheduler/Reducer/CompletionGate。
+- Standard task 受 Scheduler 治理且串行；Ultra 动态委派关闭。
+- 至少两个 read-only Worker 由 barrier 证明真并行；依赖节点不提前执行；并发不超 profile。
+- node success + integration failure 时 Final Gate 拒绝完成。
 
-#### B04 修复最多一次
+### G3：安全、隔离与故障门禁
 
-Model Plan 第一次缺字段，修复后仍非法。
+本轮结果：`passed`。
 
-期望：只有一次语义修复调用；之后进入 `needs_input` 或 `failed`，事件中保留两版 Plan 和错误。
+- Explorer/Reviewer/Verifier 对工作区修改数为 0。
+- 任一时刻只有一个有效 write lease；stale writer 100% rejected。
+- 取消后 worker/process/lease/temp workspace 遗留数为 0。
+- 修改后的操作复用旧 approval 成功数为 0。
+- 结果不明确的非幂等外部调用自动重试次数为 0。
+- base drift、apply conflict、Artifact 元数据失败、Verifier crash 均 fail closed。
 
-#### B05 目标覆盖
+### G4：性能、兼容率与收益门禁
 
-Plan 的所有节点均可执行，但没有节点产出某个 required output。
+本轮结果：`passed`。命令 `python benchmarks/runtime_v2_calibration.py --samples 20 --warmups 3 --standard-worker-ms 1000 --ultra-unit-ms 1200 --fail-on-regression` 退出 0；完整证据见 `benchmarks/runtime_v2_calibration_results.json` 与 `.md`。这是无网络、同一 deterministic Worker 的 Runtime 开销/并发校准，不外推为 Provider 模型质量结论。
 
-期望：Plan Validator 或 Final Verifier 拒绝 completed。
+- Standard：legacy/unified 成功率均 100%；p95 从 1000.8427ms 到 1032.4471ms（+3.1578%）；平均 token 均 128（+0%）；平均 model call 均 1（+0）。
+- Ultra：等价串行 p95 6034.6978ms，read-fanout p95 3838.9541ms，墙钟改善 36.3853%；两者成功率均 100%、平均 token 均 500。
+- 基准刻意使用 1.2s 的独立逻辑单元来验证“收益高于协调成本”的适用区间；微任务仍应由 TopologyDecision 选择 `deep-single`，不能从本结果推导所有 Ultra 请求都应 fan-out。
 
-### C. Reducer、事件和恢复
+### G5：全仓、兼容、恢复与产品入口门禁
 
-#### C01 幂等重放
+本轮结果：`passed`，无环境阻塞。`python -m pytest -q --tb=short` 为 `1512 passed, 2 skipped, 1 warning`；两个 skip 是未设置 `ANTHROPIC_API_KEY` 时按设计跳过的原有 Anthropic live API 用例。Windows 路径安全测试改用无需管理员权限的真实 junction/hardlink，产品断言全部通过。
 
-同一 event log 重放两次，并重复插入部分 event。
+- 全仓 unit/integration、compile/import、项目已配置 lint/type/static 检查通过，或每个环境阻塞有准确记录。
+- 旧 config/session/checkpoint/rewind fixture 通过；默认 profile=standard。
+- CLI/TUI/Web/Headless 产品入口走统一 Runtime；展示 selected route，Ultra deep-single 展示原因。
+- Web 输入框右下角只公开 Standard/Ultra；选择值随单次运行请求传入并写入 RunRecord，运行中锁定。`deep-single` 继续作为 Ultra 的内部 route，不作为第三个公开模式。
+- 故障重启后 state/event/approval/artifact 可恢复且敏感字段已脱敏。
 
-期望：projection 内容和哈希一致，计数不重复。
+### G6：可选 Live Provider Smoke
 
-#### C02 旧 revision 迟到结果
+本轮结果：`passed`。真实 DeepSeek `deepseek-v4-pro` Provider 上，Standard 返回 `OK`、route=`standard-single`、延迟 7386.41ms；Ultra 返回 `OK`、route=`deep-single`、延迟 39592.50ms。两次 readiness/trace 均可用，证据已脱敏保存为 `benchmarks/runtime_v2_provider_smoke_standard.json` 与 `benchmarks/runtime_v2_provider_smoke_ultra.json`。Ultra 在该不可拆分 smoke 上选择 deep-single 正是预期行为。
 
-Replan 后让旧 WorkerResult 到达。
+在明确配置的真实 Provider 上各运行一个 Standard 和 Ultra smoke，记录模型、时间、退出状态和脱敏 trace。429、网络、凭据或本机服务不可用属于环境阻塞，不覆盖 G0–G5，也不能声称通过。
 
-期望：结果被归档为 stale，不改变当前 node、budget 和最终状态。
+## 8. 一票否决条件
 
-#### C03 Amendment 最小失效
+任一项出现，本轮不得标记 Ultra V1 完成：
 
-只修改一个下游 required output。
+1. Standard 绕过统一 Scheduler/Reducer，或存在第二套可推进 Plan 状态。
+2. `task` 直接创建未登记 AgentLoop/Worker。
+3. 简单 Standard 增加 LLM planner 或 final model verifier 调用。
+4. Explorer/Reviewer/Verifier 能修改工作区，或两个 Writer 同时持有效 lease。
+5. stale lease/fencing/superseded/duplicate Result 被当前 Plan 接受。
+6. 大输出静默截断，或 Verifier 只能读取摘要。
+7. 参数/cwd/base 变化仍可复用旧 approval。
+8. 取消后遗留 Worker、子进程、lease 或 temp workspace。
+9. unknown 非幂等副作用被自动重试。
+10. Final Gate 不检查集成 workspace，或节点 success 自动等价任务 completed。
+11. 文档/报告宣称未执行的测试或未实现的 Multi-Writer 已完成。
 
-期望：仅失效依赖该输入的节点；无关且证据版本一致的 verified node 保留。
+## 9. 证据目录与命名
 
-#### C04 崩溃点恢复
-
-分别在 scheduled、running、waiting_approval、verifying 状态终止进程。
-
-期望：重启后恢复一致 projection；lease 按策略恢复或过期；不会重复产生不可幂等副作用。
-
-### D. Invocation、Context 和权限
-
-#### D01 Context 最小化
-
-父任务包含两个不相关子域，只把其中一个分给 Worker。
-
-期望：ContextManifest 不含另一个子域的私有消息、无关 Artifact 或无关 secret。
-
-#### D02 Explore/Plan 只读强制
-
-让只读 Worker 请求写文件、危险命令和嵌套 general Agent。
-
-期望：能力层或 Policy 层拒绝；工作区无变化。
-
-#### D03 Approval 参数绑定
-
-批准 `command=A, path=X, revision=1` 后，把 invocation 改成 command B、path Y 或 revision 2。
-
-期望：旧 Grant 全部失效，必须重新审批。
-
-#### D04 Approval 过期、拒绝与单次使用
-
-使用确定性时钟覆盖 TTL 到期、用户拒绝和一次性 Grant 重放。
-
-期望：均不能执行；Reducer 记录明确原因。
-
-#### D05 委派预算不扩大
-
-父任务只剩 1000 token 或一层 delegation depth，子 Agent 尝试再派生。
-
-期望：子预算不超过父剩余预算；深度超限被拒绝。
-
-### E. Worker、Evidence 与 Verifier
-
-#### E01 WorkerResult 四种终态
-
-分别产生 succeeded、blocked、failed、cancelled，确认字段完整并能被 Reducer 消费。
-
-#### E02 无 Evidence 的 Claim 不通过
-
-WorkerResult 声称“测试已通过”但没有命令回执或测试 Artifact。
-
-期望：Node Verifier `fail` 或 `inconclusive`，绝不能 `pass`。
-
-#### E03 Evidence 完整性
-
-在验证前篡改文件、命令输出 Artifact 或 Evidence 哈希。
-
-期望：完整性检查失败，旧 evidence 不能证明新 revision。
-
-#### E04 Verifier 类型路由
-
-分别交付代码、Web 页面、文档和研究 Claim。
-
-期望：选择对应 verifier；Browser Verifier 不被用于非 Web Artifact。
-
-#### E05 Node 通过但 Final 失败
-
-所有节点局部断言通过，但任务 required output 少一项。
-
-期望：Final Task Verifier 阻止 completed，并给出 missing coverage。
-
-#### E06 有界重试和 replan
-
-覆盖一次 transient tool error、持续 transient error、语义错误和用户约束改变。
-
-期望：只在策略允许时重试；超过预算停止；语义错误进入 Replan Gate；约束变化等待 Amendment。
-
-### F. Scheduler 与多 Worker
-
-#### F01 DAG 依赖顺序
-
-构造 `A,B -> C -> D`。
-
-期望：A/B 可同时 ready，C 只能在 A/B verified 后 ready，D 只能在 C verified 后 ready。
-
-#### F02 真实只读并行
-
-两个 Worker 使用可控阻塞夹具各运行固定时长。
-
-期望：执行时间区间重叠；总耗时达到性能阈值；事件因果关系仍正确。
-
-#### F03 Lease 防重复
-
-两个 Scheduler 实例竞争同一 ready node。
-
-期望：只有一个获得有效 lease；另一个不执行。
-
-#### F04 取消传播
-
-父任务运行两个子 Worker 时取消任务。
-
-期望：未开始节点不再调度，运行节点收到取消，最终状态不是 completed，资源被清理。
-
-#### F05 Worker 失败不污染兄弟结果
-
-一个只读 Worker 失败，另一个成功。
-
-期望：成功 evidence 保留；是否重试/继续由 node required 和 plan policy 决定。
-
-### G. 写隔离与合并
-
-#### G01 独立 worktree
-
-两个写 Worker 从同一基线修改不同文件。
-
-期望：cwd、branch/worktree 和 patch 独立；主 checkout 在 merge 前不变化。
-
-#### G02 无冲突合并
-
-两个 patch 修改不同资源。
-
-期望：merge arbiter 按确定顺序应用，随后重新验证受影响节点。
-
-#### G03 冲突停止
-
-两个 patch 修改同一行或违反同一资源 ownership。
-
-期望：进入 conflict/needs_input 或 replan；不自动选择任一版本，不丢用户改动。
-
-#### G04 基线漂移
-
-Worker 运行期间主工作区目标文件发生用户修改。
-
-期望：base revision 检查失败；旧 patch 不直接应用。
-
-#### G05 全路径清理
-
-覆盖成功、失败、取消、超时和进程崩溃。
-
-期望：无 orphan lease、进程、临时 worktree 或未登记 patch。
-
-### H. 交付与兼容
-
-#### H01 Completed Manifest
-
-期望：所有 required criteria 为 pass；Manifest 引用 Artifact 和 Evidence，并记录 plan revision、成本和风险。
-
-#### H02 Partial Delivery
-
-一个可独立交付部分通过，另一个因外部条件阻塞。
-
-期望：状态为 partial；清楚列出已验证成果、未完成项、阻塞和下一步，不伪装 completed。
-
-#### H03 V1 flag off
-
-期望：V1 characterization suite 无回归；不创建 V2 副作用。
-
-#### H04 Shadow 模式
-
-期望：V2 Plan/Validator 只产出审计 Artifact，不执行 Worker、不请求审批、不修改文件。
-
-#### H05 兼容 session
-
-加载旧 session 和旧 task Tool 文本结果。
-
-期望：可以只读重放；必要时生成显式 legacy adapter 记录，不篡改原始历史。
-
-## 7. 安全与故障注入矩阵
-
-| 故障 | 注入位置 | 期望系统行为 |
-| --- | --- | --- |
-| Planner 返回畸形 JSON | Plan Builder | Validator 拒绝；最多一次修复 |
-| DAG 有环 | Plan Validator | 不进入 Runtime |
-| Scheduler 重复投递 | lease acquisition | 只执行一次 |
-| Worker 超时 | Worker Runtime | cancel/timeout event；按策略重试 |
-| Tool 返回成功但无 receipt | Evidence Store | verifier 拒绝 |
-| Evidence 被篡改 | Node Verifier | integrity failure |
-| Approval 过期 | Policy Engine | 不执行；回到 Reducer |
-| 参数在审批后变化 | Tool Runner 前 | grant mismatch；拒绝 |
-| event store 写入中断 | Task Runtime | 原子追加或可检测损坏 |
-| 旧 Worker 迟到 | Reducer | stale result 归档 |
-| 用户在合并前改文件 | Merge Arbiter | base mismatch；停止合并 |
-| Worker 进程崩溃 | Scheduler | lease expiry/recovery；资源清理 |
-| Provider 429/5xx | Agent Worker | 有界 fallback/retry；保留真实错误 |
-| 全局预算耗尽 | 任意 invocation | 停止派生和重试；partial/failed |
-| 递归 task 调用 | Worker capability | depth/capability 拒绝 |
-| 用户取消 | Task Runtime | 向后代传播并停止新调度 |
-
-## 8. 非功能指标与阈值
-
-所有耗时阈值使用确定性本地夹具测量，排除真实 provider 网络时间。
-
-| 指标 | 阈值 |
-| --- | --- |
-| Reducer 重放确定性 | 同一 log 100% 得到相同 projection hash |
-| Event 幂等 | 重复应用不改变最终 projection |
-| Fast path 额外模型调用 | 0 次 Planner 调用 |
-| Fast path 编排开销 | p95 不高于 50 ms（不含模型/工具） |
-| Scheduler ready-to-start 开销 | p95 不高于 100 ms（本地空闲 slot） |
-| 三个等时只读 Worker 并行效率 | 总墙钟时间不高于串行基线的 70% |
-| 未授权副作用 | 0 |
-| 重复不可幂等执行 | 0 |
-| Claim 无 Evidence 却通过 | 0 |
-| Required node 未验证却 completed | 0 |
-| 写冲突静默覆盖 | 0 |
-| Crash/restart 恢复成功率 | 规定注入点 100% 恢复为合法状态 |
-| Orphan lease/process/worktree | 0 |
-| 全局预算超支 | 0；允许计量误差必须预先定义且不超过 1% |
-| V1 flag-off 行为回归 | characterization suite 100% 通过 |
-
-若真实 CI 环境噪声使耗时阈值不稳定，必须先保留确定性 fake-delay benchmark 作为硬门禁；真实耗时只做趋势报告，不能随意放宽正确性阈值。
-
-## 9. 建议测试文件
-
-| 测试文件 | 覆盖范围 |
-| --- | --- |
-| `tests/test_task_contract.py` | Contract、Amendment、revision |
-| `tests/test_plan_model.py` | Plan schema 和序列化 |
-| `tests/test_plan_validator.py` | DAG、引用、冲突、覆盖、修复 |
-| `tests/test_task_runtime.py` | Reducer、幂等、重放、旧结果 |
-| `tests/test_task_scheduler.py` | ready、priority、lease、并发、取消 |
-| `tests/test_invocation.py` | InvocationSpec、budget、idempotency |
-| `tests/test_worker_runtime.py` | Agent/Tool adapter、WorkerResult |
-| `tests/test_policy_engine.py` | Approval 绑定、TTL、拒绝、scope |
-| `tests/test_evidence_store.py` | hash、revision、篡改检测 |
-| `tests/test_verifier_registry.py` | verifier 路由、Node/Final 判定 |
-| `tests/test_delivery.py` | completed/partial/failed manifest |
-| `tests/test_multi_agent_integration.py` | Fake Provider 端到端 DAG |
-| `tests/test_multi_agent_concurrency.py` | 并行、lease、资源冲突 |
-| `tests/test_multi_agent_worktree.py` | 隔离写、merge、冲突、清理 |
-| `tests/test_multi_agent_recovery.py` | crash、replay、cancel、resume |
-| `tests/test_multi_agent_compatibility.py` | V1 flag、shadow、旧 session |
-
-测试应复用真实生产 reducer、scheduler、policy 和 verifier，不复制一套仅供测试的简化实现。
-
-## 10. 验收执行顺序
-
-### Gate G0：静态与 schema 门禁
-
-1. 格式、类型和 import 检查。
-2. 所有 schema round-trip。
-3. Plan Validator property tests。
-4. 依赖边界检查，确认 `agent_loop.py` 未反向依赖全局 Scheduler 实现细节。
-
-失败：停止后续验收。
-
-### Gate G1：单元门禁
-
-执行所有新增模块单测和现有受影响单测。
-
-建议命令：
-
-```powershell
-python -m pytest -q `
-  tests/test_task_contract.py `
-  tests/test_plan_model.py `
-  tests/test_plan_validator.py `
-  tests/test_task_runtime.py `
-  tests/test_task_scheduler.py `
-  tests/test_invocation.py `
-  tests/test_worker_runtime.py `
-  tests/test_policy_engine.py `
-  tests/test_evidence_store.py `
-  tests/test_verifier_registry.py `
-  tests/test_delivery.py
-```
-
-失败：不得进入集成门禁。
-
-### Gate G2：离线集成门禁
-
-```powershell
-python -m pytest -q `
-  tests/test_multi_agent_integration.py `
-  tests/test_multi_agent_concurrency.py `
-  tests/test_multi_agent_recovery.py `
-  tests/test_agent_loop.py `
-  tests/test_turn_kernel.py `
-  tests/test_session.py `
-  tests/test_permissions.py
-```
-
-必须覆盖 Fast、Single 和 Multi 三条完整路径。
-
-### Gate G3：写隔离与安全门禁
-
-```powershell
-python -m pytest -q `
-  tests/test_multi_agent_worktree.py `
-  tests/test_policy_engine.py `
-  tests/test_permissions.py
-```
-
-同时运行安全/故障注入矩阵。任何未授权副作用或静默覆盖都直接判定失败。
-
-### Gate G4：性能与稳定性门禁
-
-运行确定性并发 benchmark、长事件重放、重复 replan、预算耗尽和 100 轮资源清理测试，生成 JSON 与 Markdown 报告。
-
-### Gate G5：兼容与全仓门禁
-
-```powershell
-python -m pytest -q
-```
-
-随后执行：
-
-- V1 flag-off characterization；
-- V2 shadow differential；
-- session inspect/replay；
-- checkpoint/rewind；
-- package smoke；
-- release readiness。
-
-### Gate G6：可选 Live Provider Smoke
-
-只有 G0-G5 全通过后才允许执行。结果必须单独标记 provider、模型、成本和时间，不能修改前述本地门禁结果。
-
-## 11. 验收证据目录
-
-每次候选验收生成独立目录：
+证据统一写入项目合法的临时/测试输出或 MiniCode Runtime 状态目录，不污染仓库根目录；最终 CI artifact 可按下列逻辑结构收集：
 
 ```text
-.temp/multi-agent-v2-acceptance/<candidate-id>/
-  manifest.json
-  environment.json
-  requirement-matrix.json
-  test-results.json
-  event-replay-report.json
-  plan-validator-report.json
-  policy-security-report.json
-  concurrency-report.json
-  worktree-cleanup-report.json
-  compatibility-report.json
-  delivery-samples/
-  logs/
-  summary.md
+runtime-v2-evidence/<run-id>/
+  baseline.json
+  profile.json
+  topology-decision.json
+  contract-r<N>.json
+  plan-v<N>.json
+  events.jsonl
+  attempts/<node>/<attempt>.json
+  context-manifests/
+  artifacts/
+  verification/
+  resource-census.json
+  test-report.json
+  benchmark.json
 ```
 
-`manifest.json` 必须记录所有证据文件的相对路径、大小、SHA-256、生成命令和退出码。包含 secret、完整模型思维过程或敏感环境变量的内容必须在写入前脱敏。
+文件内容必须脱敏；ArtifactRef 的 hash/size 可交叉校验；测试日志引用 Requirement 与 Gate。工作目录中的临时证据在测试结束后清理，CI/Session store 中的证据按现有保留策略保存。
 
-## 12. 里程碑验收判定
+本轮持久证据为 `benchmarks/runtime_v2_calibration_results.json`、`benchmarks/runtime_v2_calibration_results.md`、`benchmarks/runtime_v2_provider_smoke_standard.json` 和 `benchmarks/runtime_v2_provider_smoke_ultra.json`；Provider 文件不含 credential、完整环境或原始 trace。
 
-### M1 Typed Runtime
+## 10. 执行顺序与 Milestone 判定
 
-必须通过 R01-R04，以及 Gate G0-G2 中对应场景。
+严格按升级方案 Phase 0→6 实施并依次执行 G0→G5；G6 可选。Phase 7 Multi-Writer 只保留设计且为 deferred。
 
-### M2 Verified Single Worker
+| Milestone | 进入条件 | 退出判定 | 可独立回滚 | Requirements |
+|---|---|---|---|---|
+| M0 Baseline | 测试环境可用 | golden/调用次数/延迟 token 基线已记录 | 无产品变更 | R17,R30 |
+| M1 Protocol | M0 | G0 + protocol/reducer 单元通过 | flag off/忽略 extension | R01-R08,R18 |
+| M2 Unified Standard | M1 | Standard/task 通过 G1-G2 | 临时 flag 回旧串行 | R10,R17,R19-R21,R30,R33 |
+| M3 Read Fan-out | M2 | 只读并行、budget/cancel/artifact 通过 G2-G3 | route=deep-single | R11-R13,R20,R22-R27,R31-R32 |
+| M4 Exclusive Writer | M3 | isolation/verifier/final gate 通过 G3 | Ultra=deep-single/Standard | R09,R14-R16,R28-R29,R34 |
+| M5 Product Ready | M4 | G0-G5 全部通过；G6 如运行则证据脱敏 | 默认 Standard/临时 flag | R01-R36 |
 
-必须通过 R05-R09；任何 Claim/Evidence 或 Approval 失败均阻断发布。
+## 11. 文档与实现一致性检查
 
-### M3 Multi-Agent MVP
+代码修改前和完成后各运行一次轻量检查：
 
-必须通过 R10-R13；至少证明两个只读 Worker 真并行。写节点仍必须串行。
+1. 两个 companion link 的目标存在。
+2. fenced code block 数量成对；Mermaid block 包含受支持的 graph/flowchart/sequenceDiagram/stateDiagram-v2 声明。
+3. `R01..R36` 定义行恰好各一条、无断号；`G0..G6` 标题恰好各一条。
+4. Phase 0–7、M0–M5、Standard/deep-single/ultra-read-fanout 术语一致。
+5. 不含“Ultra 必须多 Agent”“Standard 必须低推理”“本轮 Multi-Writer completed”等冲突结论。
+6. 文档模块路径全部在仓库中存在，或明确标注为本轮新增文件。
 
-### M4 Isolated Writers
+## 12. 最终验收报告模板
 
-必须通过 R14-R15 和 Gate G3-G4；没有 worktree 清理证据不得通过。
+```markdown
+# Unified Runtime / Ultra V1 Acceptance Report
 
-### M5 Default V2
-
-必须通过 R16-R18、全仓测试、兼容性和 release readiness；完成 shadow/canary 观察后才可默认启用。
-
-## 13. 一票否决条件
-
-出现任一情况，候选版本结论必须为 `fail`：
-
-1. 未经有效 ApprovalGrant 发生副作用。
-2. 用户或其他 Worker 的修改被静默覆盖。
-3. 无 Evidence 的 Claim 通过验证。
-4. Required node 未验证却生成 completed DeliveryManifest。
-5. 旧 plan 或旧 invocation 的迟到结果覆盖当前状态。
-6. Retry、replan、delegation 或成本突破硬预算仍继续执行。
-7. Crash/cancel 后残留可继续写入的有效 lease 或孤立工作区。
-8. Shadow 模式产生任何真实副作用。
-9. 通过 skip、固定成功输出或替换生产实现规避失败。
-
-## 14. 验收结论模板
-
-```text
-Candidate:
-Commit / worktree:
-Schema versions:
-Feature mode:
-
-G0 Static/Schema: pass | fail
-G1 Unit: pass | fail
-G2 Offline Integration: pass | fail
-G3 Security/Isolation: pass | fail | not-applicable
-G4 Performance/Stability: pass | fail | not-applicable
-G5 Compatibility/Full Suite: pass | fail
-G6 Live Provider: pass | provider-risk | not-run
-
-Requirements passed:
-Requirements failed:
-Veto conditions triggered:
-Known limitations:
-Evidence manifest:
-
-Verdict: pass | conditional-pass | fail
-Approved rollout mode: off | shadow | single | readonly-multi | isolated-write-multi | default
+- revision / platform / Python:
+- implementation status:
+- baseline: passed / failed / skipped / environmental blockers
+- G0: status, commands, evidence
+- G1: status, commands, counts, evidence
+- G2: status, commands, counts, evidence
+- G3: status, fault matrix, resource census
+- G4 Standard: success delta, p95 delta, token delta, model-call delta
+- G4 Ultra: success/wall-clock delta or calibration-pending rationale
+- G5: full-suite and compatibility results
+- G6: passed / failed / blocked / not-run with reason
+- R01-R36: implementation file, test, result, evidence
+- known deviations/deferred: only factual unfinished items
+- veto conditions: none / list
+- git status --short:
+- git diff --stat:
+- final decision: accepted / conditional / rejected
 ```
 
-`conditional-pass` 只能用于尚未进入相应里程碑的非适用能力，不能用于安全、状态一致性或证据完整性失败。
+只有 G0–G5 的安全与一致性硬条件全部满足、无一票否决项时，才可写 `accepted`。Ultra 收益数据不足时可写 `conditional: calibration-pending`，但不得把功能安全缺失解释为待校准。
 
-## 15. 最终发布条件
-
-V2 可设为默认运行时的必要条件：
-
-1. Gate G0-G5 全部通过；G6 已执行或明确记录 provider-risk/not-run。
-2. R01-R18 全部通过并有 manifest 可追溯证据。
-3. 一票否决条件为零。
-4. `shadow`、`single`、`readonly-multi`、`isolated-write-multi` 分阶段均完成观察。
-5. V1 fallback 可用，且自动回退原因可观察。
-6. 用户文档准确区分已实现能力与未来能力。
-7. 最终验收报告由 Runtime、Security/Policy、Verification/QA 三个职责分别签署。
+本轮实际决定：`accepted`。G0–G5 全部通过，无一票否决项；可选 G6 也已用真实 Provider 通过。Phase 7 Multi-Writer 仍是明确非目标，不影响 Ultra V1 的完成判定。

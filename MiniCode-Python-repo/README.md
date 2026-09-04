@@ -384,6 +384,7 @@ What matters is not the diagram itself. What matters is that runtime state is tr
 | `Docs/Documentation/` | Architecture notes, optimization history, and productization reports. |
 | `openspec/` | Specs, archived change records, and build/verify planning artifacts. |
 | `.mini-code-memory/` | Workspace-level durable memory state created by the runtime. |
+| `~/.mini-code/memory-v2/` | Shared, opt-in lossless base for authoritative events, paged and Runtime artifacts, verified cold archives, spool, and local backups. Tenant/workspace/task/run identifiers provide isolation. |
 
 ## Core Modules
 
@@ -396,6 +397,7 @@ What matters is not the diagram itself. What matters is that runtime state is tr
 | `minicode/memory.py` | Long-term project memory manager and retrieval surface. |
 | `minicode/working_memory.py` | Protected working-memory entries that survive compaction pressure. |
 | `minicode/memory_pipeline.py` | Closed-loop memory retrieval, injection, reflection writeback, and optimization path. |
+| `minicode/paged_memory/` | Opt-in INLINE/WORKING_SET/PAGED_MEMORY runtime, authoritative stores, artifact paging, indexing, lifecycle, and recovery tools. |
 | `minicode/product_surfaces.py` | User-facing summaries for readiness, hooks, instructions, delegation, and extensions. |
 | `minicode/readiness.py` | Standalone readiness CLI used by local checks and CI gates. |
 | `minicode/release_readiness.py` | Release-oriented runtime smoke and provider-readiness checks. |
@@ -420,6 +422,7 @@ Start here if you want the deeper implementation and productization record:
 - [Chinese README](./README.zh-CN.md)
 - [Optimization Summary](./Docs/Documentation/OPTIMIZATION_SUMMARY.md)
 - [Memory Theory](./Docs/Documentation/memory_theory.md)
+- [Tiered Context and Lossless Out-of-Window Memory](./Docs/Documentation/PAGED_MEMORY.md)
 - [Minicode-lite Productization Design](./Docs/Documentation/superpowers/specs/2026-06-05-minicode-lite-productization-design.md)
 - [Minicode-lite Build Plan](./Docs/Documentation/superpowers/plans/2026-06-05-minicode-lite-productization-build.md)
 - [Minicode-lite Verify Report](./Docs/Documentation/superpowers/reports/2026-06-05-minicode-lite-productization-verify.md)

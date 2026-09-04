@@ -318,6 +318,7 @@ flowchart LR
 | `Docs/Documentation/` | 架构说明、优化记录和产品化报告。 |
 | `openspec/` | spec、归档变更记录，以及 build/verify 规划产物。 |
 | `.mini-code-memory/` | runtime 创建的 workspace 级持久记忆状态。 |
+| `~/.mini-code/memory-v2/` | 所有任务共用的可选无损存储底座，包含权威事件、分页与 Runtime Artifact、可验证冷归档、故障 spool 与本地备份，并按 tenant/workspace/task/run 隔离。 |
 
 ## Core Modules
 
@@ -330,6 +331,7 @@ flowchart LR
 | `minicode/memory.py` | 长期项目记忆管理和检索入口。 |
 | `minicode/working_memory.py` | 在 compaction 压力下仍会保留的 working memory 条目。 |
 | `minicode/memory_pipeline.py` | memory retrieval、injection、reflection writeback 和优化闭环。 |
+| `minicode/paged_memory/` | 可选的 INLINE/WORKING_SET/PAGED_MEMORY runtime、权威存储、Artifact 分页、索引、生命周期与恢复工具。 |
 | `minicode/product_surfaces.py` | readiness、hooks、instructions、delegation、extensions 等用户可见摘要。 |
 | `minicode/readiness.py` | 独立 readiness CLI，用于本地检查和 CI 门禁。 |
 | `minicode/release_readiness.py` | 面向 release 的 runtime smoke 与 provider readiness 检查。 |
@@ -353,6 +355,7 @@ flowchart LR
 - [English README](./README.md)
 - [Optimization Summary](./Docs/Documentation/OPTIMIZATION_SUMMARY.md)
 - [Memory Theory](./Docs/Documentation/memory_theory.md)
+- [分级上下文与窗口外无损记忆](./Docs/Documentation/PAGED_MEMORY.md)
 - [Minicode-lite Productization Design](./Docs/Documentation/superpowers/specs/2026-06-05-minicode-lite-productization-design.md)
 - [Minicode-lite Build Plan](./Docs/Documentation/superpowers/plans/2026-06-05-minicode-lite-productization-build.md)
 - [Minicode-lite Verify Report](./Docs/Documentation/superpowers/reports/2026-06-05-minicode-lite-productization-verify.md)
