@@ -2,69 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import hmac
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
-
-
-# ---------------------------------------------------------------------------
-# Current Time
-# ---------------------------------------------------------------------------
-
-def _run_current_time(input_data: dict, context: ToolContext) -> ToolResult:
-    """Get current time in various formats."""
-    tz_name = input_data.get("timezone", "UTC")
-    format_str = input_data.get("format", "iso")
-    
-    try:
-        # Get timezone
-        if tz_name == "local":
-            now = datetime.now()
-        elif tz_name == "UTC":
-            now = datetime.now(timezone.utc)
-        else:
-            # Try to find timezone offset
-            now = datetime.now(timezone.utc)
-            # Simple handling for common zones
-            offsets = {"EST": -5, "EDT": -4, "CST": -6, "CDT": -5, "PST": -8, "PDT": -7, "JST": 9, "CET": 1, "CEST": 2}
-            offset_hours = offsets.get(tz_name.upper(), 0)
-            now = datetime.now(timezone.utc) + timedelta(hours=offset_hours)
-    
-    except Exception:
-        now = datetime.now()
-    
-    # Format output
-    if format_str == "iso":
-        output = now.isoformat()
-    elif format_str == "unix":
-        output = str(int(now.timestamp()))
-    elif format_str == "date":
-        output = now.strftime("%Y-%m-%d")
-    elif format_str == "time":
-        output = now.strftime("%H:%M:%S")
-    elif format_str == "full":
-        output = now.strftime("%Y-%m-%d %H:%M:%S %Z")
-    else:
-        output = now.isoformat()
-    
-    return ToolResult(ok=True, output=output)
-
-
-current_time_tool = ToolDefinition(
-    name="current_time",
-    description="Get current time in various formats and timezones.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "timezone": {"type": "string", "description": "Timezone: local, UTC, EST, CST, PST, JST, etc."},
-            "format": {"type": "string", "description": "Format: iso, unix, date, time, full"}
-        }
-    },
-    validator=lambda x: x,
-    run=_run_current_time,
-)
-
-
 # ---------------------------------------------------------------------------
 # Timestamp Convert
 # ---------------------------------------------------------------------------

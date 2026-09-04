@@ -38,6 +38,16 @@ def test_turn_recurrent_state_maps_await_user_to_paused() -> None:
     assert turn_state.final_task_state() is TaskState.PAUSED
 
 
+def test_failed_tool_result_is_not_marked_as_verification_evidence() -> None:
+    turn_state = TurnRecurrentState(max_steps=5)
+
+    turn_state.record_tool_result(False, summary="web_search: unrelated or unavailable")
+
+    assert turn_state.has_verification_evidence() is False
+    assert turn_state.verification_state.evidence_ready is False
+    assert turn_state.verification_state.evidence_summary == ""
+
+
 def test_build_stable_task_pack_includes_graph_and_protected_context() -> None:
     pack = build_stable_task_pack(
         task=DummyTask(),

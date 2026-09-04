@@ -34,6 +34,7 @@ from minicode.runtime_profile_eval import (
 )
 
 LIVE_PROVIDER_SMOKE_ENV = "MINICODE_LIVE_PROVIDER_SMOKE"
+BOUNDED_PROVIDER_SMOKE_ENV = "MINICODE_BOUNDED_PROVIDER_SMOKE"
 SMOKE_PROMPT = "Reply with exactly OK."
 DEFAULT_TIMEOUT_SECONDS = 45
 MAX_TIMEOUT_SECONDS = 300
@@ -110,7 +111,7 @@ def _readiness_snapshot(report: object) -> dict[str, Any]:
     }
 
 
-def _base_result(*, timeout: int, summary: str) -> dict[str, Any]:
+def _base_result(*, timeout: int, summary: str, profile: str) -> dict[str, Any]:
     return {
         "schema_version": 1,
         "status": "skipped",
@@ -121,6 +122,8 @@ def _base_result(*, timeout: int, summary: str) -> dict[str, Any]:
         "timeout_seconds": timeout,
         "provider": "",
         "model": "",
+        "execution_profile": profile,
+        "selected_route": "",
         "summary": summary,
         "failure_category": "not-run",
         "retryable": False,
@@ -144,6 +147,7 @@ def run_provider_smoke(
     run_live: bool = False,
     timeout: int = DEFAULT_TIMEOUT_SECONDS,
     runner: Runner = subprocess.run,
+    profile: str = "standard",
 ) -> dict[str, Any]:
     """Run one provider smoke, returning only safe structured evidence.
 
@@ -152,9 +156,13 @@ def run_provider_smoke(
     started.  The default path performs no config read and no subprocess call.
     """
 
+    normalized_profile = str(profile).strip().lower()
+    if normalized_profile not in {"standard", "ultra"}:
+        raise ValueError("provider smoke profile must be 'standard' or 'ultra'")
     timeout_seconds = _bounded_timeout(timeout)
     result = _base_result(
         timeout=timeout_seconds,
+        profile=normalized_profile,
         summary=(
             "Live provider smoke skipped. Pass --run-live and set "
             f"{LIVE_PROVIDER_SMOKE_ENV}=1."
@@ -233,10 +241,43 @@ def run_provider_smoke(
         )
         return redact_sensitive_payload(result)
 
-    command = [sys.executable, "-m", "minicode.headless", SMOKE_PROMPT]
+    command = [
+        sys.executable,
+        "-m",
+        "minicode.headless",
+        "--profile",
+        normalized_profile,
+        SMOKE_PROMPT,
+    ]
     with tempfile.TemporaryDirectory(prefix="minicode-provider-smoke-") as temp_dir:
         trace_path = Path(temp_dir) / "headless-trace.json"
         env = dict(os.environ)
+        # Run the subprocess against the already validated runtime without
+        # inheriting unrelated user settings.  Existing explicit process env
+        # wins (useful for local OpenAI-compatible smoke servers); otherwise
+        # project the validated fields into the child environment.
+        env["HOME"] = temp_dir
+        env["USERPROFILE"] = temp_dir
+        env["MINI_CODE_MODEL"] = model
+        env["MINI_CODE_PROVIDER"] = provider
+        runtime_env_fields = {
+            "OPENAI_API_KEY": runtime.get("openaiApiKey"),
+            "OPENAI_BASE_URL": runtime.get("openaiBaseUrl"),
+            "ANTHROPIC_API_KEY": runtime.get("apiKey"),
+            "ANTHROPIC_AUTH_TOKEN": runtime.get("authToken"),
+            "ANTHROPIC_BASE_URL": runtime.get("baseUrl"),
+            "DEEPSEEK_API_KEY": runtime.get("deepseekApiKey"),
+            "DEEPSEEK_BASE_URL": runtime.get("deepseekBaseUrl"),
+            "OPENROUTER_API_KEY": runtime.get("openrouterApiKey"),
+            "OPENROUTER_BASE_URL": runtime.get("openrouterBaseUrl"),
+            "CUSTOM_API_KEY": runtime.get("customApiKey"),
+            "CUSTOM_API_BASE_URL": runtime.get("customBaseUrl"),
+        }
+        for key, value in runtime_env_fields.items():
+            if value not in (None, ""):
+                env.setdefault(key, str(value))
+        env["MINI_CODE_EXECUTION_PROFILE"] = normalized_profile
+        env[BOUNDED_PROVIDER_SMOKE_ENV] = "1"
         existing_pythonpath = env.get("PYTHONPATH", "")
         env["PYTHONPATH"] = (
             str(REPO_ROOT)
@@ -286,6 +327,12 @@ def run_provider_smoke(
             trace_payload = _read_trace(trace_path)
             trace_readiness = trace_payload.get("readiness_report", {})
             repair_plan = trace_payload.get("repair_plan", [])
+            runtime_trace = trace_payload.get("runtime_trace", {})
+            trace_profile = (
+                runtime_trace.get("profile", {})
+                if isinstance(runtime_trace, dict)
+                else {}
+            )
             result.update(
                 {
                     "status": "passed" if outcome == "answered" else "failed",
@@ -297,6 +344,11 @@ def run_provider_smoke(
                     "recovery_action": failure.recovery_action,
                     "error_code": error_context["error_code"],
                     "request_id": error_context["request_id"],
+                    "selected_route": (
+                        str(trace_profile.get("selected_route") or "")
+                        if isinstance(trace_profile, dict)
+                        else ""
+                    ),
                     "latency_ms": round((time.perf_counter() - started) * 1000, 2),
                     "trace": {
                         "available": bool(trace_payload),
@@ -366,6 +418,12 @@ def main(argv: list[str] | None = None) -> int:
         help=f"Allow a live request; also requires {LIVE_PROVIDER_SMOKE_ENV}=1.",
     )
     parser.add_argument(
+        "--profile",
+        choices=("standard", "ultra"),
+        default="standard",
+        help="Unified Runtime profile to exercise (default: standard).",
+    )
+    parser.add_argument(
         "--timeout",
         type=int,
         default=DEFAULT_TIMEOUT_SECONDS,
@@ -377,6 +435,7 @@ def main(argv: list[str] | None = None) -> int:
         args.cwd,
         run_live=args.run_live,
         timeout=args.timeout,
+        profile=args.profile,
     )
     rendered = json.dumps(result, ensure_ascii=False, indent=2) + "\n"
     print(rendered, end="")

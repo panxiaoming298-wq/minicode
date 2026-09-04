@@ -2,7 +2,7 @@
 
 import json
 import os
-import tempfile
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -10,7 +10,6 @@ import pytest
 
 from minicode.session import (
     AutosaveManager,
-    SessionData,
     SessionMetadata,
     _runtime_summary_from_transcript_entries,
     cleanup_old_sessions,
@@ -30,6 +29,32 @@ from minicode.session import (
     rewind_session,
     save_session,
 )
+
+
+def _create_directory_alias(link: Path, target: Path) -> None:
+    """Create a real directory alias without requiring Windows symlink rights."""
+
+    if os.name == "nt":
+        completed = subprocess.run(
+            ["cmd.exe", "/d", "/c", "mklink", "/J", str(link), str(target)],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr or completed.stdout
+    else:
+        link.symlink_to(target, target_is_directory=True)
+
+
+def _create_file_alias(link: Path, target: Path) -> None:
+    """Use a hard link on Windows and a symlink where unprivileged links exist."""
+
+    if os.name == "nt":
+        os.link(target, link)
+    else:
+        link.symlink_to(target)
 
 
 @pytest.fixture
@@ -189,14 +214,14 @@ def test_update_metadata_keeps_session_ids_aligned(temp_session_dir):
     assert session.metadata.session_id == session.session_id
 
 
-def test_load_session_does_not_follow_legacy_symlinks(temp_session_dir, tmp_path):
+def test_load_session_does_not_follow_legacy_link_aliases(temp_session_dir, tmp_path):
     """Legacy session and delta readers must stay inside the session store."""
     source = create_new_session(workspace="/tmp/source")
     source.messages = [{"role": "user", "content": "base"}]
     save_session(source, force_full=True)
 
     linked_path = temp_session_dir / "linked.json"
-    linked_path.symlink_to(temp_session_dir / f"{source.session_id}.json")
+    _create_file_alias(linked_path, temp_session_dir / f"{source.session_id}.json")
     assert load_session("linked") is None
 
     outside_delta_dir = tmp_path / "outside-deltas"
@@ -212,12 +237,33 @@ def test_load_session_does_not_follow_legacy_symlinks(temp_session_dir, tmp_path
     )
     (temp_session_dir / "deltas").mkdir()
     delta_dir = temp_session_dir / "deltas" / source.session_id
-    delta_dir.symlink_to(outside_delta_dir, target_is_directory=True)
+    _create_directory_alias(delta_dir, outside_delta_dir)
 
     loaded = load_session(source.session_id)
 
     assert loaded is not None
     assert loaded.messages == source.messages
+
+
+def test_delete_session_refuses_linked_delta_directory(temp_session_dir, tmp_path):
+    """Deletion must never traverse a Windows junction or Unix symlink."""
+
+    source = create_new_session(workspace="/tmp/source")
+    source.messages = [{"role": "user", "content": "base"}]
+    save_session(source, force_full=True)
+    outside_delta_dir = tmp_path / "outside-delete-target"
+    outside_delta_dir.mkdir()
+    sentinel = outside_delta_dir / "must-survive.json"
+    sentinel.write_text('{"outside": true}', encoding="utf-8")
+    (temp_session_dir / "deltas").mkdir()
+    _create_directory_alias(
+        temp_session_dir / "deltas" / source.session_id,
+        outside_delta_dir,
+    )
+
+    assert delete_session(source.session_id) is False
+    assert sentinel.read_text(encoding="utf-8") == '{"outside": true}'
+    assert (temp_session_dir / f"{source.session_id}.json").is_file()
 
 
 def test_corrupt_legacy_session_is_rejected_without_raising(temp_session_dir):

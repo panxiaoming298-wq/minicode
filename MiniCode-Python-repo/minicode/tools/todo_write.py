@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import time
+from typing import Any
+
 from minicode.tooling import ToolDefinition, ToolResult
 
 # In-memory task storage (resets per session)
-_tasks = []
+_tasks: list[dict[str, Any]] = []
 _task_id_counter = 0
 
 
@@ -28,22 +30,19 @@ def _run(input_data: dict, context) -> ToolResult:
 
     todos = input_data["todos"]
 
-    # Clear existing tasks and replace
-    _tasks.clear()
+    existing_by_content = {task["content"]: task for task in _tasks}
+    next_tasks = []
 
     for todo in todos:
         # Try to find existing task by content
-        existing = None
-        for task in _tasks:
-            if task["content"] == todo["content"]:
-                existing = task
-                break
+        existing = existing_by_content.get(todo["content"])
 
         if existing:
             # Update existing task
             existing["status"] = todo.get("status", existing["status"])
             if todo.get("status") == "completed" and not existing.get("completed_at"):
                 existing["completed_at"] = time.time()
+            next_tasks.append(existing)
         else:
             # Create new task
             _task_id_counter += 1
@@ -54,7 +53,10 @@ def _run(input_data: dict, context) -> ToolResult:
                 "created_at": time.time(),
                 "completed_at": time.time() if todo.get("status") == "completed" else None,
             }
-            _tasks.append(new_task)
+            existing_by_content[todo["content"]] = new_task
+            next_tasks.append(new_task)
+
+    _tasks = next_tasks
 
     # Format output
     lines = ["Task list updated:", ""]

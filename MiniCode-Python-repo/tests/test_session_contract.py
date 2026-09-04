@@ -88,6 +88,31 @@ def test_save_emits_rust_bundle_and_memory_continuity(tmp_path: Path) -> None:
     assert not list(bundle_dir.glob("*.tmp"))
 
 
+def test_session_contract_preserves_terminal_metadata_status(tmp_path: Path) -> None:
+    sessions_dir = tmp_path / "sessions"
+    sessions_dir.mkdir()
+    session = create_new_session(str(tmp_path / "workspace"))
+    session.messages = [
+        {"role": "user", "content": "run the task"},
+        {"role": "assistant", "content": "verification failed"},
+    ]
+    session.metadata.status = "failed"
+    session.metadata.ended_at = "2026-09-02T04:00:00Z"
+
+    with patch("minicode.session.SESSIONS_DIR", sessions_dir), patch(
+        "minicode.session.MINI_CODE_DIR", tmp_path
+    ):
+        save_session(session, force_full=True)
+        loaded = load_session(session.session_id)
+
+    assert loaded is not None
+    assert loaded.metadata.status == "failed"
+    assert loaded.metadata.ended_at == "2026-09-02T04:00:00Z"
+    bundle = read_session_bundle(session.session_id, sessions_dir)
+    assert bundle is not None
+    assert bundle.metadata.status == "failed"
+
+
 def test_bundle_only_session_can_be_resumed(tmp_path: Path) -> None:
     sessions_dir = tmp_path / "sessions"
     sessions_dir.mkdir()

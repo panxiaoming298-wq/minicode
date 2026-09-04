@@ -67,13 +67,16 @@ def _run_status(cwd: str) -> ToolResult:
         return ToolResult(ok=True, output="Working tree clean. Nothing to commit.")
 
     # Count changes
-    staged = sum(1 for line in stdout.split("\n") if line and line[0] != " ")
-    unstaged = sum(1 for line in stdout.split("\n") if line and line[0] == " ")
+    status_lines = [line for line in stdout.split("\n") if len(line) >= 2]
+    staged = sum(1 for line in status_lines if line[0] not in {" ", "?"})
+    unstaged = sum(1 for line in status_lines if line[1] not in {" ", "?"})
+    untracked = sum(1 for line in status_lines if line[:2] == "??")
 
     lines = [
         "Git Status:",
         f"  Staged changes: {staged}",
         f"  Unstaged changes: {unstaged}",
+        f"  Untracked files: {untracked}",
         "",
         "Files:",
     ]
@@ -126,7 +129,10 @@ def _run_log(cwd: str, max_lines: int) -> ToolResult:
 
 def _run_commit(cwd: str, message: str) -> ToolResult:
     # First check what will be committed
-    rc, staged, _ = _run_git(["diff", "--cached", "--stat"], cwd)
+    rc, staged, stderr = _run_git(["diff", "--cached", "--stat"], cwd)
+
+    if rc != 0:
+        return ToolResult(ok=False, output=f"Unable to inspect staged changes: {stderr}")
 
     if not staged:
         return ToolResult(

@@ -187,8 +187,9 @@ class TurnRecurrentState:
         if summary:
             normalized = " ".join(summary.split())
             self.latest_tool_result_summary = normalized[:280]
-            self.verification_state.evidence_summary = normalized[:200]
-            self.verification_state.evidence_ready = True
+            if ok:
+                self.verification_state.evidence_summary = normalized[:200]
+                self.verification_state.evidence_ready = True
         self._refresh_budget_signals()
 
     def set_progress_summary(self, summary: str) -> None:
@@ -199,7 +200,10 @@ class TurnRecurrentState:
         self._refresh_budget_signals()
 
     def has_verification_evidence(self) -> bool:
-        return self.tool_observation_count > 0 and bool(self.latest_tool_result_summary)
+        return (
+            self.successful_tool_observation_count > 0
+            and bool(self.verification_state.evidence_summary)
+        )
 
     def activate_widening(self, *, extra_steps: int = 0) -> bool:
         if self.widening_active:
@@ -525,6 +529,14 @@ def _content_mentions_evidence(content: str, evidence_summary: str) -> bool:
         "diff shows",
         "I ran",
         "I checked",
+        "根据",
+        "来源",
+        "报道",
+        "已核实",
+        "已核验",
+        "证据",
+        "结果显示",
+        "网页显示",
     )
     if any(marker in normalized_content for marker in evidence_markers):
         return True

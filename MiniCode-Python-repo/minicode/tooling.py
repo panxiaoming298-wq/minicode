@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, List, Mapping, Protocol
 
 from minicode.logging_config import get_logger, log_tool_execution
+from minicode.runtime_protocol import ReplayPolicy, ToolEffect, operation_digest
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +145,8 @@ class ToolMetadata:
     is_enabled: bool = True
     max_result_size_chars: int = 10_000
     tags: list[str] = field(default_factory=list)
+    effect: ToolEffect | None = None
+    replay_policy: ReplayPolicy | None = None
     
     @property
     def is_read_only(self) -> bool:
@@ -220,6 +223,16 @@ class ToolContext:
     permissions: Any | None = None
     session: Any | None = None
     _runtime: dict | None = None
+    runtime_context: Any | None = None
+    allowed_effects: frozenset[ToolEffect] | None = None
+    cancellation_event: Any | None = None
+    node_id: str | None = None
+    attempt_id: str | None = None
+    idempotency_key: str | None = None
+    run_id: str | None = None
+    tool_call_id: str | None = None
+    base_revision: str | None = None
+    raw_result_observer: Callable[[str, ToolResult], ToolResult | None] | None = None
 
 
 Validator = Callable[[Any], Any]
@@ -234,14 +247,34 @@ class ToolDefinition:
     validator: Validator
     run: Runner
     metadata: ToolMetadata | None = None
+
+    @property
+    def effect(self) -> ToolEffect:
+        """Return the explicit Runtime effect for policy and worker isolation.
+
+        Unknown tools fail closed as privileged.  The legacy read-only name
+        set is retained only as a compatibility input to this central mapping;
+        Runtime policy never infers write safety from concurrency safety.
+        """
+        if self.metadata and self.metadata.effect is not None:
+            return self.metadata.effect
+        if self.metadata and ToolCapability.READ_ONLY in self.metadata.capabilities:
+            return ToolEffect.READ_ONLY
+        return _EXPLICIT_TOOL_EFFECTS.get(self.name, ToolEffect.PRIVILEGED)
+
+    @property
+    def replay_policy(self) -> ReplayPolicy:
+        if self.metadata and self.metadata.replay_policy is not None:
+            return self.metadata.replay_policy
+        return _EXPLICIT_REPLAY_POLICIES.get(
+            self.name,
+            ReplayPolicy.SAFE if self.effect is ToolEffect.READ_ONLY else ReplayPolicy.NEVER_AUTO_RETRY,
+        )
     
     @property
     def is_read_only(self) -> bool:
         """Check if this tool is read-only (safe for concurrent execution)."""
-        if self.metadata:
-            return self.metadata.is_read_only
-        # Fallback: heuristic based on tool name
-        return self.name in _READ_ONLY_TOOL_NAMES
+        return self.effect is ToolEffect.READ_ONLY
     
     @property
     def is_concurrency_safe(self) -> bool:
@@ -259,6 +292,92 @@ _READ_ONLY_TOOL_NAMES: frozenset[str] = frozenset({
     "web_fetch", "web_search",
     "ask_user", "todo_write",
 })
+
+
+# The product tool surface is deliberately classified here in one auditable
+# table.  Any extension/MCP tool not listed and without metadata is privileged,
+# so an Explorer can never receive it by accident.
+_EXPLICIT_TOOL_EFFECTS: dict[str, ToolEffect] = {
+    # Workspace reads / deterministic local transforms
+    "read_file": ToolEffect.READ_ONLY,
+    "list_files": ToolEffect.READ_ONLY,
+    "grep_files": ToolEffect.READ_ONLY,
+    "file_tree": ToolEffect.READ_ONLY,
+    "find_symbols": ToolEffect.READ_ONLY,
+    "find_references": ToolEffect.READ_ONLY,
+    "get_ast_info": ToolEffect.READ_ONLY,
+    "code_review": ToolEffect.READ_ONLY,
+    "diff_viewer": ToolEffect.READ_ONLY,
+    "json_format": ToolEffect.READ_ONLY,
+    "json_parse": ToolEffect.READ_ONLY,
+    "regex_test": ToolEffect.READ_ONLY,
+    "base64_encode": ToolEffect.READ_ONLY,
+    "base64_decode": ToolEffect.READ_ONLY,
+    "url_encode": ToolEffect.READ_ONLY,
+    "url_decode": ToolEffect.READ_ONLY,
+    "current_time": ToolEffect.READ_ONLY,
+    "timestamp": ToolEffect.READ_ONLY,
+    "hash": ToolEffect.READ_ONLY,
+    "hmac": ToolEffect.READ_ONLY,
+    "csv_parse": ToolEffect.READ_ONLY,
+    "csv_create": ToolEffect.READ_ONLY,
+    "uuid_generate": ToolEffect.READ_ONLY,
+    "text_sort": ToolEffect.READ_ONLY,
+    "text_dedupe": ToolEffect.READ_ONLY,
+    "text_join": ToolEffect.READ_ONLY,
+    "line_count": ToolEffect.READ_ONLY,
+    "random_string": ToolEffect.READ_ONLY,
+    # Workspace mutation
+    "write_file": ToolEffect.WORKSPACE_WRITE,
+    "edit_file": ToolEffect.WORKSPACE_WRITE,
+    "patch_file": ToolEffect.WORKSPACE_WRITE,
+    "batch_copy": ToolEffect.WORKSPACE_WRITE,
+    "batch_move": ToolEffect.WORKSPACE_WRITE,
+    "batch_delete": ToolEffect.WORKSPACE_WRITE,
+    "regex_replace": ToolEffect.WORKSPACE_WRITE,
+    "gzip_compress": ToolEffect.WORKSPACE_WRITE,
+    "gzip_decompress": ToolEffect.WORKSPACE_WRITE,
+    "tar_create": ToolEffect.WORKSPACE_WRITE,
+    "tar_extract": ToolEffect.WORKSPACE_WRITE,
+    "zip_create": ToolEffect.WORKSPACE_WRITE,
+    "zip_extract": ToolEffect.WORKSPACE_WRITE,
+    # Network reads still cross the workspace trust boundary and therefore
+    # require an explicit side-effect-capable scope in Runtime V2.
+    "web_fetch": ToolEffect.EXTERNAL_SIDE_EFFECT,
+    "web_search": ToolEffect.EXTERNAL_SIDE_EFFECT,
+    "http_request": ToolEffect.EXTERNAL_SIDE_EFFECT,
+    # Shell, git, user interaction, state mutation, skills and delegation.
+    "run_command": ToolEffect.PRIVILEGED,
+    "test_runner": ToolEffect.PRIVILEGED,
+    "git": ToolEffect.PRIVILEGED,
+    "ask_user": ToolEffect.PRIVILEGED,
+    "todo_write": ToolEffect.PRIVILEGED,
+    "load_skill": ToolEffect.PRIVILEGED,
+    "task": ToolEffect.PRIVILEGED,
+}
+
+
+_EXPLICIT_REPLAY_POLICIES: dict[str, ReplayPolicy] = {
+    name: ReplayPolicy.SAFE
+    for name, effect in _EXPLICIT_TOOL_EFFECTS.items()
+    if effect is ToolEffect.READ_ONLY
+}
+_EXPLICIT_REPLAY_POLICIES.update(
+    {
+        "write_file": ReplayPolicy.VERIFY_BEFORE_RETRY,
+        "edit_file": ReplayPolicy.VERIFY_BEFORE_RETRY,
+        "patch_file": ReplayPolicy.VERIFY_BEFORE_RETRY,
+        "batch_copy": ReplayPolicy.VERIFY_BEFORE_RETRY,
+        "batch_move": ReplayPolicy.VERIFY_BEFORE_RETRY,
+        "batch_delete": ReplayPolicy.NEVER_AUTO_RETRY,
+        "web_fetch": ReplayPolicy.SAFE,
+        "web_search": ReplayPolicy.SAFE,
+        "http_request": ReplayPolicy.NEVER_AUTO_RETRY,
+        "run_command": ReplayPolicy.NEVER_AUTO_RETRY,
+        "git": ReplayPolicy.NEVER_AUTO_RETRY,
+        "task": ReplayPolicy.IDEMPOTENT_WITH_KEY,
+    }
+)
 
 
 class ToolRegistry:
@@ -279,20 +398,62 @@ class ToolRegistry:
     def list(self) -> list[ToolDefinition]:
         return list(self._tools)
 
-    def list_all(self) -> list[str]:
+    def list_all(self) -> List[str]:
         return list(self._tool_index.keys())
 
-    def get_skills(self) -> list[dict[str, Any]]:
+    def filtered_by_effects(self, allowed_effects: set[ToolEffect] | frozenset[ToolEffect]) -> "ToolRegistry":
+        """Create a capability view without transferring disposer ownership."""
+        allowed = frozenset(allowed_effects)
+        return ToolRegistry(
+            [tool for tool in self._tools if tool.effect in allowed],
+            skills=self._skills,
+            mcp_servers=self._mcp_servers,
+        )
+
+    def filtered_without_names(self, excluded_names: set[str] | frozenset[str]) -> "ToolRegistry":
+        """Create a non-owning view that hides selected tools from the model and executor."""
+
+        excluded = frozenset(excluded_names)
+        return ToolRegistry(
+            [tool for tool in self._tools if tool.name not in excluded],
+            skills=self._skills,
+            mcp_servers=self._mcp_servers,
+        )
+
+    def with_additional_tools(self, additional: list[ToolDefinition]) -> "ToolRegistry":
+        """Create a non-owning per-turn view with validated unique tool names."""
+        existing = set(self._tool_index)
+        duplicates = [tool.name for tool in additional if tool.name in existing]
+        if duplicates:
+            raise ValueError(
+                "cannot add duplicate tools: " + ", ".join(sorted(set(duplicates)))
+            )
+        return ToolRegistry(
+            [*self._tools, *additional],
+            skills=self._skills,
+            mcp_servers=self._mcp_servers,
+        )
+
+    def effect_manifest(self) -> dict[str, dict[str, str]]:
+        return {
+            tool.name: {
+                "effect": tool.effect.value,
+                "replay_policy": tool.replay_policy.value,
+            }
+            for tool in self._tools
+        }
+
+    def get_skills(self) -> List[dict[str, Any]]:
         return list(self._skills)
 
-    def get_mcp_servers(self) -> list[dict[str, Any]]:
+    def get_mcp_servers(self) -> List[dict[str, Any]]:
         return list(self._mcp_servers)
 
     def find(self, name: str) -> ToolDefinition | None:
         # O(1) lookup via cached index
         return self._tool_index.get(name)
 
-    def execute(self, tool_name: str, input_data: Any, context: ToolContext) -> ToolResult:
+    def execute(self, tool_name: str, input_data: Any, context: ToolContext | None) -> ToolResult:
         """Execute a tool with comprehensive error protection.
         
         The global exception safety net catches ALL exceptions (except
@@ -309,6 +470,21 @@ class ToolRegistry:
         tool = self.find(tool_name)
         if tool is None:
             return ToolResult(ok=False, output=f"Unknown tool: {tool_name}")
+
+        # Preserve the historical direct-registry API used by integrations and
+        # tests while still giving Runtime policy a concrete context object.
+        context = context or ToolContext(cwd=".")
+
+        if context.cancellation_event is not None and context.cancellation_event.is_set():
+            return ToolResult(ok=False, output="Canceled: parent Runtime canceled this tool call")
+        if context.allowed_effects is not None and tool.effect not in context.allowed_effects:
+            return ToolResult(
+                ok=False,
+                output=(
+                    "PolicyDenied: tool effect "
+                    f"{tool.effect.value!r} is outside this Worker's capability scope"
+                ),
+            )
 
         _logger = get_logger("tools")
         _start = time.monotonic()
@@ -327,12 +503,59 @@ class ToolRegistry:
                            f"Input was: {str(input_data)[:200]}"
                 )
 
+            # Bind interactive one-shot permission decisions to the complete
+            # Runtime operation.  Legacy/direct callers keep their historical
+            # manager; governed Workers use an operation-scoped adapter so a
+            # changed argument/cwd/base cannot inherit an old allow-once.
+            if (
+                context.permissions is not None
+                and context.run_id
+                and context.node_id
+                and context.attempt_id
+                and context.tool_call_id
+                and callable(getattr(context.permissions, "fork_for_operation", None))
+            ):
+                arguments = (
+                    dict(parsed)
+                    if isinstance(parsed, Mapping)
+                    else {"value": parsed}
+                )
+                environment_scope = {
+                    "tool": tool_name,
+                    "effect": tool.effect.value,
+                    "allowed_effects": sorted(
+                        effect.value for effect in (context.allowed_effects or ())
+                    ),
+                    "idempotency_key": context.idempotency_key or "",
+                }
+                digest = operation_digest(
+                    run_id=context.run_id,
+                    node_id=context.node_id,
+                    attempt_id=context.attempt_id,
+                    tool_call_id=context.tool_call_id,
+                    cwd=context.cwd,
+                    arguments=arguments,
+                    environment_scope=environment_scope,
+                    base_revision=context.base_revision or "unknown",
+                )
+                context = replace(
+                    context,
+                    permissions=context.permissions.fork_for_operation(digest),
+                )
+
             # Phase 2: Execution (with crash protection)
             result = tool.run(parsed, context)
 
             # Phase 3: Output sanitization
             if result.output is None:
                 result.output = ""
+
+            # Lossless persistence hooks observe the exact tool receipt before
+            # the legacy prompt-size truncator is allowed to alter it.
+            if context.raw_result_observer is not None:
+                observed = context.raw_result_observer(tool_name, result)
+                if observed is not None:
+                    result = observed
 
             # Smart truncation for large outputs
             if result.output and len(result.output) > _LARGE_OUTPUT_THRESHOLD:

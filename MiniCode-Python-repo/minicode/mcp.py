@@ -18,6 +18,7 @@ DANGEROUS_SHELL_CHARS = set('|&;`$(){}<>\n\r')
 
 # MCP payload 大小上限（防止恶意服务端制造 OOM）
 MAX_MCP_PAYLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+MAX_MCP_STDERR_LINE_BYTES = 64 * 1024
 
 # 允许的命令白名单（常见的 MCP 服务器命令）
 ALLOWED_COMMANDS = {
@@ -372,8 +373,15 @@ class StdioMcpClient:
 
     def _consume_stderr(self) -> None:
         assert self.process is not None and self.process.stderr is not None
-        for line in self.process.stderr:
+        while True:
+            line = self.process.stderr.readline(MAX_MCP_STDERR_LINE_BYTES + 1)
+            if not line:
+                break
             try:
+                if len(line) > MAX_MCP_STDERR_LINE_BYTES:
+                    while line and not line.endswith(b"\n"):
+                        line = self.process.stderr.readline(MAX_MCP_STDERR_LINE_BYTES + 1)
+                    line = b"MCP stderr line exceeded limit"
                 text = line.decode("utf-8", errors="replace").strip()
                 if text:
                     self.stderr_lines.append(text)
@@ -391,9 +399,17 @@ class StdioMcpClient:
         assert self.process is not None and self.process.stdout is not None
         try:
             while True:
-                line_bytes = self.process.stdout.readline()
+                line_bytes = self.process.stdout.readline(MAX_MCP_PAYLOAD_BYTES + 1)
                 if not line_bytes:
                     break
+
+                if len(line_bytes) > MAX_MCP_PAYLOAD_BYTES:
+                    while line_bytes and not line_bytes.endswith(b"\n"):
+                        line_bytes = self.process.stdout.readline(MAX_MCP_PAYLOAD_BYTES + 1)
+                    self.stderr_lines.append(
+                        f"MCP payload too large (limit {MAX_MCP_PAYLOAD_BYTES})"
+                    )
+                    continue
 
                 try:
                     line = line_bytes.decode("utf-8")
@@ -402,12 +418,6 @@ class StdioMcpClient:
 
                 stripped = line.strip()
                 if not stripped:
-                    continue
-
-                if len(line_bytes) > MAX_MCP_PAYLOAD_BYTES:
-                    self.stderr_lines.append(
-                        f"MCP payload too large: {len(line_bytes)} bytes (limit {MAX_MCP_PAYLOAD_BYTES})"
-                    )
                     continue
 
                 # Auto-detect protocol if not determined yet
@@ -427,8 +437,11 @@ class StdioMcpClient:
                     # The current 'line' is the first header line
                     header_lines = [line.rstrip("\r\n")]
                     while True:
-                        next_line_bytes = self.process.stdout.readline()
+                        next_line_bytes = self.process.stdout.readline(MAX_MCP_STDERR_LINE_BYTES + 1)
                         if not next_line_bytes:
+                            return
+                        if len(next_line_bytes) > MAX_MCP_STDERR_LINE_BYTES:
+                            self.stderr_lines.append("MCP header line exceeded limit")
                             return
                         try:
                             next_line = next_line_bytes.decode("utf-8")
@@ -486,6 +499,11 @@ class StdioMcpClient:
             raise RuntimeError(f'MCP server "{self.server_name}" is not running.')
         
         payload_bytes = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        if len(payload_bytes) > MAX_MCP_PAYLOAD_BYTES:
+            raise RuntimeError(
+                f"MCP request payload too large: {len(payload_bytes)} bytes "
+                f"(limit {MAX_MCP_PAYLOAD_BYTES})"
+            )
         
         if self.protocol == "newline-json":
             self.process.stdin.write(payload_bytes + b"\n")

@@ -99,6 +99,9 @@ def test_provider_smoke_returns_redacted_success_evidence(monkeypatch, tmp_path:
                 {
                     "readiness_report": {"status": "ready"},
                     "repair_plan": [{"step": "keep-fallback-gate"}],
+                    "runtime_trace": {
+                        "profile": {"selected_route": "standard-single"}
+                    },
                 }
             ),
             encoding="utf-8",
@@ -118,6 +121,8 @@ def test_provider_smoke_returns_redacted_success_evidence(monkeypatch, tmp_path:
     assert result["live_provider_claim"] is True
     assert result["attempted"] is True
     assert result["provider"] == "openai"
+    assert result["execution_profile"] == "standard"
+    assert result["selected_route"] == "standard-single"
     assert result["trace"] == {
         "available": True,
         "readiness_status": "ready",
@@ -125,6 +130,41 @@ def test_provider_smoke_returns_redacted_success_evidence(monkeypatch, tmp_path:
     }
     assert result["timeout_seconds"] == 7
     assert "sk-test-secret" not in rendered
+
+
+def test_provider_smoke_can_explicitly_exercise_ultra_profile(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv(provider_smoke.LIVE_PROVIDER_SMOKE_ENV, "1")
+    _patch_valid_runtime(monkeypatch)
+    observed: dict[str, object] = {}
+
+    def fake_run(command, **kwargs):
+        observed["command"] = command
+        observed["profile_env"] = kwargs["env"]["MINI_CODE_EXECUTION_PROFILE"]
+        trace_path = Path(kwargs["env"]["MINI_CODE_HEADLESS_MESSAGES_OUT"])
+        trace_path.write_text(
+            json.dumps(
+                {
+                    "runtime_trace": {
+                        "profile": {"selected_route": "deep-single"}
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(command, 0, stdout="OK\n", stderr="")
+
+    result = provider_smoke.run_provider_smoke(
+        tmp_path,
+        run_live=True,
+        runner=fake_run,
+        profile="ultra",
+    )
+
+    assert result["status"] == "passed"
+    assert result["execution_profile"] == "ultra"
+    assert result["selected_route"] == "deep-single"
+    assert observed["profile_env"] == "ultra"
+    assert observed["command"][-3:] == ["--profile", "ultra", provider_smoke.SMOKE_PROMPT]
 
 
 def test_provider_smoke_reaches_local_openai_compatible_server(

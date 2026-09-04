@@ -22,6 +22,7 @@ from typing import Any
 
 from minicode.config import MINI_CODE_DIR
 from minicode.logging_config import log_session_event
+from minicode.path_safety import is_unsafe_stored_path
 from minicode.session_contract import (
     atomic_write_json,
     build_session_record,
@@ -112,6 +113,7 @@ class SessionData:
     extension_manifests: list[dict[str, Any]] = field(default_factory=list)
     readiness_report: dict[str, Any] = field(default_factory=dict)
     memory_continuity: dict[str, Any] = field(default_factory=dict)
+    runtime_runs: list[dict[str, Any]] = field(default_factory=list)
     checkpoints: list[FileCheckpoint] = field(default_factory=list)
     metadata: SessionMetadata = field(default=None)
     
@@ -119,6 +121,7 @@ class SessionData:
     _last_saved_msg_count: int = field(default=0, repr=False)
     _last_saved_transcript_count: int = field(default=0, repr=False)
     _last_saved_checkpoint_count: int = field(default=0, repr=False)
+    _last_saved_runtime_count: int = field(default=0, repr=False)
     _delta_save_count: int = field(default=0, repr=False)
     _last_full_save_hash: str = field(default="", repr=False)
 
@@ -224,6 +227,7 @@ class SessionData:
             len(self.messages) != self._last_saved_msg_count
             or len(self.transcript_entries) != self._last_saved_transcript_count
             or len(self.checkpoints) != self._last_saved_checkpoint_count
+            or len(self.runtime_runs) != self._last_saved_runtime_count
         )
     
     def _compute_content_hash(self) -> str:
@@ -422,7 +426,11 @@ def _session_index_file() -> Path:
 def _load_session_index() -> dict[str, SessionMetadata]:
     """Load the session index (lightweight metadata for all sessions)."""
     index_path = _session_index_file()
-    if index_path.is_symlink() or not index_path.is_file():
+    if is_unsafe_stored_path(
+        index_path,
+        boundary=MINI_CODE_DIR,
+        reject_hardlinks=True,
+    ) or not index_path.is_file():
         return {}
     try:
         raw = index_path.read_text(encoding="utf-8")
@@ -489,7 +497,7 @@ def _save_delta(session: SessionData) -> None:
     the entire session on every autosave.
     """
     delta_dir = _session_delta_dir(session.session_id)
-    if delta_dir.is_symlink() or (
+    if is_unsafe_stored_path(delta_dir, boundary=SESSIONS_DIR) or (
         delta_dir.exists() and not delta_dir.is_dir()
     ):
         raise OSError("invalid session delta directory")
@@ -499,8 +507,9 @@ def _save_delta(session: SessionData) -> None:
     new_messages = session.messages[session._last_saved_msg_count:]
     new_transcripts = session.transcript_entries[session._last_saved_transcript_count:]
     new_checkpoints = session.checkpoints[session._last_saved_checkpoint_count:]
+    new_runtime_runs = session.runtime_runs[session._last_saved_runtime_count:]
     
-    if not new_messages and not new_transcripts and not new_checkpoints:
+    if not new_messages and not new_transcripts and not new_checkpoints and not new_runtime_runs:
         return
     
     # Create delta entry
@@ -516,6 +525,9 @@ def _save_delta(session: SessionData) -> None:
     if new_checkpoints:
         delta_data["checkpoint_offset"] = session._last_saved_checkpoint_count
         delta_data["checkpoints"] = [_serialize_checkpoint(cp) for cp in new_checkpoints]
+    if new_runtime_runs:
+        delta_data["runtime_offset"] = session._last_saved_runtime_count
+        delta_data["runtime_runs"] = new_runtime_runs
     
     # Write delta file with sequential numbering
     delta_num = session._delta_save_count
@@ -526,6 +538,7 @@ def _save_delta(session: SessionData) -> None:
     session._last_saved_msg_count = len(session.messages)
     session._last_saved_transcript_count = len(session.transcript_entries)
     session._last_saved_checkpoint_count = len(session.checkpoints)
+    session._last_saved_runtime_count = len(session.runtime_runs)
     session._delta_save_count += 1
 
 
@@ -536,12 +549,16 @@ def _consolidate_deltas(session: SessionData) -> None:
     and to ensure the full session file stays consistent.
     """
     delta_dir = _session_delta_dir(session.session_id)
-    if delta_dir.is_symlink() or not delta_dir.is_dir():
+    if is_unsafe_stored_path(delta_dir, boundary=SESSIONS_DIR) or not delta_dir.is_dir():
         return
     
     # Deltas are already applied during load_session, so just clean up
     for delta_file in sorted(delta_dir.glob("delta_*.json")):
-        if delta_file.is_symlink() or not delta_file.is_file():
+        if is_unsafe_stored_path(
+            delta_file,
+            boundary=SESSIONS_DIR,
+            reject_hardlinks=True,
+        ) or not delta_file.is_file():
             continue
         try:
             delta_file.unlink()
@@ -667,12 +684,18 @@ def _load_session_from_bundle(session_id: str) -> SessionData | None:
         turns=[turn.to_dict() for turn in record.turns],
         history=record.input_history,
         memory_continuity=record.memory_continuity,
+        runtime_runs=(
+            list(extensions.get("runtime_runs", []))
+            if isinstance(extensions.get("runtime_runs", []), list)
+            else []
+        ),
         checkpoints=checkpoints,
         metadata=metadata,
     )
     session._last_saved_msg_count = len(session.messages)
     session._last_saved_transcript_count = len(session.transcript_entries)
     session._last_saved_checkpoint_count = len(session.checkpoints)
+    session._last_saved_runtime_count = len(session.runtime_runs)
     session._last_full_save_hash = session._compute_content_hash()
     return session
 
@@ -726,6 +749,7 @@ def save_session(session: SessionData, force_full: bool = False) -> None:
             "extension_manifests": session.extension_manifests,
             "readiness_report": session.readiness_report,
             "memory_continuity": session.memory_continuity,
+            "runtime_runs": session.runtime_runs,
             "checkpoints": [_serialize_checkpoint(cp) for cp in session.checkpoints],
             "metadata": {
                 "session_id": session.metadata.session_id,
@@ -758,6 +782,7 @@ def save_session(session: SessionData, force_full: bool = False) -> None:
         session._last_saved_msg_count = len(session.messages)
         session._last_saved_transcript_count = len(session.transcript_entries)
         session._last_saved_checkpoint_count = len(session.checkpoints)
+        session._last_saved_runtime_count = len(session.runtime_runs)
         session._last_full_save_hash = session._compute_content_hash()
         
         # Consolidate and clean up delta files
@@ -796,7 +821,11 @@ def load_session(session_id: str) -> SessionData | None:
         return None
     log_session_event("load", details=f"id={session_id}")
     session_path = _session_file(session_id)
-    if session_path.is_symlink() or not session_path.is_file():
+    if is_unsafe_stored_path(
+        session_path,
+        boundary=SESSIONS_DIR,
+        reject_hardlinks=True,
+    ) or not session_path.is_file():
         return _load_session_from_bundle(session_id)
 
     try:
@@ -832,6 +861,7 @@ def load_session(session_id: str) -> SessionData | None:
             extension_manifests=data.get("extension_manifests", []),
             readiness_report=data.get("readiness_report", {}),
             memory_continuity=data.get("memory_continuity", {}),
+            runtime_runs=data.get("runtime_runs", []),
             checkpoints=[
                 _deserialize_checkpoint(item)
                 for item in data.get("checkpoints", [])
@@ -842,10 +872,14 @@ def load_session(session_id: str) -> SessionData | None:
         
         # Apply any pending deltas
         delta_dir = _session_delta_dir(session_id)
-        if not delta_dir.is_symlink() and delta_dir.is_dir():
+        if not is_unsafe_stored_path(delta_dir, boundary=SESSIONS_DIR) and delta_dir.is_dir():
             delta_files = sorted(delta_dir.glob("delta_*.json"))
             for delta_path in delta_files:
-                if delta_path.is_symlink() or not delta_path.is_file():
+                if is_unsafe_stored_path(
+                    delta_path,
+                    boundary=SESSIONS_DIR,
+                    reject_hardlinks=True,
+                ) or not delta_path.is_file():
                     continue
                 try:
                     delta_raw = delta_path.read_text(encoding="utf-8")
@@ -883,6 +917,14 @@ def load_session(session_id: str) -> SessionData | None:
                         elif c_offset + len(parsed) > len(session.checkpoints):
                             overlap = len(session.checkpoints) - c_offset
                             session.checkpoints.extend(parsed[overlap:])
+                    if "runtime_runs" in delta:
+                        r_offset = delta.get("runtime_offset", len(session.runtime_runs))
+                        incoming = [item for item in delta["runtime_runs"] if isinstance(item, dict)]
+                        if r_offset >= len(session.runtime_runs):
+                            session.runtime_runs.extend(incoming)
+                        elif r_offset + len(incoming) > len(session.runtime_runs):
+                            overlap = len(session.runtime_runs) - r_offset
+                            session.runtime_runs.extend(incoming[overlap:])
                     
                     session._delta_save_count += 1
                 except (json.JSONDecodeError, KeyError, TypeError):
@@ -893,6 +935,7 @@ def load_session(session_id: str) -> SessionData | None:
         session._last_saved_msg_count = len(session.messages)
         session._last_saved_transcript_count = len(session.transcript_entries)
         session._last_saved_checkpoint_count = len(session.checkpoints)
+        session._last_saved_runtime_count = len(session.runtime_runs)
         session._last_full_save_hash = session._compute_content_hash()
         # Deltas can append messages after the base turn list was written.
         # Re-derive the compact turn view so Rust readers and Python resume
@@ -935,7 +978,19 @@ def delete_session(session_id: str) -> bool:
         return False
     session_path = _session_file(session_id)
     bundle_path = SESSIONS_DIR / session_id
-    bundle_exists = bundle_path.is_dir() and not bundle_path.is_symlink()
+    delta_dir = _session_delta_dir(session_id)
+    guarded_paths = (session_path, bundle_path, delta_dir)
+    if any(
+        path.exists()
+        and is_unsafe_stored_path(
+            path,
+            boundary=SESSIONS_DIR,
+            reject_hardlinks=path.is_file(),
+        )
+        for path in guarded_paths
+    ):
+        return False
+    bundle_exists = bundle_path.is_dir()
     if not session_path.exists() and not bundle_exists:
         return False
 
@@ -943,7 +998,6 @@ def delete_session(session_id: str) -> bool:
         if session_path.exists():
             session_path.unlink()
         # Clean up orphaned delta files
-        delta_dir = _session_delta_dir(session_id)
         if delta_dir.exists():
             import shutil
             shutil.rmtree(delta_dir, ignore_errors=True)

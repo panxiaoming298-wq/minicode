@@ -137,7 +137,11 @@ class PipelineResult:
 
 
 class StepPlanner:
-    """Plans execution steps from a TaskObject."""
+    """Legacy TaskObject-to-pipeline adapter.
+
+    Runtime V2 product plans are compiled by ``unified_runtime.PlanCompiler``.
+    This adapter is retained for offline controller compatibility only.
+    """
 
     def plan(self, task: TaskObject) -> PipelinePlan:
         plan_id = f"plan-{task.id}"
@@ -332,7 +336,9 @@ class StepExecutor:
 
 
 class PipelineEngine:
-    """Orchestrates full pipeline execution."""
+    """Legacy/offline controller harness, not a product Runtime or Scheduler."""
+
+    runtime_authority = False
 
     def __init__(self):
         self.planner = StepPlanner()

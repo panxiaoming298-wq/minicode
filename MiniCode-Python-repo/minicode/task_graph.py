@@ -23,6 +23,31 @@ from pathlib import Path
 from typing import Any
 
 from minicode.config import MINI_CODE_DIR
+from minicode.runtime_protocol import PlanVersion
+
+
+@dataclass(frozen=True, slots=True)
+class CanonicalPlanGraph:
+    """Runtime V2's single canonical PlanGraph schema facade.
+
+    RuntimeReducer owns the mutable current-version pointer and node states;
+    this object only exposes the immutable current PlanVersion.  The legacy
+    ``TaskGraph`` below remains a Worker-local compatibility tracker and is not
+    a product scheduler or a second Runtime plan.
+    """
+
+    current: PlanVersion
+
+    @property
+    def run_id(self) -> str:
+        return self.current.run_id
+
+    @property
+    def version(self) -> int:
+        return self.current.plan_version
+
+    def to_dict(self) -> dict[str, Any]:
+        return self.current.to_dict()
 
 
 # ---------------------------------------------------------------------------
@@ -77,7 +102,12 @@ class TaskSlot:
 
 @dataclass
 class TaskGraph:
-    """Persistent task graph with execution slots."""
+    """Legacy Worker-local task progress facade.
+
+    Product execution authority lives in ``CanonicalPlanGraph`` plus
+    ``RuntimeReducer``/``TaskScheduler``.  This compatibility class is retained
+    for existing AgentLoop turn telemetry and old persisted task graphs only.
+    """
 
     name: str = ""
     definitions: dict[str, TaskDefinition] = field(default_factory=dict)

@@ -1,73 +1,53 @@
-"""Task tool — spawn a sub-agent to handle complex multi-step tasks.
+"""Governed ``task`` tool.
 
-Inspired by Claude Code's Task tool which launches an independent agent loop
-with its own context window, isolated from the main conversation.
-
-The sub-agent runs a full agent loop (model + tools) with:
-- Its own system prompt tailored to the task type
-- A filtered tool set based on the agent type
-- A turn limit to prevent runaway execution
-- Result summarized back into the parent context
+This module is intentionally unable to import or start AgentLoop.  It emits a
+DelegationRequest to the active Runtime; only TaskScheduler may create the
+registered child Node/Attempt.
 """
+
 from __future__ import annotations
 
-import time
-from typing import TypedDict, cast
+import hashlib
+import json
+from typing import TypedDict
 
-from minicode.agent_loop import run_agent_turn
+from minicode.runtime_protocol import (
+    AgentResultStatus,
+    BudgetEnvelope,
+    DelegationRequest,
+    ToolEffect,
+)
 from minicode.tooling import ToolDefinition, ToolResult
-from minicode.types import ChatMessage
 
-
-# ---------------------------------------------------------------------------
-# Agent type definitions
-# ---------------------------------------------------------------------------
 
 class AgentDef(TypedDict):
     name: str
     description: str
-    system_prompt: str
-    allowed_tools: set[str] | None
+    allowed_effects: tuple[ToolEffect, ...]
     max_turns: int
 
 
 AGENT_TYPES: dict[str, AgentDef] = {
     "explore": {
         "name": "Explore",
-        "description": "Fast, read-only agent for codebase exploration and search",
-        "system_prompt": (
-            "You are an exploration agent. Your job is to quickly search and "
-            "understand codebases. You should be fast and focused on finding "
-            "relevant files and understanding structure. "
-            "You can only use read-only tools. "
-            "When done, provide a concise summary of your findings."
-        ),
-        "allowed_tools": {"read_file", "list_files", "grep_files", "file_tree", "find_symbols", "find_references", "get_ast_info"},
+        "description": "Fast, read-only codebase exploration",
+        "allowed_effects": (ToolEffect.READ_ONLY,),
         "max_turns": 5,
     },
     "plan": {
         "name": "Plan",
-        "description": "Thorough agent for gathering context and understanding code",
-        "system_prompt": (
-            "You are a planning agent. Your job is to thoroughly understand "
-            "the codebase and task before acting. Read multiple files, trace "
-            "code paths, and build a complete mental model. "
-            "You can only use read-only tools. "
-            "When done, provide a detailed analysis with actionable recommendations."
-        ),
-        "allowed_tools": {"read_file", "list_files", "grep_files", "file_tree", "find_symbols", "find_references", "get_ast_info", "code_review"},
+        "description": "Thorough, read-only analysis",
+        "allowed_effects": (ToolEffect.READ_ONLY,),
         "max_turns": 8,
     },
     "general": {
         "name": "General",
-        "description": "Full-featured agent for complex multi-step tasks",
-        "system_prompt": (
-            "You are a general-purpose coding agent. You can read, write, "
-            "and modify code. Follow best practices and explain your changes. "
-            "Break complex tasks into smaller steps. "
-            "When done, provide a summary of what you did and any important findings."
+        "description": "Serial compatibility Worker with workspace tools",
+        "allowed_effects": (
+            ToolEffect.READ_ONLY,
+            ToolEffect.WORKSPACE_WRITE,
+            ToolEffect.PRIVILEGED,
         ),
-        "allowed_tools": None,  # None = all tools allowed
         "max_turns": 15,
     },
 }
@@ -77,177 +57,105 @@ def _validate(input_data: dict) -> dict:
     description = input_data.get("description")
     if not isinstance(description, str) or not description.strip():
         raise ValueError("description is required")
-    
     agent_type = input_data.get("agent_type", "general")
     if agent_type not in AGENT_TYPES:
-        valid = ", ".join(AGENT_TYPES.keys())
+        valid = ", ".join(AGENT_TYPES)
         raise ValueError(f"agent_type must be one of: {valid}. Got: {agent_type}")
-    
+    prompt = input_data.get("prompt", description)
+    if not isinstance(prompt, str) or not prompt.strip():
+        raise ValueError("prompt must be a non-empty string")
     return {
         "description": description.strip(),
         "agent_type": agent_type,
-        "prompt": input_data.get("prompt", description.strip()),
+        "prompt": prompt.strip(),
     }
 
 
 def _run(input_data: dict, context) -> ToolResult:
-    """Execute a sub-agent task.
-    
-    This creates an isolated agent loop with:
-    - Its own message history (system + task prompt)
-    - Filtered tools based on agent type
-    - A turn limit
-    - Result summarized for the parent context
-    """
-    from minicode.model_registry import create_model_adapter
-    from minicode.permissions import PermissionManager
-    from minicode.tools import create_default_tool_registry
-    
+    runtime_context = getattr(context, "runtime_context", None)
+    gateway = getattr(runtime_context, "delegation_gateway", runtime_context)
+    if gateway is None or not callable(getattr(gateway, "submit", None)):
+        return ToolResult(
+            ok=False,
+            output=(
+                "DelegationUnavailable: task requires an active unified Runtime "
+                "and cannot start an unregistered AgentLoop"
+            ),
+        )
+
+    parent_node_id = str(getattr(context, "node_id", "") or "")
+    if not parent_node_id:
+        return ToolResult(ok=False, output="DelegationUnavailable: parent node identity is missing")
     agent_type = input_data["agent_type"]
-    agent_def = AGENT_TYPES[agent_type]
-    task_prompt = input_data["prompt"]
-    
-    # Try to get the model from context or fall back to creating one
-    # The context object carries runtime info needed for the model adapter
-    runtime = None
-    model = None
-    
-    # Attempt to extract runtime from the ToolContext
-    if hasattr(context, '_runtime') and context._runtime:
-        runtime = context._runtime
-    
-    if not runtime:
-        # Try loading from config
-        try:
-            from minicode.config import load_runtime_config
-            runtime = load_runtime_config(context.cwd)
-        except Exception:
-            pass
-    
-    if not runtime:
-        return ToolResult(
-            ok=False,
-            output="Cannot run sub-agent: no model configuration available. Set ANTHROPIC_API_KEY and ANTHROPIC_MODEL."
-        )
-    
-    # Create a filtered tool registry for this agent type
-    full_tools = create_default_tool_registry(context.cwd, runtime=runtime)
-    allowed = agent_def["allowed_tools"]
-    
-    if allowed is not None:
-        filtered_tools = [t for t in full_tools.list() if t.name in allowed]
-        from minicode.tooling import ToolRegistry
-        tools = ToolRegistry(filtered_tools)
-    else:
-        tools = full_tools
-    
-    # Create model adapter
-    model = create_model_adapter(
-        model=runtime.get("model", ""),
-        tools=tools,
-        runtime=runtime,
+    definition = AGENT_TYPES[agent_type]
+    depth = 2 if parent_node_id.startswith("delegated-") else 1
+    canonical = json.dumps(
+        {
+            "run_id": gateway.run_id,
+            "parent_node_id": parent_node_id,
+            "agent_type": agent_type,
+            "objective": input_data["prompt"],
+        },
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
     )
-    
-    # Create isolated permissions (no prompts — auto-deny writes for read-only agents)
-    if agent_def["allowed_tools"] is not None:
-        # Read-only agent: create permission manager that denies writes
-        sub_permissions = PermissionManager(context.cwd, prompt=None)
-    else:
-        # General agent: inherit parent's permission prompt handler
-        sub_permissions = PermissionManager(context.cwd, prompt=getattr(context.permissions, 'prompt', None))
-    
-    # Build isolated message list
-    sub_messages: list[ChatMessage] = cast(list[ChatMessage], [
-        {
-            "role": "system",
-            "content": agent_def["system_prompt"]
-            + f"\n\nCurrent cwd: {context.cwd}"
-            + "\n\nIMPORTANT: When you have completed your task, end with <final> and provide your findings."
-            + " Do not ask the user questions — work autonomously with the tools available."
-            + " Be concise and focused."
-        },
-        {
-            "role": "user",
-            "content": task_prompt,
-        },
-    ])
-    
-    # Run the sub-agent loop
-    start_time = time.time()
-    max_turns = agent_def["max_turns"]
-    
+    request = DelegationRequest(
+        run_id=gateway.run_id,
+        parent_node_id=parent_node_id,
+        requested_role=agent_type,
+        objective=input_data["prompt"],
+        context_requirements=("task-contract", "repository", "parent-result-context"),
+        allowed_tool_capabilities=definition["allowed_effects"],
+        proposed_budget=BudgetEnvelope(
+            max_agents=1,
+            max_active_workers=1,
+            max_delegation_depth=max(0, gateway.max_delegation_depth - depth + 1),
+            max_tokens=definition["max_turns"] * 2_000,
+            retry_budget=0,
+        ),
+        delegation_depth=depth,
+        idempotency_key=hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+    )
     try:
-        result_messages = run_agent_turn(
-            model=model,
-            tools=tools,
-            messages=sub_messages,
-            cwd=context.cwd,
-            permissions=sub_permissions,
-            max_steps=max_turns,
-        )
-    except Exception as e:
+        result = gateway.submit(request)
+    except Exception as error:
         return ToolResult(
             ok=False,
-            output=f"Sub-agent ({agent_def['name']}) failed: {type(e).__name__}: {e}"
+            output=f"DelegationFailed: {type(error).__name__}: {error}",
         )
-    
-    elapsed = time.time() - start_time
-    
-    # Extract the final assistant message as the result
-    final_message = None
-    for msg in reversed(result_messages):
-        if msg.get("role") == "assistant" and msg.get("content", "").strip():
-            final_message = msg["content"]
-            break
-    
-    if not final_message:
-        final_message = "(sub-agent completed without a final message)"
-    
-    # Build summary
-    tool_calls_count = sum(1 for m in result_messages if m.get("role") == "assistant_tool_call")
-    user_messages_count = sum(1 for m in result_messages if m.get("role") == "user")
-    
-    header = (
-        f"[Sub-agent {agent_def['name']} completed]\n"
-        f"  Type: {agent_type}\n"
-        f"  Turns: {user_messages_count} (tool calls: {tool_calls_count})\n"
-        f"  Duration: {elapsed:.1f}s\n"
-        f"  Max turns: {max_turns}\n"
-    )
-    
-    # Truncate very long results
-    result_text = final_message
-    MAX_RESULT_LEN = 8000
-    if len(result_text) > MAX_RESULT_LEN:
-        result_text = result_text[:MAX_RESULT_LEN] + f"\n\n... (truncated, {len(final_message)} chars total)"
-    
-    return ToolResult(ok=True, output=header + "\n" + result_text)
+
+    artifact_lines = [
+        f"  Artifact: {ref.artifact_id} sha256={ref.content_hash} size={ref.size} key={ref.store_key}"
+        for ref in result.artifact_refs
+    ]
+    header = [
+        f"[Governed Worker {definition['name']} {result.status.value}]",
+        f"  Run: {result.run_id}",
+        f"  Node: {result.node_id}",
+        f"  Attempt: {result.attempt_id}",
+        f"  Plan version: {result.plan_version}",
+        *artifact_lines,
+    ]
+    body = "\n".join(header) + "\n\n" + result.output_summary
+    return ToolResult(ok=result.status is AgentResultStatus.SUCCEEDED, output=body)
 
 
 task_tool = ToolDefinition(
     name="task",
     description=(
-        "Launch a sub-agent to handle a complex task autonomously. "
-        "The sub-agent runs in its own isolated context with a turn limit. "
-        "Use 'explore' for fast read-only codebase exploration, "
-        "'plan' for thorough analysis, or 'general' for full-featured multi-step work. "
-        "The sub-agent's final result is returned to you."
+        "Submit a governed child Worker through the active Runtime Scheduler. "
+        "Use 'explore' or 'plan' for read-only work; 'general' is a serial "
+        "Standard compatibility Worker. Ultra V1 disables dynamic delegation."
     ),
     input_schema={
         "type": "object",
         "properties": {
-            "description": {
-                "type": "string",
-                "description": "Short 3-5 word description of the task",
-            },
-            "prompt": {
-                "type": "string",
-                "description": "Full task description for the sub-agent. If not provided, uses 'description'.",
-            },
+            "description": {"type": "string", "description": "Short task label"},
+            "prompt": {"type": "string", "description": "Full child objective"},
             "agent_type": {
                 "type": "string",
                 "enum": ["explore", "plan", "general"],
-                "description": "Type of sub-agent: 'explore' (fast, read-only), 'plan' (thorough, read-only), 'general' (full tools, default)",
             },
         },
         "required": ["description"],

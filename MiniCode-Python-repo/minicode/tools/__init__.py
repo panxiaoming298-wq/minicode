@@ -8,6 +8,7 @@ from minicode.tools.ask_user import ask_user_tool
 from minicode.tools.batch_ops import batch_copy_tool, batch_move_tool, batch_delete_tool
 from minicode.tools.code_nav import find_symbols_tool, find_references_tool, get_ast_info_tool
 from minicode.tools.code_review import code_review_tool
+from minicode.tools.current_time import current_time_tool
 from minicode.tools.diff_viewer import diff_viewer_tool
 from minicode.tools.edit_file import edit_file_tool
 from minicode.tools.file_tree import file_tree_tool
@@ -46,6 +47,8 @@ _CORE_TOOLS = [
     # Web tools
     web_fetch_tool,
     web_search_tool,
+    # Local clock (avoids unnecessary network or shell calls for date/time)
+    current_time_tool,
     # Task management
     todo_write_tool,
     # Sub-agent
@@ -84,7 +87,7 @@ def _load_utility_wrapper_tools():
         gzip_compress_tool, gzip_decompress_tool, tar_create_tool, tar_extract_tool,
         zip_create_tool, zip_extract_tool,
     )
-    from minicode.tools.crypto_utils import current_time_tool, timestamp_tool, hash_tool, hmac_tool
+    from minicode.tools.crypto_utils import timestamp_tool, hash_tool, hmac_tool
     from minicode.tools.csv_utils import csv_parse_tool, csv_create_tool
     from minicode.tools.encoding_utils import base64_encode_tool, base64_decode_tool, url_encode_tool, url_decode_tool
     from minicode.tools.http_utils import http_request_tool
@@ -105,7 +108,6 @@ def _load_utility_wrapper_tools():
         base64_decode_tool,
         url_encode_tool,
         url_decode_tool,
-        current_time_tool,
         timestamp_tool,
         hash_tool,
         hmac_tool,

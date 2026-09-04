@@ -5,6 +5,15 @@ import urllib.error
 import urllib.request
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
+from minicode.tools.web_fetch import _LimitedRedirectHandler, _build_safe_opener, _is_safe_url
+
+
+MAX_HTTP_RESPONSE_BYTES = 1_000_000
+
+
+def _read_bounded(response, limit: int = MAX_HTTP_RESPONSE_BYTES) -> tuple[bytes, bool]:
+    payload = response.read(limit + 1)
+    return payload[:limit], len(payload) > limit
 
 
 def _validate_http_request(input_data: dict) -> dict:
@@ -31,6 +40,9 @@ def _run_http_request(input_data: dict, context: ToolContext) -> ToolResult:
     headers = input_data.get("headers", {})
     body = input_data.get("body", "")
     timeout = input_data.get("timeout", 30)
+    safe, reason = _is_safe_url(url)
+    if not safe:
+        return ToolResult(ok=False, output=f"Security error: {reason}")
     
     # Build request
     req = urllib.request.Request(url, method=method)
@@ -44,10 +56,12 @@ def _run_http_request(input_data: dict, context: ToolContext) -> ToolResult:
         req.data = body.encode("utf-8")
     
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as response:
+        opener = _build_safe_opener(_LimitedRedirectHandler())
+        with opener.open(req, timeout=timeout) as response:
             status = response.status
             response_headers = dict(response.headers)
-            content = response.read().decode("utf-8")
+            payload, truncated = _read_bounded(response)
+            content = payload.decode("utf-8", errors="replace")
             
             # Try to parse JSON
             try:
@@ -63,11 +77,15 @@ def _run_http_request(input_data: dict, context: ToolContext) -> ToolResult:
                 "Body:",
                 content[:10000],  # Limit output
             ]
+            if truncated:
+                lines.append(f"\n... [response truncated at {MAX_HTTP_RESPONSE_BYTES} bytes]")
             
             return ToolResult(ok=True, output="\n".join(lines))
     
     except urllib.error.HTTPError as e:
-        return ToolResult(ok=False, output=f"HTTP {e.code}: {e.reason}\n{e.read().decode('utf-8', errors='replace')}")
+        payload, truncated = _read_bounded(e)
+        suffix = f"\n... [response truncated at {MAX_HTTP_RESPONSE_BYTES} bytes]" if truncated else ""
+        return ToolResult(ok=False, output=f"HTTP {e.code}: {e.reason}\n{payload.decode('utf-8', errors='replace')}{suffix}")
     except urllib.error.URLError as e:
         return ToolResult(ok=False, output=f"Network error: {e.reason}")
     except Exception as e:

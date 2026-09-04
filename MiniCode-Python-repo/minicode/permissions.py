@@ -235,6 +235,43 @@ class PermissionManager:
     def end_turn(self) -> None:
         self.begin_turn()
 
+    def fork_for_operation(self, operation_digest: str) -> "PermissionManager":
+        """Create a one-operation adapter for a governed Runtime tool call.
+
+        Persistent allow/deny policy and explicit turn-wide edit grants remain
+        available.  One-shot/session caches deliberately do not cross the
+        boundary, so a prior ``allow_once`` can never authorize changed
+        arguments, cwd, environment scope, or repository base.
+        """
+
+        def bound_prompt(request: dict[str, Any]) -> dict[str, Any]:
+            if self.prompt is None:
+                return {"decision": "deny_once"}
+            payload = dict(request)
+            details = [str(item) for item in payload.get("details", [])]
+            details.append(f"operation digest: {operation_digest}")
+            payload["details"] = details
+            payload["operationDigest"] = operation_digest
+            return self.prompt(payload)
+
+        scoped = PermissionManager(
+            self.workspace_root,
+            prompt=bound_prompt if self.prompt is not None else None,
+            auto_mode=self.auto_checker.mode,
+        )
+        for attribute in (
+            "allowed_directory_prefixes",
+            "denied_directory_prefixes",
+            "allowed_command_patterns",
+            "denied_command_patterns",
+            "allowed_edit_patterns",
+            "denied_edit_patterns",
+        ):
+            setattr(scoped, attribute, set(getattr(self, attribute)))
+        scoped.turn_allowed_edits = set(self.turn_allowed_edits)
+        scoped.turn_allow_all_edits = self.turn_allow_all_edits
+        return scoped
+
     def get_summary(self) -> list[str]:
         summary = [f"cwd: {self.workspace_root}"]
         summary.append(
@@ -337,7 +374,8 @@ class PermissionManager:
         force_prompt_reason: str | None = None,
     ) -> None:
         self.ensure_path_access(command_cwd, "command_cwd")
-        reason = force_prompt_reason or _classify_dangerous_command(command, args)
+        dangerous_reason = _classify_dangerous_command(command, args)
+        reason = force_prompt_reason or dangerous_reason
         if not reason:
             # Not classified as dangerous — check auto mode for auto-approve
             _sig = _format_command_signature(command, args)
@@ -350,8 +388,8 @@ class PermissionManager:
                 get_mode_state().record_decision("block")
                 log_permission_check("run_command", _sig, granted=False)
                 raise RuntimeError(f"Command blocked by auto mode: {assessment.reason}")
-            # action == "prompt" — fall through to normal approval flow
-            return
+            # action == "prompt" — continue through the normal approval flow.
+            reason = assessment.reason or "Current permission mode requires approval"
         signature = _format_command_signature(command, args)
         if signature in self.session_denied_commands or signature in self.denied_command_patterns:
             raise RuntimeError(f"Command denied: {signature}")
@@ -376,7 +414,7 @@ class PermissionManager:
         # Distinguish forced prompts (external trigger) from dangerous commands
         summary = (
             "mini-code wants to run a dangerous command"
-            if not force_prompt_reason
+            if dangerous_reason and not force_prompt_reason
             else "mini-code wants approval for this command"
         )
         result = self.prompt(

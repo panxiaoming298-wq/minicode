@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import os
+import locale
 import re
+import signal
 import shlex
 import shutil
 import subprocess
 import sys
+import threading
+import time
 from typing import Sequence
 
 from minicode.background_tasks import register_background_shell_task
@@ -25,14 +29,26 @@ def _command_output_encoding() -> str:
     Override with the ``MINICODE_COMMAND_ENCODING`` env var — e.g. set it to
     ``cp936`` (or ``gbk``) on Chinese Windows where legacy commands (``dir``,
     ``systeminfo``, batch scripts printing CJK) output in the OEM code page and
-    would otherwise garble under the UTF-8 default. Defaults to ``utf-8``
-    (modern tools, and Python with ``PYTHONUTF8=1``).
+    would otherwise garble under the wrong code page. Without an override,
+    decoding tries UTF-8 first and then the local Windows ANSI/OEM encodings.
 
     A single global encoding can't be perfect for mixed output (a ``cp936``
     override will garble UTF-8 tools, and vice-versa) — pick whichever matches
     the majority of the commands you run.
     """
-    return os.environ.get("MINICODE_COMMAND_ENCODING", "utf-8").strip() or "utf-8"
+    return os.environ.get("MINICODE_COMMAND_ENCODING", "").strip() or "utf-8"
+
+
+def _automatic_command_encodings() -> list[str]:
+    candidates = ["utf-8-sig"]
+    preferred = locale.getpreferredencoding(False)
+    if preferred:
+        candidates.append(preferred)
+    if os.name == "nt":
+        # Windows PowerShell 5 and legacy console programs commonly emit the
+        # active ANSI/OEM code page when stdout is redirected.
+        candidates.extend(["mbcs", "oem", "cp936"])
+    return list(dict.fromkeys(candidate.casefold() for candidate in candidates if candidate))
 
 
 def _decode_command_output(data: bytes | str | None) -> str:
@@ -46,11 +62,47 @@ def _decode_command_output(data: bytes | str | None) -> str:
         return ""
     if isinstance(data, str):
         return data
-    encoding = _command_output_encoding()
+    configured = os.environ.get("MINICODE_COMMAND_ENCODING", "").strip()
+    if configured:
+        try:
+            return data.decode(configured)
+        except (UnicodeDecodeError, LookupError):
+            return data.decode("utf-8", errors="replace")
+
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        try:
+            return data.decode("utf-16")
+        except UnicodeDecodeError:
+            pass
+    for encoding in _automatic_command_encodings():
+        try:
+            return data.decode(encoding)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _kill_process_tree(process: subprocess.Popen) -> None:
+    """Best-effort termination of the governed command and its descendants."""
+    if process.poll() is not None:
+        return
     try:
-        return data.decode(encoding)
-    except (UnicodeDecodeError, LookupError):
-        return data.decode("utf-8", errors="replace")
+        if os.name == "nt":
+            subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                capture_output=True,
+                check=False,
+                timeout=5,
+            )
+        else:
+            killpg = getattr(os, "killpg")
+            getpgid = getattr(os, "getpgid")
+            killpg(getpgid(process.pid), getattr(signal, "SIGKILL", 9))
+    except (OSError, subprocess.SubprocessError):
+        try:
+            process.kill()
+        except OSError:
+            pass
 
 
 
@@ -72,6 +124,123 @@ def _truncate_large_output(output: str, max_chars: int = MAX_OUTPUT_CHARS) -> st
     tail = "\n".join(lines[-tail_lines:])
     omitted = total_lines - head_lines - tail_lines
     return f"{head}\n\n... [{omitted} lines omitted, output was {len(output):,} chars] ...\n\n{tail}"
+
+
+class _BoundedByteBuffer:
+    """Drain arbitrary output while retaining only a bounded head and tail."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = max(1, limit)
+        self.head_limit = max(1, int(self.limit * 0.6))
+        self.tail_limit = max(0, self.limit - self.head_limit)
+        self.head = bytearray()
+        self.tail = bytearray()
+        self.total = 0
+
+    def append(self, payload: bytes) -> None:
+        if not payload:
+            return
+        self.total += len(payload)
+        head_remaining = self.head_limit - len(self.head)
+        if head_remaining > 0:
+            self.head.extend(payload[:head_remaining])
+            payload = payload[head_remaining:]
+        if payload and self.tail_limit:
+            self.tail.extend(payload)
+            if len(self.tail) > self.tail_limit:
+                del self.tail[: len(self.tail) - self.tail_limit]
+
+    def value(self) -> bytes:
+        if self.total <= self.limit:
+            return bytes(self.head + self.tail)
+        omitted = self.total - len(self.head) - len(self.tail)
+        marker = f"\n... [{omitted} output bytes omitted] ...\n".encode("utf-8")
+        return bytes(self.head) + marker + bytes(self.tail)
+
+
+def _drain_process_stream(stream, sink: _BoundedByteBuffer) -> None:
+    try:
+        while True:
+            chunk = stream.read(8192)
+            if not chunk:
+                return
+            sink.append(chunk)
+    except (OSError, ValueError):
+        return
+
+
+def _bounded_process_output(stdout: _BoundedByteBuffer, stderr: _BoundedByteBuffer) -> str:
+    return "\n".join(
+        part
+        for part in (
+            _decode_command_output(stdout.value()).strip(),
+            _decode_command_output(stderr.value()).strip(),
+        )
+        if part
+    ).strip()
+
+
+def _run_with_bounded_pipes(
+    command: str,
+    args: list[str],
+    *,
+    cwd: str,
+    timeout: float,
+    cancellation_event,
+) -> ToolResult:
+    popen_kwargs: dict = {}
+    if os.name == "nt":
+        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    else:
+        popen_kwargs["start_new_session"] = True
+    process = subprocess.Popen(  # noqa: S603
+        [command, *args],
+        cwd=cwd,
+        env=os.environ.copy(),
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        **popen_kwargs,
+    )
+    assert process.stdout is not None and process.stderr is not None
+    stdout = _BoundedByteBuffer(MAX_OUTPUT_CHARS // 2)
+    stderr = _BoundedByteBuffer(MAX_OUTPUT_CHARS // 2)
+    readers = [
+        threading.Thread(target=_drain_process_stream, args=(process.stdout, stdout), daemon=True),
+        threading.Thread(target=_drain_process_stream, args=(process.stderr, stderr), daemon=True),
+    ]
+    for reader in readers:
+        reader.start()
+
+    started_at = time.monotonic()
+    canceled = False
+    timed_out = False
+    while process.poll() is None:
+        if cancellation_event is not None and cancellation_event.is_set():
+            canceled = True
+            _kill_process_tree(process)
+            break
+        if time.monotonic() - started_at >= timeout:
+            timed_out = True
+            _kill_process_tree(process)
+            break
+        time.sleep(0.02)
+
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=5)
+    for reader in readers:
+        reader.join(timeout=5)
+
+    output = _bounded_process_output(stdout, stderr)
+    partial = f"\nPartial output:\n{output}" if output else ""
+    if canceled:
+        return ToolResult(ok=False, output=f"Command canceled by parent Runtime (process killed).{partial}")
+    if timed_out:
+        return ToolResult(ok=False, output=f"Command timed out after {timeout} seconds (process killed).{partial}")
+    return ToolResult(ok=process.returncode == 0, output=output)
 
 # Read-only commands that never need permission prompts.
 # Includes both Unix and Windows equivalents.
@@ -300,6 +469,14 @@ def _run(input_data: dict, context) -> ToolResult:
             context.permissions.ensure_command(command, args, effective_cwd)
 
     if use_shell and background_shell:
+        if getattr(context, "cancellation_event", None) is not None:
+            return ToolResult(
+                ok=False,
+                output=(
+                    "PolicyDenied: governed Runtime Workers may not detach background "
+                    "commands because cancellation ownership would be lost"
+                ),
+            )
         # Platform-specific process isolation flags
         popen_kwargs: dict = {}
         if os.name == "nt":
@@ -355,23 +532,36 @@ def _run(input_data: dict, context) -> ToolResult:
             )
             
             os.close(slave_fd)
-            output_bytes = bytearray()
+            output_bytes = _BoundedByteBuffer(MAX_OUTPUT_CHARS)
             timed_out = False
+            canceled = False
+            started_at = time.monotonic()
             
             try:
                 while True:
-                    r, _, _ = select.select([master_fd], [], [], effective_timeout)
-                    if not r:
-                        timed_out = True
-                        process.kill()
+                    if (
+                        getattr(context, "cancellation_event", None) is not None
+                        and context.cancellation_event.is_set()
+                    ):
+                        canceled = True
+                        _kill_process_tree(process)
                         process.wait()
                         break
+                    remaining = effective_timeout - (time.monotonic() - started_at)
+                    if remaining <= 0:
+                        timed_out = True
+                        _kill_process_tree(process)
+                        process.wait()
+                        break
+                    r, _, _ = select.select([master_fd], [], [], min(0.1, remaining))
+                    if not r:
+                        continue
                     
                     try:
                         data = os.read(master_fd, 4096)
                         if not data:
                             break
-                        output_bytes.extend(data)
+                        output_bytes.append(data)
                     except OSError:
                         # EIO happens when child closes the PTY or exits
                         break
@@ -380,7 +570,7 @@ def _run(input_data: dict, context) -> ToolResult:
                 if not timed_out:
                     process.wait()
                 
-            output_str = _decode_command_output(bytes(output_bytes)).strip()
+            output_str = _decode_command_output(output_bytes.value()).strip()
             output_str = output_str.replace("\r\n", "\n")
             output_str = _truncate_large_output(output_str)
             
@@ -389,40 +579,27 @@ def _run(input_data: dict, context) -> ToolResult:
                     ok=False,
                     output=f"Command timed out after {effective_timeout} seconds (process killed).\nPartial output:\n{output_str}",
                 )
+            if canceled:
+                return ToolResult(
+                    ok=False,
+                    output=f"Command canceled by parent Runtime (process killed).\nPartial output:\n{output_str}",
+                )
             return ToolResult(ok=process.returncode == 0, output=output_str)
             
         except ImportError:
             pass  # Fallback to subprocess on systems without pty
 
+    effective_timeout = input_data.get("timeout") or COMMAND_TIMEOUT
     try:
-        effective_timeout = input_data.get("timeout") or COMMAND_TIMEOUT
-        completed = subprocess.run(  # noqa: S603
-            [command, *args],
+        return _run_with_bounded_pipes(
+            command,
+            args,
             cwd=effective_cwd,
-            env=os.environ.copy(),
-            capture_output=True,
-            check=False,
             timeout=effective_timeout,
+            cancellation_event=getattr(context, "cancellation_event", None),
         )
-        output = "\n".join(
-            part for part in [
-                _decode_command_output(completed.stdout).strip(),
-                _decode_command_output(completed.stderr).strip(),
-            ] if part
-        ).strip()
-        output = _truncate_large_output(output)
-        return ToolResult(ok=completed.returncode == 0, output=output)
-    except subprocess.TimeoutExpired as e:
-        # Capture partial output from timeout
-        partial_stdout = _decode_command_output(e.stdout).strip()
-        partial_stderr = _decode_command_output(e.stderr).strip()
-        partial = "\n".join(part for part in [partial_stdout, partial_stderr] if part)
-        if partial:
-            partial = f"\nPartial output:\n{_truncate_large_output(partial)}"
-        return ToolResult(
-            ok=False,
-            output=f"Command timed out after {effective_timeout} seconds (process killed).{partial}",
-        )
+    except OSError as error:
+        return ToolResult(ok=False, output=f"Command execution failed: {error}")
 
 
 run_command_tool = ToolDefinition(

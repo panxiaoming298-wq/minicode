@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import os
+import re
 import subprocess
 import sys
-import re
-import os
 from pathlib import Path
 from typing import Any
+
 from minicode.tooling import ToolDefinition, ToolResult
 from minicode.workspace import resolve_tool_path
 
@@ -16,7 +17,7 @@ from minicode.workspace import resolve_tool_path
 
 def _discover_test_files(path: Path, pattern: str = "test_*.py") -> list[Path]:
     """Discover test files matching pattern."""
-    test_files = []
+    test_files: list[Path] = []
     
     if path.is_file():
         if path.name.startswith("test_") or path.name.endswith("_test.py"):
@@ -39,7 +40,7 @@ def _discover_test_files(path: Path, pattern: str = "test_*.py") -> list[Path]:
 
 def _parse_pytest_output(output: str) -> dict[str, Any]:
     """Parse pytest output into structured format."""
-    results = {
+    results: dict[str, Any] = {
         "passed": 0,
         "failed": 0,
         "errors": 0,
@@ -101,7 +102,7 @@ def _parse_pytest_output(output: str) -> dict[str, Any]:
 
 def _parse_unittest_output(output: str) -> dict[str, Any]:
     """Parse unittest output into structured format."""
-    results = {
+    results: dict[str, Any] = {
         "passed": 0,
         "failed": 0,
         "errors": 0,
@@ -185,15 +186,6 @@ def _run(input_data: dict, context) -> ToolResult:
                    f"Expected files matching: test_*.py or *_test.py",
         )
     
-    # Apply pattern filter if provided
-    if pattern:
-        test_files = [f for f in test_files if pattern in f.name]
-        if not test_files:
-            return ToolResult(
-                ok=False,
-                output=f"No test files match pattern: {pattern}",
-            )
-    
     # Determine framework
     if framework == "auto":
         # Check if pytest is available
@@ -211,8 +203,9 @@ def _run(input_data: dict, context) -> ToolResult:
     if framework == "pytest":
         cmd = [sys.executable, "-m", "pytest"]
         
-        # Add test files
-        cmd.extend([str(f) for f in test_files[:10]])  # Limit to 10 files
+        # Pass the target once so pytest performs its complete discovery without
+        # hitting platform command-line limits for large suites.
+        cmd.append(str(target))
         
         if verbose:
             cmd.append("-v")
@@ -225,12 +218,14 @@ def _run(input_data: dict, context) -> ToolResult:
             cmd.extend(["-k", pattern])
         
     else:  # unittest
-        cmd = [sys.executable, "-m", "unittest", "discover"]
-        cmd.extend(["-s", str(target)])
-        
-        if pattern:
-            cmd.extend(["-p", f"*{pattern}*"])
+        if target.is_file():
+            cmd = [sys.executable, "-m", "unittest", str(target)]
         else:
+            cmd = [sys.executable, "-m", "unittest", "discover", "-s", str(target)]
+        
+        if pattern and target.is_dir():
+            cmd.extend(["-p", f"*{pattern}*"])
+        elif target.is_dir():
             cmd.extend(["-p", "test_*.py"])
         
         if verbose:

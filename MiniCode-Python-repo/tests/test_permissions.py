@@ -104,6 +104,41 @@ def test_dangerous_command_deny_always_persists(tmp_path: Path) -> None:
         reloaded.ensure_command("git", ["clean", "-fd"], str(workspace))
 
 
+def test_default_mode_prompts_for_unclassified_command(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    prompts: list[dict] = []
+
+    def deny(request: dict) -> dict:
+        prompts.append(request)
+        return {"decision": "deny_once"}
+
+    manager = PermissionManager(
+        str(workspace),
+        prompt=deny,
+        auto_mode=permissions_module.PermissionMode.DEFAULT,
+    )
+
+    with pytest.raises(RuntimeError, match="Command denied"):
+        manager.ensure_command("echo", ["permission-check"], str(workspace))
+
+    assert len(prompts) == 1
+    assert "Default mode: approval required" in prompts[0]["details"][-1]
+
+
+def test_default_mode_fails_closed_without_prompt_for_unclassified_command(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    manager = PermissionManager(
+        str(workspace),
+        prompt=None,
+        auto_mode=permissions_module.PermissionMode.DEFAULT,
+    )
+
+    with pytest.raises(RuntimeError, match="requires approval"):
+        manager.ensure_command("echo", ["permission-check"], str(workspace))
+
+
 def test_edit_deny_with_feedback_surfaces_guidance(tmp_path: Path) -> None:
     target = tmp_path / "demo.py"
     target.write_text("old\n", encoding="utf-8")

@@ -1,9 +1,51 @@
 from __future__ import annotations
 
 import shutil
+import uuid
+from pathlib import Path
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
 from minicode.workspace import resolve_tool_path
+
+
+def _remove_copy_path(path: Path) -> None:
+    if path.is_symlink() or path.is_file():
+        path.unlink()
+    elif path.exists():
+        shutil.rmtree(path)
+
+
+def _copy_to_staging(source: Path, staging: Path) -> None:
+    if source.is_dir():
+        shutil.copytree(source, staging)
+    else:
+        shutil.copy2(source, staging)
+
+
+def _replace_with_staged_copy(source: Path, destination: Path) -> None:
+    """Copy fully before replacing destination, restoring it if the swap fails."""
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    staging = destination.parent / f".{destination.name}.copy-{token}"
+    backup = destination.parent / f".{destination.name}.backup-{token}"
+    moved_existing = False
+    try:
+        _copy_to_staging(source, staging)
+        if destination.exists() or destination.is_symlink():
+            destination.replace(backup)
+            moved_existing = True
+        try:
+            staging.replace(destination)
+        except Exception:
+            if moved_existing and backup.exists() and not destination.exists():
+                backup.replace(destination)
+            raise
+        if moved_existing:
+            _remove_copy_path(backup)
+    finally:
+        if staging.exists() or staging.is_symlink():
+            _remove_copy_path(staging)
 
 
 def _validate_batch_copy(input_data: dict) -> dict:
@@ -29,15 +71,9 @@ def _run_batch_copy(input_data: dict, context: ToolContext) -> ToolResult:
         return ToolResult(ok=False, output=f"Source not found: {input_data['source']}")
     
     try:
-        if source.is_dir():
-            if destination.exists():
-                shutil.rmtree(destination)
-            shutil.copytree(source, destination)
-            return ToolResult(ok=True, output=f"Copied directory to {input_data['destination']}")
-        else:
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(source, destination)
-            return ToolResult(ok=True, output=f"Copied file to {input_data['destination']}")
+        _replace_with_staged_copy(source, destination)
+        kind = "directory" if source.is_dir() else "file"
+        return ToolResult(ok=True, output=f"Copied {kind} to {input_data['destination']}")
     except Exception as e:
         return ToolResult(ok=False, output=f"Copy failed: {e}")
 

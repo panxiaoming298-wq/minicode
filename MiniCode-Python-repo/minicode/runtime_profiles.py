@@ -6,7 +6,12 @@ from typing import Any, Mapping
 
 @dataclass(frozen=True, slots=True)
 class RuntimeProfile:
-    """Named runtime profile for one agent turn."""
+    """Legacy-compatible reasoning profile for one Worker turn.
+
+    This is intentionally independent from Runtime V2's public
+    ``ExecutionProfile`` (Standard/Ultra).  It controls AgentLoop depth only;
+    it never chooses Worker topology or verification strength.
+    """
 
     name: str
     max_steps: int | None

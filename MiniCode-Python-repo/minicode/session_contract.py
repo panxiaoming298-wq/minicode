@@ -21,7 +21,10 @@ import os
 from pathlib import Path
 import tempfile
 import time
-from typing import Any, Mapping
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+from minicode.path_safety import is_unsafe_stored_path
 
 
 SESSION_FORMAT_VERSION = "minicode-rust-compatible-v1"
@@ -267,7 +270,7 @@ class SessionRecord:
 
 
 def derive_turn_records(
-    messages: list[Mapping[str, Any]],
+    messages: Sequence[Mapping[str, Any]],
     *,
     created_at: float = 0.0,
 ) -> list[TurnRecord]:
@@ -368,6 +371,7 @@ def build_session_record(session: Any) -> SessionRecord:
     session_id = _text(getattr(session, "session_id", ""))
     created_at = float(getattr(session, "created_at", 0.0) or 0.0)
     updated_at = float(getattr(session, "updated_at", created_at) or created_at)
+    python_metadata = getattr(session, "metadata", None)
     messages = [
         dict(message)
         for message in (getattr(session, "messages", []) or [])
@@ -409,18 +413,30 @@ def build_session_record(session: Any) -> SessionRecord:
             }
             for checkpoint in checkpoints
         ]
+    runtime_runs = getattr(session, "runtime_runs", []) or []
+    if isinstance(runtime_runs, list):
+        extensions["runtime_runs"] = deepcopy(
+            [item for item in runtime_runs if isinstance(item, Mapping)]
+        )
 
     metadata = RustSessionMetadata(
         session_id=session_id,
         created_at=_iso_timestamp(created_at),
-        ended_at=_optional_text(getattr(session, "ended_at", None)),
+        ended_at=_optional_text(
+            getattr(python_metadata, "ended_at", None)
+            or getattr(session, "ended_at", None)
+        ),
         duration_seconds=max(0, int(updated_at - created_at)),
         model=model,
         cwd=_text(getattr(session, "workspace", "")),
         turn_count=len(turns),
         user_input_count=user_input_count,
         tool_call_count=tool_call_count,
-        status=_text(getattr(session, "status", "active") or "active"),
+        status=_text(
+            getattr(python_metadata, "status", None)
+            or getattr(session, "status", "active")
+            or "active"
+        ),
         updated_at=_iso_timestamp(updated_at),
     )
     history = getattr(session, "history", []) or []
@@ -441,7 +457,10 @@ def write_session_bundle(session: Any, sessions_dir: Path) -> SessionRecord:
     record = build_session_record(session)
     if not _valid_session_id(record.session_id):
         raise ValueError("invalid session id for bundle path")
-    bundle_dir = Path(sessions_dir) / record.session_id
+    sessions_root = Path(sessions_dir)
+    bundle_dir = sessions_root / record.session_id
+    if is_unsafe_stored_path(bundle_dir, boundary=sessions_root):
+        raise OSError("invalid session bundle directory")
     metadata = record.metadata.to_dict()
     metadata.update(
         {
@@ -484,12 +503,23 @@ def read_session_bundle(session_id: str, sessions_dir: Path) -> SessionRecord | 
 
     if not _valid_session_id(session_id):
         return None
-    bundle_dir = Path(sessions_dir) / session_id
-    if bundle_dir.is_symlink() or not bundle_dir.is_dir():
+    sessions_root = Path(sessions_dir)
+    bundle_dir = sessions_root / session_id
+    if is_unsafe_stored_path(bundle_dir, boundary=sessions_root) or not bundle_dir.is_dir():
         return None
-    metadata = _read_json(bundle_dir / "metadata.json")
-    conversation = _read_json(bundle_dir / "conversation.json")
-    history = _read_json(bundle_dir / "input_history.json") or {}
+    metadata_path = bundle_dir / "metadata.json"
+    conversation_path = bundle_dir / "conversation.json"
+    history_path = bundle_dir / "input_history.json"
+    for path in (metadata_path, conversation_path, history_path):
+        if path.exists() and is_unsafe_stored_path(
+            path,
+            boundary=sessions_root,
+            reject_hardlinks=True,
+        ):
+            return None
+    metadata = _read_json(metadata_path)
+    conversation = _read_json(conversation_path)
+    history = _read_json(history_path) or {}
     if metadata is None or conversation is None:
         return None
 
@@ -537,12 +567,19 @@ def delete_session_bundle(session_id: str, sessions_dir: Path) -> bool:
 
     if not _valid_session_id(session_id):
         return False
-    bundle_dir = Path(sessions_dir) / session_id
-    if bundle_dir.is_symlink() or not bundle_dir.is_dir():
+    sessions_root = Path(sessions_dir)
+    bundle_dir = sessions_root / session_id
+    if is_unsafe_stored_path(bundle_dir, boundary=sessions_root) or not bundle_dir.is_dir():
         return False
     removed = False
     for path in bundle_dir.iterdir():
-        if path.is_file() or path.is_symlink():
+        if is_unsafe_stored_path(
+            path,
+            boundary=sessions_root,
+            reject_hardlinks=path.is_file(),
+        ):
+            return False
+        if path.is_file():
             path.unlink()
             removed = True
     try:

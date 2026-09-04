@@ -98,13 +98,27 @@ def test_oversized_payload_is_rejected_without_leaking_pending_request(
 ) -> None:
     client = _client(tmp_path, mode="oversized_payload")
     client.start()
-    monkeypatch.setattr(mcp_module, "MAX_MCP_PAYLOAD_BYTES", 64)
+    monkeypatch.setattr(mcp_module, "MAX_MCP_PAYLOAD_BYTES", 192)
 
     with pytest.raises(RuntimeError, match="request timed out"):
         client.request("tools/call", {"name": "echo", "arguments": {"text": "hi"}}, timeout_seconds=0.1)
 
     assert client._pending == {}
     assert any("payload too large" in line for line in client.stderr_lines)
+    client.close()
+
+
+def test_oversized_request_is_rejected_before_write(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _client(tmp_path)
+    client.start()
+    monkeypatch.setattr(mcp_module, "MAX_MCP_PAYLOAD_BYTES", 64)
+
+    with pytest.raises(RuntimeError, match="request payload too large"):
+        client.send({"jsonrpc": "2.0", "method": "x", "params": {"text": "x" * 128}})
+
     client.close()
 
 

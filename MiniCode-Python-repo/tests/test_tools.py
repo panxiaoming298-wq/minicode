@@ -6,8 +6,11 @@ import zipfile
 
 import pytest
 
+import minicode.tools.batch_ops as batch_ops_module
+import minicode.tools.git as git_module
 import minicode.tools.test_runner as test_runner_module
 import minicode.tools.run_command as run_command_module
+import minicode.tools.todo_write as todo_write_module
 from minicode.permissions import PermissionManager
 from minicode.session import create_new_session, load_session
 from minicode.tools.batch_ops import batch_copy_tool, batch_move_tool
@@ -120,6 +123,19 @@ def test_run_command_tool_supports_echo_on_current_platform(tmp_path: Path) -> N
     assert "hello" in result.output.lower()
 
 
+def test_command_output_auto_detects_legacy_chinese_windows_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("MINICODE_COMMAND_ENCODING", raising=False)
+    monkeypatch.setattr(
+        run_command_module,
+        "_automatic_command_encodings",
+        lambda: ["utf-8-sig", "cp936"],
+    )
+
+    assert run_command_module._decode_command_output("星期三".encode("cp936")) == "星期三"
+
+
 @pytest.mark.parametrize(
     "command",
     [
@@ -162,6 +178,7 @@ def test_default_tool_registry_is_core_first(tmp_path: Path) -> None:
 
     assert "read_file" in names
     assert "run_command" in names
+    assert "current_time" in names
     assert "base64_encode" not in names
     assert "csv_parse" not in names
 
@@ -228,6 +245,33 @@ def test_batch_file_operations_reject_paths_that_escape_workspace(tmp_path: Path
     assert not (workspace / input_data["destination"]).exists()
 
 
+def test_batch_copy_preserves_existing_destination_when_copy_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "source"
+    destination = tmp_path / "destination"
+    source.mkdir()
+    destination.mkdir()
+    (source / "new.txt").write_text("new", encoding="utf-8")
+    (destination / "old.txt").write_text("old", encoding="utf-8")
+
+    monkeypatch.setattr(
+        batch_ops_module.shutil,
+        "copytree",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("copy failed")),
+    )
+
+    result = batch_copy_tool.run(
+        {"source": "source", "destination": "destination"},
+        ToolContext(cwd=str(tmp_path), permissions=None),
+    )
+
+    assert result.ok is False
+    assert (destination / "old.txt").read_text(encoding="utf-8") == "old"
+    assert not list(tmp_path.glob(".destination.copy-*"))
+
+
 def test_file_tree_rejects_paths_that_escape_workspace(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     outside = tmp_path / "outside"
@@ -267,6 +311,116 @@ def test_test_runner_rejects_paths_that_escape_workspace(
 
     assert result.ok is False
     assert "escapes workspace" in result.output
+
+
+def test_test_runner_passes_complete_target_to_pytest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    for index in range(12):
+        (tests_dir / f"test_{index}.py").write_text(
+            f"def test_{index}():\n    assert True\n",
+            encoding="utf-8",
+        )
+    calls: list[list[str]] = []
+
+    def fake_run(command, **_kwargs):
+        calls.append(command)
+        return test_runner_module.subprocess.CompletedProcess(command, 0, "12 passed", "")
+
+    monkeypatch.setattr(test_runner_module.subprocess, "run", fake_run)
+
+    result = test_runner_tool.run(
+        {
+            "path": "tests",
+            "framework": "pytest",
+            "verbose": False,
+            "coverage": False,
+            "pattern": None,
+            "timeout": 10,
+        },
+        ToolContext(cwd=str(tmp_path), permissions=None),
+    )
+
+    assert result.ok is True
+    assert len(calls) == 1
+    assert calls[0][:3] == [sys.executable, "-m", "pytest"]
+    assert calls[0][3:] == [str(tests_dir)]
+
+
+def test_git_status_counts_porcelain_xy_columns(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        git_module,
+        "_run_git",
+        lambda *_args, **_kwargs: (
+            0,
+            "M  staged.py\n M unstaged.py\nMM both.py\n?? new.py",
+            "",
+        ),
+    )
+
+    result = git_module._run_status(".")
+
+    assert result.ok is True
+    assert "Staged changes: 2" in result.output
+    assert "Unstaged changes: 2" in result.output
+    assert "Untracked files: 1" in result.output
+
+
+def test_git_commit_fails_when_staged_diff_cannot_be_inspected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        git_module,
+        "_run_git",
+        lambda *_args, **_kwargs: (2, "", "not a repository"),
+    )
+
+    result = git_module._run_commit(".", "message")
+
+    assert result.ok is False
+    assert "Unable to inspect staged changes" in result.output
+
+
+def test_run_command_retains_bounded_head_and_tail_for_large_output(tmp_path: Path) -> None:
+    payload_size = run_command_module.MAX_OUTPUT_CHARS + 50_000
+    result = run_command_tool.run(
+        {
+            "command": sys.executable,
+            "args": ["-c", f"import sys; sys.stdout.write('A' * {payload_size})"],
+            "timeout": 10,
+        },
+        ToolContext(cwd=str(tmp_path), permissions=None),
+    )
+
+    assert result.ok is True
+    assert "output bytes omitted" in result.output
+    assert len(result.output) <= run_command_module.MAX_OUTPUT_CHARS + 100
+
+
+def test_todo_write_preserves_identity_when_updating_status() -> None:
+    todo_write_module._tasks = []
+    todo_write_module._task_id_counter = 0
+    try:
+        first = todo_write_module.todo_write_tool.run(
+            {"todos": [{"content": "fix bug", "status": "pending"}]},
+            None,
+        )
+        original = dict(todo_write_module._tasks[0])
+        second = todo_write_module.todo_write_tool.run(
+            {"todos": [{"content": "fix bug", "status": "completed"}]},
+            None,
+        )
+
+        assert first.ok is True
+        assert second.ok is True
+        assert todo_write_module._tasks[0]["id"] == original["id"]
+        assert todo_write_module._tasks[0]["created_at"] == original["created_at"]
+        assert todo_write_module._tasks[0]["status"] == "completed"
+        assert todo_write_module._tasks[0]["completed_at"] is not None
+    finally:
+        todo_write_module._tasks = []
+        todo_write_module._task_id_counter = 0
 
 
 @pytest.mark.parametrize(
