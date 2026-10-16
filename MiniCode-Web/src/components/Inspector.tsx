@@ -12,8 +12,9 @@ import {
   MessageSquare,
   PanelRight,
   RefreshCw,
+  TerminalSquare,
 } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 
 import { api } from "../api/client";
 import { traceForRun } from "../lib/runtime";
@@ -28,6 +29,9 @@ import { WorktreeChanges } from "./WorktreeChanges";
 import { FilePreview } from "./FilePreview";
 import { RuleFilePreview } from "./RuleFilePreview";
 import "./InspectorFiles.css";
+import "./TerminalPanel.css";
+
+const TerminalPanel = lazy(() => import("./TerminalPanel"));
 import type {
   CapabilitySnapshot,
   ContextStatsView,
@@ -43,7 +47,7 @@ import type {
   WorkspaceStatus,
 } from "../types";
 
-export type InspectorTab = "files" | "changes" | "run" | "capabilities" | "context" | "agents";
+export type InspectorTab = "files" | "changes" | "terminal" | "run" | "capabilities" | "context" | "agents";
 export interface InspectorTabRequest {
   tab: InspectorTab;
   section?: ComposerInspectorSection;
@@ -210,6 +214,18 @@ export function Inspector({
   onOpenSettings,
 }: InspectorProps) {
   const [tab, setTab] = useState<InspectorTab>("files");
+  const terminalIdentity = `${sessionId || "draft"}:${workspace}:${worktreeId || "local"}`;
+  const [terminalOwner, setTerminalOwner] = useState<string | null>(null);
+  const handledTerminalRequest = useRef<InspectorTabRequest | null>(null);
+  const terminalStarted = terminalOwner === terminalIdentity;
+
+  useEffect(() => setTerminalOwner(null), [terminalIdentity]);
+  useEffect(() => {
+    if (open && tabRequest?.tab === "terminal" && workspace && handledTerminalRequest.current !== tabRequest) {
+      handledTerminalRequest.current = tabRequest;
+      setTerminalOwner(terminalIdentity);
+    }
+  }, [open, tabRequest, terminalIdentity, workspace]);
   const inspectorRef = useRef<HTMLElement>(null);
   const handledSectionRequest = useRef<InspectorTabRequest | null>(null);
   const [changeView, setChangeView] = useState<ChangeView>("diff");
@@ -406,6 +422,9 @@ export function Inspector({
         <div className="inspector-tabs" role="tablist" aria-label="检查器分类">
           <button role="tab" aria-selected={tab === "files"} onClick={() => setTab("files")}>文件</button>
           <button role="tab" aria-selected={tab === "changes"} onClick={() => setTab("changes")}>变更</button>
+          <button role="tab" aria-selected={tab === "terminal"} onClick={() => {
+            setTab("terminal"); if (workspace) setTerminalOwner(terminalIdentity);
+          }}>终端</button>
           <button role="tab" aria-selected={tab === "run"} onClick={() => setTab("run")}>运行</button>
           <button role="tab" aria-selected={tab === "agents"} onClick={() => setTab("agents")}>子代理</button>
           <button role="tab" aria-selected={tab === "capabilities"} onClick={() => setTab("capabilities")}>能力</button>
@@ -533,6 +552,14 @@ export function Inspector({
       {open && tab === "run" && (
         <RuntimePanel sessionId={sessionId} runStatus={runStatus} runId={runId} execution={execution} events={events} inspect={sessionInspect} />
       )}
+
+      {terminalStarted && <Suspense fallback={tab === "terminal" ? <div className="inspector-empty" role="status">正在加载终端…</div> : null}>
+        <TerminalPanel key={terminalIdentity} workspace={workspace} sessionId={sessionId} visible={open && tab === "terminal"} />
+      </Suspense>}
+      {tab === "terminal" && !terminalStarted && <div className="inspector-empty terminal-start">
+        <TerminalSquare size={24} /><p>{workspace ? "在当前项目目录打开 PowerShell。" : "打开项目后，即可使用终端。"}</p>
+        {workspace && <button type="button" onClick={() => setTerminalOwner(terminalIdentity)}>打开终端</button>}
+      </div>}
 
       {tab === "capabilities" && (
         <CapabilityPanel

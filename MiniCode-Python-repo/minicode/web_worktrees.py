@@ -309,4 +309,7 @@ def install_worktree_routes(app, operations):
     def cleanup(identity: str, requestId: str = Query(min_length=1, max_length=128), discard: bool = False):
         with operations.manager._lock:
             operations.require_idle(identity)
+            terminals = getattr(app.state, "terminal_manager", None)
+            if terminals is not None and terminals.workspace_active(operations.service.get(identity)["workspace"]):
+                raise HTTPException(409, "工作树中有终端正在运行，请先结束终端再删除。")
         return {"operation": operations.submit("cleanup", requestId, {"worktreeId": identity, "discard": discard})}

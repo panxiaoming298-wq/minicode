@@ -13,6 +13,25 @@ import threading
 
 
 class WindowsJob:
+    @classmethod
+    def for_pid(cls, pid: int) -> WindowsJob:
+        """Own a process created by a native pseudoconsole instead of Popen."""
+        from ctypes import wintypes as w
+        from types import SimpleNamespace
+
+        api = ctypes.WinDLL("kernel32", use_last_error=True)
+        api.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+        api.OpenProcess.restype = w.HANDLE
+        api.CloseHandle.argtypes = [w.HANDLE]
+        api.CloseHandle.restype = w.BOOL
+        handle = api.OpenProcess(0x0101, False, pid)  # SET_QUOTA | TERMINATE
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            return cls(SimpleNamespace(_handle=handle))
+        finally:
+            api.CloseHandle(handle)
+
     def __init__(self, process: subprocess.Popen):
         from ctypes import wintypes as w
 

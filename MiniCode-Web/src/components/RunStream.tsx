@@ -109,6 +109,7 @@ interface RunStreamProps {
   summaryLoading: boolean;
   onOpenChanges: () => void;
   onOpenRuntime: () => void;
+  onOpenTerminal?: () => void;
   onOpenFile?: (reference: FileReference) => void;
   recoveryAction?: RunRecoveryAction;
   onOpenSettings?: () => void;
@@ -914,6 +915,7 @@ export function RunStream({
   summaryLoading,
   onOpenChanges,
   onOpenRuntime,
+  onOpenTerminal,
   onOpenFile,
   recoveryAction,
   onOpenSettings,
@@ -1138,7 +1140,7 @@ export function RunStream({
     <FileNavigationContext.Provider value={{ workspace, onOpenFile }}>
     <QuestionSession run={run} items={items} onAnswer={onAnswerQuestion} activeId={activeQuestionId} openRequest={questionOpenRequest}>
     <main className="run-column conversation-surface" id="main-content">
-      <header className={`run-header ${!hasSession ? "is-new-task" : ""} ${session?.sessionId ? "has-chat-actions" : ""}`}>
+      <header className={`run-header ${!hasSession ? "is-new-task" : ""} ${session?.sessionId ? "has-chat-actions" : ""} ${session?.sessionId || onOpenTerminal ? "has-header-actions" : ""}`}>
         <button className="icon-button mobile-only" onClick={onOpenRail} aria-label="打开任务栏">
           <Menu size={19} />
         </button>
@@ -1152,7 +1154,12 @@ export function RunStream({
           {session?.worktreeId && <span className="worktree-badge" title={session.workspace}>Worktree · {session.worktreeStatus === "ready" ? "就绪" : `不可运行（${session.worktreeStatus || "缺失"}）`}</span>}
           {session?.forkedFromId && <span className="worktree-badge">分叉自 <button onClick={() => onSourceSession?.(session.forkedFromId!)}>{session.forkedFromId.slice(0, 12)}</button></span>}
         </div>
-        {session?.sessionId && <ChatActions key={session.sessionId} sessionId={session.sessionId} active={active} loading={loading} />}
+        {(session?.sessionId || onOpenTerminal) && <span className="run-header-actions">
+          {session?.sessionId && <ChatActions key={session.sessionId} sessionId={session.sessionId} active={active} loading={loading} />}
+          {onOpenTerminal && <button type="button" className="icon-button terminal-toggle" onClick={onOpenTerminal} aria-label="打开项目终端" title="打开项目终端">
+            <TerminalSquare size={18} />
+          </button>}
+        </span>}
       </header>
       {!loading && active && <RunProgress run={run} status={runStatus} execution={execution} profile={actualProfile}
         items={items} reconnecting={reconnecting} onCompose={onCompose} onJump={jumpToItem} />}

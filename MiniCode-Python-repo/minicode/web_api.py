@@ -3055,6 +3055,8 @@ def create_app(
     from minicode.config import MINI_CODE_DIR
     from minicode.development_services import DevelopmentServiceManager
     from minicode.web_services import install_service_routes
+    from minicode.web_terminal import TerminalManager, install_terminal_routes
+    terminals = TerminalManager()
     workspace_default = Path(default_workspace or Path.cwd()).expanduser().resolve()
     manager = RunManager(web_runtime=web_runtime, web_ultra_runtime=web_ultra_runtime,
         web_agent_teams=web_agent_teams, web_agent_team_writes=web_agent_team_writes, web_primary_role=web_primary_role,
@@ -3065,8 +3067,11 @@ def create_app(
         try:
             yield
         finally:
+            await asyncio.to_thread(terminals.close)
             manager.services.close()
     app = FastAPI(title="MiniCode Local Web", version="0.1.0", lifespan=lifespan)
+    app.state.terminal_manager = terminals
+    install_terminal_routes(app, terminals)
     install_service_routes(app, manager)
     from minicode.web_worktrees import WorktreeOperations, install_worktree_routes
     operations = WorktreeOperations(manager)
@@ -3503,6 +3508,7 @@ def create_app(
             if session is None:
                 raise HTTPException(status_code=404, detail="会话不存在。")
             entry = _session_trash().archive(asdict(session.metadata))
+            terminals.close_session(session_id)
             return {"archived": True, "session": _trash_session_payload(entry)}
 
     @app.post("/api/sessions/{session_id}/restore")
@@ -3817,6 +3823,7 @@ def create_app(
             if trash.get(session_id) is None:
                 raise HTTPException(status_code=409, detail="请先将对话移入回收站，再确认永久删除。")
             current = load_session(session_id)
+            terminals.close_session(session_id)
             if current is not None:
                 operations.prepare_session_deletion(current, worktree)
             trash.begin_delete(session_id)

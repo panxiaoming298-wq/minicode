@@ -56,6 +56,12 @@ import type { ImageAttachment } from "../lib/attachments";
 
 const API_ROOT = (import.meta.env.VITE_MINICODE_API_URL || "").replace(/\/$/, "");
 
+export function terminalSocketUrl(ticket: string): string {
+  const url = new URL(`${API_ROOT}/api/terminal/${encodeURIComponent(ticket)}`, window.location.href);
+  url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+  return url.href;
+}
+
 export class ApiError extends Error {
   constructor(message: string, readonly status: number) {
     super(message);
@@ -150,6 +156,11 @@ export function parseSubmittedCandidates(value: unknown): { candidates: Submitte
 }
 
 export const api = {
+  createTerminalTicket(input: { workspace: string; sessionId?: string | null; cols: number; rows: number }, signal: AbortSignal) {
+    return request<{ ticket: string; workspace: string; shell: string }>("/api/terminal/tickets", {
+      method: "POST", body: JSON.stringify(input), signal,
+    });
+  },
   imageStatus: (sessionId: string, imageIds: string[], signal?: AbortSignal) => request<{ images: ImageStatus[] }>(
     `/api/sessions/${encodeURIComponent(sessionId)}/images/status?${new URLSearchParams({ image_ids: imageIds.join(",") })}`, { signal }),
   imageStorage: (signal?: AbortSignal) => request<ImageStorageView>("/api/storage/images", { signal }),

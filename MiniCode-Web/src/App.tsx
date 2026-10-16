@@ -572,6 +572,7 @@ export default function App() {
 
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
+      if (event.target instanceof HTMLElement && event.target.closest(".terminal-panel")) return;
       if (document.querySelector('dialog[open], [role="dialog"][aria-modal="true"]:not([aria-hidden="true"])')) return;
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "n") {
         event.preventDefault();
@@ -1802,6 +1803,8 @@ export default function App() {
             summaryLoading={sessionInspectLoading}
             onOpenChanges={() => openInspectorTab("changes")}
             onOpenRuntime={() => openInspectorTab("run")}
+            onOpenTerminal={!inspectorOpen && conversationScope === "project" && workspace
+              ? () => openInspectorTab("terminal") : undefined}
             onOpenFile={openFileReference}
             recoveryAction={recoveryAction}
             onOpenSettings={() => navigatePage("settings")}

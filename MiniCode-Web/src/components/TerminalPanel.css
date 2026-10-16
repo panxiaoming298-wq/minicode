@@ -1,0 +1,27 @@
+.terminal-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; background: var(--surface); }
+.terminal-panel[hidden] { display: none; }
+.terminal-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 44px; padding: 6px 10px 6px 14px; border-bottom: 1px solid var(--line); }
+.terminal-state { display: inline-flex; align-items: center; gap: 7px; white-space: nowrap; color: var(--text-soft); font-size: 12px; }
+.terminal-state-running::before { width: 5px; height: 5px; border-radius: 50%; background: var(--success); content: ""; }
+.terminal-state-error { color: var(--danger); }
+.terminal-actions { display: flex; align-items: center; gap: 2px; }
+.terminal-actions .icon-button { width: 28px; height: 28px; min-height: 28px; }
+.terminal-actions button:disabled { opacity: .4; cursor: default; }
+.terminal-end, .terminal-restart { display: inline-flex; align-items: center; gap: 5px; min-height: 28px; padding: 4px 7px; border: 1px solid var(--line-strong); border-radius: 6px; background: transparent; color: var(--text-soft); white-space: nowrap; font-size: 11px; }
+.terminal-end:hover:not(:disabled), .terminal-restart:hover { background: var(--panel); color: var(--text); }
+.terminal-directory { overflow: hidden; flex: 0 0 auto; padding: 9px 14px 5px; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font: 11px/1.5 var(--font-code); }
+.terminal-screen { flex: 1; min-height: 100px; min-width: 0; margin: 6px 10px 10px 14px; overflow: hidden; }
+.terminal-screen .xterm { height: 100%; }
+.terminal-panel .terminal-screen .xterm-viewport { scrollbar-width: thin; background: var(--surface); }
+.terminal-screen .xterm:focus-within { outline: none; }
+.terminal-notice { flex: 0 0 auto; padding: 8px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.terminal-notice.is-error { color: var(--danger); background: var(--danger-soft); }
+.terminal-hint { flex: 0 0 auto; padding: 8px 14px; border-top: 1px solid var(--line); color: var(--muted); font-size: 10px; line-height: 1.6; }
+.terminal-start button { display: inline-flex; align-items: center; gap: 7px; padding: 8px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-control); background: var(--surface-raised); color: var(--text); }
+.inspector-tabs { overflow-x: auto; scrollbar-width: thin; }
+.inspector-tabs > button { flex-shrink: 0; }
+@media (max-width: 480px) {
+  .terminal-toolbar { flex-wrap: wrap; }
+  .terminal-actions { margin-left: auto; }
+  .terminal-hint { font-size: 9px; }
+}

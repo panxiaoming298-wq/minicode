@@ -1,13 +1,13 @@
 export type ComposerCommandId = "compact" | "context" | "help" | "tools" | "skills" | "mcp"
   | "model" | "config" | "extensions" | "sessions" | "history" | "status" | "state" | "session"
-  | "cost" | "tasks" | "checkpoints" | "delegation" | "memory" | "instructions" | "hooks"
+  | "cost" | "tasks" | "checkpoints" | "delegation" | "terminal" | "memory" | "instructions" | "hooks"
   | "readiness" | "permissions" | "task-file" | "ls";
 
 export type ComposerInspectorSection = "tools" | "mcp" | "instructions" | "memory" | "health"
   | "usage" | "plan" | "checkpoints";
 
 export type ComposerNavigation =
-  | { kind: "inspector"; tab: "files" | "run" | "agents" | "capabilities" | "context"; section?: ComposerInspectorSection }
+  | { kind: "inspector"; tab: "files" | "run" | "terminal" | "agents" | "capabilities" | "context"; section?: ComposerInspectorSection }
   | { kind: "settings" }
   | { kind: "extensions"; view: "skills" | "extensions" }
   | { kind: "history"; search: boolean };
@@ -25,6 +25,7 @@ export interface ComposerCommand {
 }
 
 export const COMPOSER_COMMANDS: readonly ComposerCommand[] = [
+  { id: "terminal", name: "项目终端", description: "在当前项目或工作树中打开 PowerShell", action: { kind: "inspector", tab: "terminal" }, requires: "project" },
   { id: "compact", name: "整理上下文", description: "保存交接笔记，收起旧上下文；原始历史保留", action: { kind: "compact" }, requires: "session" },
   { id: "context", name: "查看上下文", description: "查看当前会话的上下文占用与明细", action: { kind: "inspector", tab: "context" }, requires: "session" },
   { id: "help", name: "命令帮助", description: "展开浏览器可用的命令与技能，输入名称筛选", action: { kind: "help" } },
