@@ -273,13 +273,4 @@ Docker CLI / Headless 的操作说明见[后端技术指南](./MiniCode-Python-r
 | [浏览器截图与检查](./MiniCode-Python-repo/Docs/Documentation/BROWSER_CHECKS.md) | Playwright 检查、截图和验收证据 |
 | [工作区约定](./AGENTS.md) | 中间件分组与协作约定 |
 
-## 相关实现与参考
 
-MiniCode 家族的相关仓库列在下方，便于追溯设计与实现背景。本工作区的功能和启动方式以当前源码及本文档为准。
-
-| 实现 | 参考仓库 |
-| --- | --- |
-| TypeScript | [LiuMengxuan04/MiniCode](https://github.com/LiuMengxuan04/MiniCode) |
-| Python | [QUSETIONS/MiniCode-Python](https://github.com/QUSETIONS/MiniCode-Python) |
-| Rust | [harkerhand/MiniCode-rs](https://github.com/harkerhand/MiniCode-rs/tree/master) |
-| Java | [hobbescalvin414-tech/minicode4j](https://github.com/hobbescalvin414-tech/minicode4j/tree/feat/default-ts-ui) |
