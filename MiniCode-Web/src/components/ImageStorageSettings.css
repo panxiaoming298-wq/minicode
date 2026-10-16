@@ -1,0 +1,28 @@
+.image-storage-settings { display: flex; flex-direction: column; }
+.image-storage-settings > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.image-storage-settings > header h2 { display: flex; align-items: center; gap: 7px; margin: 0; }
+.image-storage-settings .settings-help, .image-storage-total { margin: 0; }
+.image-storage-total { font-size: 13px; color: var(--muted); }
+.image-storage-total strong { color: var(--text); font-weight: 600; }
+.image-storage-list { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); border-radius: var(--radius-control); }
+.image-storage-list > li { display: flex; align-items: center; gap: 16px; padding: 14px; }
+.image-storage-list > li + li { border-top: 1px solid var(--line); }
+.image-storage-list > li > div { flex: 1; min-width: 0; }
+.image-storage-list strong { display: block; font-size: 13px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.image-storage-list p { margin: 5px 0 0; font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.image-storage-list .button { flex-shrink: 0; }
+.image-storage-error { color: var(--danger) !important; font-size: 13px; line-height: 1.7; overflow-wrap: anywhere; }
+.image-storage-notice { color: var(--success); font-size: 13px; line-height: 1.7; margin: 0; }
+.image-storage-confirm { width: min(460px, calc(100% - 32px)); max-height: calc(100dvh - 32px); overflow: auto; border: 1px solid var(--line-strong); border-radius: 16px; padding: 26px; background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow-soft); }
+.image-storage-confirm::backdrop { background: var(--scrim); }
+.image-storage-confirm h2 { font-size: 20px; font-weight: 650; margin: 0 0 14px; }
+.image-storage-confirm p { line-height: 1.7; font-size: 13px; color: var(--muted); }
+.image-storage-confirm .image-storage-confirm-title { color: var(--text); font-weight: 600; overflow-wrap: anywhere; }
+.image-storage-confirm footer { display: flex; justify-content: flex-end; gap: 10px; margin-top: 24px; }
+.image-storage-delete { background: var(--danger); border-color: var(--danger); color: var(--surface-raised); }
+@media (max-width: 600px) {
+  .image-storage-list > li { align-items: flex-start; flex-direction: column; gap: 10px; }
+  .image-storage-list > li > div { max-width: 100%; }
+  .image-storage-list .button { align-self: flex-end; }
+  .image-storage-confirm { padding: 20px; }
+}

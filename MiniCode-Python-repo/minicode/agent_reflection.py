@@ -9,6 +9,7 @@ Provides post-task reflection to improve future performance:
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Any
@@ -78,25 +79,28 @@ class ReflectionResult:
 
     def _format_content(self) -> str:
         parts = [
-            f"Task Context: {self.task_summary}",
+            f"任务摘要：{self.task_summary}",
+            "历史过程记录，仅供参考；不代表当前文件已经通过验证。",
         ]
         ctx = self.task_context
         if ctx.get("files"):
-            parts.append(f"Files: {', '.join(ctx['files'][:8])}")
+            parts.append(f"相关文件：{', '.join(ctx['files'][:8])}")
         if ctx.get("libraries"):
-            parts.append(f"Libraries/Tools: {', '.join(ctx['libraries'])}")
+            parts.append(f"相关技术：{', '.join(ctx['libraries'])}")
         if ctx.get("project_state"):
-            parts.append(f"State: {ctx['project_state']}")
-        parts.extend(["", "Key Decisions:"])
+            parts.append(f"当时状态：{ctx['project_state']}")
+        if self.key_decisions:
+            parts.extend(["", "过程说明（Agent 原文）："])
         for d in self.key_decisions:
             parts.append(f"  - {d}")
 
         if self.errors_encountered:
-            parts.extend(["", "Errors Encountered:"])
+            parts.extend(["", "当时遇到的问题："])
             for e in self.errors_encountered:
                 parts.append(f"  - {e}")
 
-        parts.extend(["", "Lessons Learned:"])
+        if self.lessons_learned:
+            parts.extend(["", "过程信息："])
         for lesson in self.lessons_learned:
             parts.append(f"  - {lesson}")
 
@@ -159,10 +163,22 @@ class ReflectionEngine:
             task_context=task_context,
         )
 
-        if persist and self.memory and confidence >= self.min_confidence:
+        if persist and self.should_persist(reflection):
             self._persist_reflection(reflection)
 
         return reflection
+
+    def should_persist(self, reflection: ReflectionResult) -> bool:
+        from minicode.session_contract import _valid_session_id
+        from minicode.task_history import internal_task, trivial_task
+        return bool(
+            self.memory and _valid_session_id(self.memory.source_session_id)
+            and reflection.confidence >= self.min_confidence
+            and not trivial_task(reflection.task_summary)
+            and not internal_task(reflection.task_summary)
+            and reflection.task_context.get("files")
+            and (reflection.key_decisions or reflection.errors_encountered)
+        )
 
     def _extract_task_context(
         self, tool_calls: list[dict[str, Any]], assistant_msgs: list[dict[str, Any]]
@@ -181,18 +197,18 @@ class ReflectionEngine:
         tool_names: set[str] = set()
 
         for call in tool_calls:
-            name = call.get("name", call.get("toolName", ""))
+            name = call.get("name") or call.get("toolName") or call.get("tool_name") or ""
             if name:
                 tool_names.add(name)
             # Try to detect file paths
-            for key in ("path", "filePath", "file_path", "input"):
-                val = call.get(key, "")
-                if isinstance(val, str) and ("." in val or "/" in val):
-                    files.add(val)
-                elif isinstance(val, dict):
-                    for v in val.values():
-                        if isinstance(v, str) and ("." in v or "/" in v):
-                            files.add(v)
+            payloads = [call, call.get("input")]
+            for payload in payloads:
+                if not isinstance(payload, dict):
+                    continue
+                for key in ("path", "filePath", "file_path"):
+                    val = payload.get(key)
+                    if isinstance(val, str) and val.strip():
+                        files.add(val[:500])
 
         # Detect libraries from tool calls (npm, pip, cargo, etc.)
         known_libs = {
@@ -222,11 +238,11 @@ class ReflectionEngine:
     def _extract_decisions(self, assistant_msgs: list[dict[str, Any]]) -> list[str]:
         """Extract key decisions from assistant messages."""
         decisions = []
-        keywords = ["decide", "choose", "select", "use ", "will ", "plan to", "start by"]
+        keywords = ["decide", "choose", "select", "use ", "used ", "will ", "plan to", "start by", "采用", "选择", "修复", "改为", "原因", "因为"]
         for msg in assistant_msgs:
             content = msg.get("content", "")
             if any(kw in content.lower() for kw in keywords):
-                first_sentence = content.split(".")[0].strip()
+                first_sentence = re.split(r"[。\n]|\.\s", content)[0].strip()
                 if len(first_sentence) > 10:
                     decisions.append(first_sentence[:200])
         return decisions[:5]
@@ -240,21 +256,12 @@ class ReflectionEngine:
         """Generate lessons learned from execution."""
         lessons = []
 
-        if success:
-            lessons.append("Task completed successfully with the chosen approach.")
-        else:
-            lessons.append("Task encountered errors. Review error patterns for future avoidance.")
-
-        tool_names = [t.get("tool_name", "unknown") for t in tool_calls]
+        # A response and a tool count are not evidence of task success.
+        tool_names = [t.get("name") or t.get("toolName") or t.get("tool_name") for t in tool_calls]
+        tool_names = [name for name in tool_names if name and name != "unknown"]
         if tool_names:
             unique_tools = set(tool_names)
-            lessons.append(f"Used {len(unique_tools)} unique tool(s): {', '.join(unique_tools)}.")
-
-        if errors:
-            error_tools = {e.get("tool_name", "unknown") for e in errors}
-            lessons.append(
-                f"Errors occurred with tool(s): {', '.join(error_tools)}. Consider alternative approaches."
-            )
+            lessons.append(f"调用过的工具：{', '.join(sorted(unique_tools))}。")
 
         return lessons
 
@@ -304,18 +311,24 @@ class ReflectionEngine:
 
         entry = reflection.to_memory_entry()
         try:
+            for existing in self.memory.memories[MemoryScope.LOCAL].entries:
+                if (existing.content == entry["content"] and existing.sources ==
+                        self.memory._entry_sources(entry["category"], ["task:" + reflection.task_summary[:500]])):
+                    return
             # Use add_entry if available (new API), fallback to add (old API)
             if hasattr(self.memory, "add_entry"):
                 self.memory.add_entry(
-                    scope=MemoryScope.PROJECT,
+                    scope=MemoryScope.LOCAL,
                     category=entry["category"],
                     content=entry["content"],
                     tags=entry["tags"],
+                    origin="agent_reflection",
+                    sources=["task:" + reflection.task_summary[:500]],
                 )
             else:
                 self.memory.add(
                     content=entry["content"],
-                    scope=MemoryScope.PROJECT,
+                    scope=MemoryScope.LOCAL,
                     category=entry["category"],
                     tags=entry["tags"],
                     metadata=entry["metadata"],

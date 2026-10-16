@@ -3,25 +3,39 @@
 The persisted runtime/session objects deliberately contain enough information
 to resume execution.  The browser needs a much smaller inspection surface: no
 credentials, executable MCP configuration, instruction bodies, checkpoint
-contents, artifact store keys, or evidence resource locations cross this
+contents, artifact store keys, or external evidence resource locations cross this
 boundary.
 """
 
 from __future__ import annotations
 
+import math
+import json
 import os
 import re
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, cast
 from urllib.parse import urlsplit
+
+from minicode.release_readiness import redact_sensitive_text
+from minicode.runtime_delivery import EntryCompletion, entry_completion, review_pending_reason, review_pending_closeout, task_memory_view
+from minicode.entry_task import public_task_file
+from minicode.web_runtime_settings import public_run_budget
 
 
 def _mapping(value: Any) -> dict[str, Any]:
     if is_dataclass(value) and not isinstance(value, type):
         value = asdict(cast(Any, value))
     return dict(value) if isinstance(value, Mapping) else {}
+
+
+def _review_policy_fields(value: Any) -> dict[str, Any]:
+    policy = _mapping(value)
+    if policy.get("scope") not in {"basic", "focused", "full"} or type(policy.get("required")) is not bool:
+        return {}
+    return {"reviewPolicy": {"scope": policy["scope"], "required": policy["required"]}}
 
 
 def _text(value: Any, limit: int = 600) -> str:
@@ -97,6 +111,8 @@ def public_skills(items: Any) -> list[dict[str, Any]]:
                 "name": name,
                 "description": _text(value.get("description"), 360),
                 "source": _text(value.get("source") or value.get("scope") or "local", 60),
+                "userInvocable": value.get("user_invocable", value.get("userInvocable", True)) is True
+                and not bool(value.get("error")) and name == value.get("name"),
             }
         )
     return result
@@ -165,6 +181,71 @@ def public_tools(registry: Any) -> list[dict[str, Any]]:
             }
         )
     return result
+
+
+def public_tool_catalog(registry: Any, cwd: str) -> list[dict[str, Any]]:
+    """Describe native and scoped tools without creating a live Worker or MCP client.
+
+    This catalog is deliberately separate from ``tools``: a declaration is not
+    an execution grant. Definitions with safe construction reuse their actual
+    metadata; context-bound handlers are described without manufacturing a
+    Runtime, memory store, candidate, or authorization callback.
+    """
+    from minicode.tool_discovery import ToolDiscovery
+    from minicode.tooling import ToolRegistry
+    from minicode.tools import create_builtin_tools
+    from minicode.tools.builders import builder_tools
+    from minicode.tools.session_history_read import session_history_read_tool
+    from minicode.tools.session_history_search import session_history_search_tool
+    from minicode.tools.task import (
+        advisory_acknowledgment_tool, async_agent_tools,
+        durable_consultation_tool, retry_consultation_tool,
+    )
+
+    rows = {tool["name"]: {**tool, "availability": "registered", "activation": ""}
+            for tool in public_tools(registry)}
+
+    def declare(definitions: list[Any], activation: str) -> None:
+        for tool in public_tools(ToolRegistry(definitions)):
+            rows.setdefault(tool["name"], {**tool, "availability": "conditional", "activation": activation})
+
+    declare(create_builtin_tools(cwd), "由当前工具配置与 Agent 权限决定是否注册；实用工具需要完整工具模式。")
+    declare([session_history_read_tool, session_history_search_tool], "运行会话时加载，仅访问当前会话保存的历史。")
+    declare([ToolDiscovery().tool()], "运行时启用工具发现后加载，仅发现当前任务获准使用的工具。")
+    declare(list(async_agent_tools()), "运行时启用多 Agent 协作后，按主任务或成员角色、消息、续接与团队配置加载。")
+    declare(list(builder_tools()), "启用并行候选模式并绑定构建任务调度器后，提供给主任务。")
+    declare([durable_consultation_tool, advisory_acknowledgment_tool, retry_consultation_tool],
+            "主任务启用持久化咨询后，按咨询契约、失败接管或修复状态加载。")
+
+    # These handlers require live, owner-scoped state. Catalog inspection must
+    # never instantiate that state or make an executable substitute for it.
+    context_bound = [
+        ("memory_search", "搜索当前任务中带来源的记忆卡片。", "read_only", "safe", "启用分页记忆后加载，受当前任务和角色权限限制。"),
+        ("memory_get", "按范围读取记忆卡片或来源事件的原文。", "read_only", "safe", "启用分页记忆后加载，受当前任务和角色权限限制。"),
+        ("artifact_read", "分页读取当前任务保存的工具结果。", "read_only", "safe", "启用分页记忆后加载；读取已保存的结果，不代表当前文件内容。"),
+        ("history_search", "搜索或浏览当前任务保存的原始历史。", "read_only", "safe", "启用分页记忆后加载，按当前任务范围查询。"),
+        ("checkpoint_restore", "从经过核验的检查点恢复当前运行视图。", "privileged", "never_auto_retry", "启用分页记忆且当前角色允许恢复检查点时加载。"),
+        ("memory_note_update", "更新当前任务的工作交接笔记。", "workspace_write", "never_auto_retry", "启用交接笔记且不处于内联记忆模式时加载；只读成员仅维护自己的记忆状态，实际权限由运行时决定。"),
+        ("context_rotate", "保存交接笔记后切换到下一段工作上下文。", "workspace_write", "never_auto_retry", "启用上下文轮换且不处于内联记忆模式时加载；只读成员仅变更自己的上下文状态，实际权限由运行时决定。"),
+        ("runtime_context_read", "分页读取当前 Worker 记录的上下文与工具输入输出。", "read_only", "safe", "运行时为当前 Worker 绑定上下文读取器后加载。"),
+        ("runtime_artifact_read", "分页读取获准访问的依赖结果、成员消息或项目检查报告。", "read_only", "safe", "当前角色拥有显式依赖、消息或报告读取权限时加载。"),
+        ("record_working_context", "记录主任务的当前决策、未解决风险与下一步。", "read_only", "never_auto_retry", "主任务启用工作上下文记录并拥有可引用的咨询来源时加载。"),
+        ("resolve_user_input", "处理运行期间收到的用户指令并记录响应。", "read_only", "safe", "运行时为当前 Worker 绑定用户指令处理器后加载。"),
+        ("submit_candidate", "将主任务的当前候选提交给运行时进行已配置的验收。", "workspace_write", "never_auto_retry", "当前主任务具有原生候选提交契约时加载；提交不等于验收通过。"),
+        ("submit_builder_candidate", "将构建成员的独立候选交给主任务审查。", "workspace_write", "never_auto_retry", "独立构建成员具有原生候选提交契约时加载；交接不会自动合并。"),
+        ("submit_consultation", "提交辅助任务的咨询发现、摘要与核验结论。", "read_only", "never_auto_retry", "只读辅助任务具有原生咨询提交契约时加载。"),
+        ("run_acceptance_checks", "执行任务已配置的验收检查并保留真实结果。", "workspace_write", "never_auto_retry", "当前任务绑定了验收检查时加载；命令授权与输入版本检查仍然生效。"),
+        ("request_verification", "请求运行时核验当前固定输入版本。", "read_only", "never_auto_retry", "独立核验成员绑定了原生核验请求器时加载。"),
+        ("list_mcp_resources", "列出已连接 MCP 服务提供的资源。", "privileged", "never_auto_retry", "已连接的 MCP 服务提供资源后加载。"),
+        ("read_mcp_resource", "读取指定 MCP 服务提供的资源内容。", "privileged", "never_auto_retry", "已连接的 MCP 服务提供资源后加载。"),
+        ("list_mcp_prompts", "列出已连接 MCP 服务提供的提示模板。", "privileged", "never_auto_retry", "已连接的 MCP 服务提供提示模板后加载。"),
+        ("get_mcp_prompt", "获取指定 MCP 提示模板及其内容。", "privileged", "never_auto_retry", "已连接的 MCP 服务提供提示模板后加载。"),
+    ]
+    for name, description, effect, replay, activation in context_bound:
+        rows.setdefault(name, {"name": name, "description": description, "effect": effect,
+                              "replayPolicy": replay, "source": "core",
+                              "availability": "conditional", "activation": activation})
+    return sorted(rows.values(), key=lambda tool: tool["name"])
 
 
 _APPROVAL_CHOICE_LABELS = {
@@ -481,7 +562,7 @@ def public_approval_request(value: Any, workspace: str | Path) -> dict[str, Any]
         "targetLabel": target_label,
         "operationType": operation_type,
         "riskLevel": risk_level,
-        "timeoutPolicy": "不确认时，任务会停在这里，不会自动执行。",
+        "timeoutPolicy": "不确认时不会执行，也不占工具执行时限；任务总时长和停止操作仍然生效。",
         "technicalDetails": technical,
     }
 
@@ -498,6 +579,12 @@ def public_instruction_layers(items: Any) -> list[dict[str, Any]]:
                 "scope": _text(value.get("scope"), 40),
                 "kind": _text(value.get("kind"), 40),
                 "exists": bool(value.get("exists", False)),
+                "path": _text(value.get("path"), 4096),
+                "status": _text(value.get("status") or "unknown", 40),
+                "preview": _text(value.get("preview"), 500),
+                "contentHash": _text(value.get("content_hash"), 64),
+                "updatedAt": value.get("updated_at") if type(value.get("updated_at")) in (int, float) else None,
+                "error": _text(value.get("error"), 100),
             }
         )
     return [item for item in result if item["name"]]
@@ -535,13 +622,45 @@ def public_extensions(items: Any) -> list[dict[str, Any]]:
         name = _text(value.get("name"), 100)
         if not name:
             continue
+        raw_contributes = value.get("contributes", {})
+        inferred_kinds = (
+            [str(kind) for kind, contribution in raw_contributes.items() if contribution]
+            if isinstance(raw_contributes, Mapping)
+            else []
+        )
         result.append(
             {
+                "id": _text(value.get("id") or name, 128),
+                "key": _text(
+                    value.get("key")
+                    or f"{value.get('scope', '')}:{value.get('id') or name}",
+                    180,
+                ),
                 "name": name,
                 "scope": _text(value.get("scope"), 40),
                 "version": _text(value.get("version"), 60),
                 "description": _text(value.get("description"), 260),
                 "enabled": bool(value.get("enabled", True)),
+                "trusted": bool(value.get("trusted", False)),
+                "health": _text(value.get("health") or "unknown", 80),
+                "healthDetail": _text(
+                    value.get("health_detail", value.get("healthDetail", "")),
+                    360,
+                ),
+                "permissions": _strings(value.get("permissions", []), limit=32, item_limit=100),
+                "grantedPermissions": _strings(
+                    value.get("granted_permissions", value.get("grantedPermissions", [])),
+                    limit=32,
+                    item_limit=100,
+                ),
+                "contributionKinds": _strings(
+                    value.get(
+                        "contribution_kinds",
+                        value.get("contributionKinds", inferred_kinds),
+                    ),
+                    limit=16,
+                    item_limit=60,
+                ),
             }
         )
     return result
@@ -593,6 +712,8 @@ def public_product_snapshot(snapshot: Any) -> dict[str, Any]:
 
 def public_memory(value: Any) -> dict[str, Any]:
     item = _mapping(value)
+    if item.get("schema") == "minicode-memory-inventory-v1":
+        return dict(item)
     raw_stats = item.get("stats") if isinstance(item.get("stats"), Mapping) else item
     raw_scope_counts = item.get("scope_counts", item.get("scopeCounts", {}))
     scopes: list[dict[str, Any]] = []
@@ -624,16 +745,37 @@ def public_memory(value: Any) -> dict[str, Any]:
 
 
 def public_context_stats(value: Any) -> dict[str, Any]:
+    from minicode.session_context import public_budget_policy
+
     item = _mapping(value)
     accounting = _mapping(item.get("accounting"))
+    request = _mapping(item.get("request"))
     return {
         "totalTokens": _integer(item.get("total_tokens", item.get("totalTokens", 0))),
         "estimatedTokens": _integer(item.get("estimated_tokens", item.get("estimatedTokens", 0))),
         "providerUsageTokens": _integer(item.get("provider_usage_tokens", item.get("providerUsageTokens", 0))),
         "contextWindow": _integer(item.get("context_window", item.get("contextWindow", 0))),
         "effectiveInput": _integer(item.get("effective_input", item.get("effectiveInput", 0))),
+        "admissionInputTokens": _optional_number(item.get("admission_input_tokens")),
+        "contextGuardTokens": _optional_number(item.get("context_guard_tokens")),
+        "outputReserveTokens": _optional_number(item.get("output_reserve_tokens")),
+        "safetyReserveTokens": _optional_number(item.get("safety_reserve_tokens")),
+        "reservedTokens": _optional_number(item.get("reserved_tokens")),
+        "capacityError": _text(item.get("capacity_error"), 80),
+        "budgetPolicy": public_budget_policy(item.get("budget_policy")),
         "utilization": max(0.0, min(1.0, _number(item.get("utilization", 0)))),
         "warningLevel": _text(item.get("warning_level", item.get("warningLevel", "normal")), 40),
+        "request": {
+            "requestId": _text(request.get("request_id"), 160),
+            "nodeId": _text(request.get("node_id"), 40),
+            "model": _text(request.get("model"), 160),
+            "capturedAt": _number(request.get("captured_at")) * 1000,
+            "method": _text(request.get("method"), 40),
+            "hasUnmeasuredMedia": bool(request.get("has_unmeasured_media")),
+        } if request else None,
+        "breakdown": [{"key": part["key"], "estimatedTokens": max(0, _integer(part.get("estimated_tokens")))}
+                      for part in item.get("breakdown", []) if isinstance(part, dict)
+                      and part.get("key") in {"system", "tools", "conversation", "memory", "other"}],
         "accounting": {
             "source": _text(accounting.get("source") or "estimate_only", 60),
             "isExact": bool(accounting.get("is_exact", accounting.get("isExact", False))),
@@ -653,7 +795,75 @@ def _public_artifact(value: Any) -> dict[str, Any]:
     }
 
 
-def _public_evidence(value: Any) -> dict[str, Any]:
+def _optional_number(value: Any) -> int | float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def _workspace_evidence_path(workspace: str | Path, value: Any) -> str | None:
+    """Only expose local file evidence within the actual workspace boundary."""
+    raw = str(value or "").strip()
+    if not raw or ":" in raw.replace(":\\", "", 1).replace(":/", "", 1):
+        return None
+    try:
+        root = Path(workspace).resolve()
+        path = Path(raw)
+        if ".." in raw.replace("\\", "/").split("/"):
+            return None
+        if not path.is_absolute() and PureWindowsPath(raw).drive:
+            return None
+        resolved = (path if path.is_absolute() else root / path).resolve()
+        relative = resolved.relative_to(root).as_posix()
+        return relative if relative != "." else None
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _public_cache_usage(value: Any) -> dict[str, Any] | None:
+    item = _mapping(value)
+    if not item:
+        return None
+    def totals(entry):
+        rate = _optional_number(entry.get("hit_rate"))
+        return {"inputTokens": _optional_number(entry.get("input_tokens")),
+                "cacheReadTokens": _optional_number(entry.get("cache_read_tokens")),
+                "hitRate": rate if rate is not None and 0 <= rate <= 1 else None,
+                "reportedCalls": _optional_number(entry.get("reported_calls")),
+                "modelCalls": _optional_number(entry.get("model_calls")),
+                "complete": entry.get("complete") is True}
+    return {**totals(item), "groups": [
+        {"key": group["key"], **totals(group)} for group in item.get("groups", [])
+        if isinstance(group, dict) and group.get("key") in {"primary", "agents", "memory_rerank", "other"}]}
+
+
+def _public_usage(value: Any, *, ledger: Any = None) -> dict[str, Any] | None:
+    item = _mapping(value)
+    if not item:
+        return None
+    tokens = _optional_number(item.get("tokens", item.get("tokens_used")))
+    cost = _optional_number(item.get("cost", item.get("cost_used")))
+    cost_known = item.get("cost_known", item.get("costKnown")) is True and cost is not None
+    cache = item.get("cache")
+    if cache is None and isinstance(ledger, dict) and isinstance(ledger.get("calls"), dict):
+        from minicode.usage_ledger import cache_usage_summary
+        cache = cache_usage_summary(ledger["calls"], legacy_calls=sum(
+            int(row.get("model_calls", 0) or 0) for row in ledger.get("result_usage", {}).values()))
+    return {
+        "tokens": tokens,
+        "cost": cost if cost_known else None,
+        "knownCost": _optional_number(item.get("known_cost", item.get("knownCost", cost))),
+        "tokensKnown": item.get("tokens_known", item.get("tokensKnown")) is True and tokens is not None,
+        "costKnown": cost_known,
+        "modelCalls": _optional_number(item.get("model_calls", item.get("modelCalls"))),
+        "reservedTokens": _optional_number(item.get("reserved_tokens", item.get("reservedTokens"))),
+        "reservedCost": _optional_number(item.get("reserved_cost", item.get("reservedCost"))),
+        "unsettledCalls": _optional_number(item.get("unsettled_calls", item.get("unsettledCalls"))),
+        "cache": _public_cache_usage(cache),
+    }
+
+
+def _public_evidence(workspace: str | Path, value: Any) -> dict[str, Any]:
     item = _mapping(value)
     return {
         "evidenceType": _text(item.get("evidence_type", item.get("evidenceType", "")), 80),
@@ -664,20 +874,62 @@ def _public_evidence(value: Any) -> dict[str, Any]:
         "lineStart": item.get("line_start", item.get("lineStart")),
         "lineEnd": item.get("line_end", item.get("lineEnd")),
         "page": item.get("page"),
+        "file": _workspace_evidence_path(workspace, item.get("resource"))
+        if item.get("evidence_type", item.get("evidenceType")) == "file-content" else None,
     }
 
 
-def _public_verification(value: Any) -> dict[str, Any]:
+def _public_project_check(item: Mapping) -> dict[str, Any] | None:
+    if item.get("verifier") != "npm-build-and-browser" and not str(item.get("verifier", "")).startswith("browser-scenario-"):
+        return None
+    try:
+        payload = json.loads(item.get("details") or "")
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("recipe") != "npm-build-and-browser":
+        return None
+    stages = payload.get("stages")
+    artifacts = payload.get("artifacts")
+    browser = _mapping(payload.get("browser"))
+    return {
+        "scope": payload.get("scope") if payload.get("scope") in {"build-only", "browser-scenario", "build-and-browser-smoke"} else "build-and-browser-smoke",
+        "criteria": [{"number": value["number"], "text": _text(value.get("text"), 500), "status": value["status"]}
+            for value in (browser.get("criterion_results", [])[:64] if isinstance(browser.get("criterion_results"), list) else [])
+            if isinstance(value, dict) and value.get("required") is True and type(value.get("number")) is int
+            and value.get("status") in {"passed", "failed", "not_checked"}],
+        "candidateRevision": _text(payload.get("candidate_revision"), 128),
+        "execution": payload.get("execution") if payload.get("execution") in {"executed", "reused", "not-started"} else "executed",
+        "failure": _text(payload.get("failure"), 2000),
+        "stages": [{"stage": _text(stage.get("stage"), 60), "exitCode": stage.get("exit_code") if type(stage.get("exit_code")) is int else None,
+                    "output": _raw_text(stage.get("output"), 6000)} for stage in (stages[:3] if isinstance(stages, list) else []) if isinstance(stage, dict)],
+        "browserErrors": _strings(browser.get("errors", []), limit=8, item_limit=1000),
+        "artifacts": [{"name": artifact["name"], "artifactId": artifact["ref"]["artifact_id"]}
+                      for artifact in (artifacts[:8] if isinstance(artifacts, list) else [])
+                      if isinstance(artifact, dict) and isinstance(artifact.get("name"), str) and re.fullmatch(
+                          r"report\.json|(desktop|mobile)(?:-[A-Za-z0-9_-]{1,64})?\.png|(desktop|mobile)-trace\.zip", artifact["name"])
+                      and isinstance(artifact.get("ref"), dict)
+                      and isinstance(artifact["ref"].get("artifact_id"), str)
+                      and re.fullmatch(r"artifact-[a-f0-9]{32}", artifact["ref"]["artifact_id"])],
+    }
+
+
+def _public_verification(workspace: str | Path, value: Any) -> dict[str, Any]:
     item = _mapping(value)
     raw_evidence = item.get("evidence_refs", item.get("evidenceRefs", []))
-    evidence = [_public_evidence(raw) for raw in raw_evidence[:12]] if isinstance(raw_evidence, list) else []
+    evidence = [_public_evidence(workspace, raw) for raw in raw_evidence[:50]] if isinstance(raw_evidence, list) else []
     return {
         "verifier": _text(item.get("verifier"), 140),
         "passed": bool(item.get("passed", False)),
         "scope": _text(item.get("scope"), 100),
         "details": _text(item.get("details"), 500),
+        **({"projectCheck": project} if (project := _public_project_check(item)) is not None else {}),
         "evidence": evidence,
         "deterministic": bool(item.get("deterministic", True)),
+        "coveredCriteriaIds": _strings(
+            item.get("covered_criteria_ids", item.get("coveredCriteriaIds", [])),
+            limit=50,
+            item_limit=100,
+        ),
         "createdAt": round(_number(item.get("created_at", item.get("createdAt", 0))) * 1000),
     }
 
@@ -699,7 +951,16 @@ def _public_result(workspace: str | Path, value: Any) -> dict[str, Any] | None:
             if label
         ] if isinstance(changed, list) else [],
         "artifacts": [_public_artifact(raw) for raw in raw_artifacts[:20]] if isinstance(raw_artifacts, list) else [],
-        "verificationRecords": [_public_verification(raw) for raw in raw_verifications[:20]] if isinstance(raw_verifications, list) else [],
+        "verificationRecords": [_public_verification(workspace, raw) for raw in raw_verifications[:20]] if isinstance(raw_verifications, list) else [],
+        "usage": _public_usage(item.get("usage")),
+        "metrics": {
+            public: _optional_number(_mapping(item.get("metrics")).get(private))
+            for public, private in (
+                ("elapsedSeconds", "elapsed_seconds"), ("modelCalls", "model_calls"),
+                ("modelSeconds", "model_seconds"), ("toolCalls", "tool_calls"),
+                ("toolSeconds", "tool_seconds"),
+            )
+        } if _mapping(item.get("metrics")) else None,
         "warnings": _strings(item.get("warnings", []), limit=12, item_limit=300),
         "failure": {
             "kind": _text(failure.get("kind"), 80),
@@ -710,14 +971,68 @@ def _public_result(workspace: str | Path, value: Any) -> dict[str, Any] | None:
     }
 
 
+def _public_agent_collaboration(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    if "agent_sessions" not in state:
+        return None
+    from minicode.runtime_state import RuntimeReducer
+    try:
+        reducer = RuntimeReducer.restore(state)
+        return {"team": reducer.agent_team_view(), "waits": reducer.agent_wait_projection(), "agents": [
+            {**reducer.agent_task_projection(record),
+             **({"name": redact_sensitive_text(record["name"])} if "name" in record else {}),
+             "objective": redact_sensitive_text(_text(record["definition"]["objective"], 1000))}
+            for record in reducer.agent_sessions().values()],
+            "messages": [{"messageId": record["message_id"], "senderId": record["sender_id"],
+                "recipientId": record["recipient_id"], "kind": record["kind"], "state": record["state"],
+                "sequence": record["sequence"], "content": redact_sensitive_text(_text(record["content"], 1200)),
+                "reason": redact_sensitive_text(_text(record.get("reason"), 300)), "replyTo": record.get("reply_to")}
+                for record in reducer.agent_message_records()]}
+    except (ValueError, RuntimeError, TypeError, KeyError):
+        return {"team": None, "agents": [], "messages": [], "error": "Agent collaboration state failed integrity validation"}
+
+
 def public_runtime_trace(value: Any, workspace: str | Path) -> dict[str, Any]:
+    from minicode.runtime_activity import collaboration_view
+    from minicode.runtime_resilience import child_recovery
+    from minicode.web_run_continuation import continuation_view
     trace = _mapping(value)
+    pending_reason = review_pending_reason(trace)
     profile = _mapping(trace.get("profile"))
+    collaboration = collaboration_view(profile)
     topology = _mapping(trace.get("topology_decision", trace.get("topologyDecision", {})))
     plan = _mapping(trace.get("plan"))
     scheduler = _mapping(trace.get("scheduler"))
     delivery = _mapping(trace.get("delivery"))
     state = _mapping(trace.get("state"))
+    state_schema = state.get("schema_version")
+    if state_schema == "minicode-runtime-state-v21":
+        state_schema = state.get("review_base_schema")
+        observed_nodes = plan.get("nodes", [])
+        primary = next((_mapping(node) for node in (observed_nodes if isinstance(observed_nodes, list) else [])
+            if isinstance(node, Mapping) and node.get("node_id") == "primary"), {})
+        if _review_policy_fields(primary.get("review_policy")):
+            profile = {**profile, "review_policy": primary["review_policy"]}
+    if state_schema == "minicode-runtime-state-v20":
+        state_schema = state.get("agent_collaboration_base_schema")
+    if state_schema == "minicode-runtime-state-v19":
+        state_schema = state.get("user_steering_base_schema")
+    if state_schema in {f"minicode-runtime-state-v{i}" for i in range(12, 19)}:
+        state_schema = state.get("agent_base_schema")
+    if state_schema == "minicode-runtime-state-v11":
+        state_schema = state.get("orchestration_base_schema")
+    run_id = plan.get("run_id", state.get("run_id", scheduler.get("run_id", "")))
+    completion = (
+        entry_completion(trace, expected_run_id=run_id)
+        if isinstance(run_id, str) and run_id
+        else EntryCompletion(False, "invalid_runtime_trace")
+    )
+    delivery_reasons = _strings(delivery.get("reasons", []), limit=12, item_limit=300)
+    if pending_reason:
+        delivery_reasons = [pending_reason, *delivery_reasons][:12]
+    if completion.reason != "runtime_completion_gate":
+        delivery_reasons = [completion.message, *delivery_reasons][:12]
+    contract = _mapping(trace.get("contract", state.get("contract")))
+    reserve = _mapping(state.get("closure_budget")) if state_schema in {"minicode-runtime-state-v7", "minicode-runtime-state-v8", "minicode-runtime-state-v9", "minicode-runtime-state-v10"} else {}
 
     nodes: list[dict[str, Any]] = []
     raw_nodes = plan.get("nodes", [])
@@ -738,7 +1053,16 @@ def public_runtime_trace(value: Any, workspace: str | Path) -> dict[str, Any]:
                     "acceptanceCriteria": _strings(definition.get("acceptance_criteria", definition.get("acceptanceCriteria", [])), limit=12, item_limit=300),
                     "maxAttempts": _integer(definition.get("max_attempts", definition.get("maxAttempts", 1)), 1),
                     "state": _text(runtime_node.get("state") or "PENDING", 60),
+                    "criticality": "advisory" if definition.get("criticality") == "advisory" else "required",
+                    **_review_policy_fields(definition.get("review_policy", definition.get("reviewPolicy"))),
+                    **({"reviewStatus": "unavailable"} if runtime_node.get("review_status") == "unavailable" else {}),
+                    "diagnosis": {key: _mapping(runtime_node.get("failure_diagnosis")).get(key)
+                                  for key in ("category", "failureKind", "fallbackAllowed", "acknowledged")},
+                    "advisoryReason": redact_sensitive_text(_text(_mapping(runtime_node.get("advisory_acknowledgment")).get("reason"), 2000)),
                     "attemptCount": len(attempts) if isinstance(attempts, list) else 0,
+                    "recovery": child_recovery(node_id, _text(runtime_node.get("state"), 60),
+                        _strings(definition.get("allowed_effects", []), limit=12, item_limit=80),
+                        [_mapping(attempt) for attempt in attempts] if isinstance(attempts, list) else []),
                     "rejectionReasons": _strings(runtime_node.get("rejection_reasons", runtime_node.get("rejectionReasons", [])), limit=8, item_limit=300),
                     "result": _public_result(workspace, runtime_node.get("result")),
                 }
@@ -747,6 +1071,14 @@ def public_runtime_trace(value: Any, workspace: str | Path) -> dict[str, Any]:
     raw_delivery_artifacts = delivery.get("artifact_refs", delivery.get("artifactRefs", []))
     raw_delivery_verification = delivery.get("verification_records", delivery.get("verificationRecords", []))
     context_manifests = trace.get("context_manifests", trace.get("contextManifests", []))
+    raw_reasoning_decisions = trace.get(
+        "reasoning_budget_decisions",
+        trace.get("reasoningBudgetDecisions", []),
+    )
+    raw_acceptance_criteria = trace.get(
+        "acceptance_criteria",
+        trace.get("acceptanceCriteria", []),
+    )
     context: list[dict[str, Any]] = []
     if isinstance(context_manifests, list):
         for raw in context_manifests[:50]:
@@ -762,26 +1094,66 @@ def public_runtime_trace(value: Any, workspace: str | Path) -> dict[str, Any]:
                     "dependencyCount": len(dependencies) if isinstance(dependencies, list) else 0,
                     "artifactCount": len(artifacts) if isinstance(artifacts, list) else 0,
                     "toolCapabilityScope": _strings(manifest.get("tool_capability_scope", manifest.get("toolCapabilityScope", [])), limit=12, item_limit=80),
+                    "retryFeedback": [redact_sensitive_text(item) for item in _strings(manifest.get("retry_feedback", manifest.get("retryFeedback", [])), limit=3, item_limit=4_000)],
+                }
+            )
+
+    reasoning_decisions: list[dict[str, Any]] = []
+    if isinstance(raw_reasoning_decisions, list):
+        for raw in raw_reasoning_decisions[:50]:
+            decision = _mapping(raw)
+            reasoning_decisions.append(
+                {
+                    "nodeId": _text(decision.get("node_id", decision.get("nodeId", "")), 120),
+                    "model": _text(decision.get("model"), 160),
+                    "provider": _text(decision.get("provider"), 80),
+                    "requested": _text(decision.get("requested"), 40),
+                    "applied": _text(decision.get("applied"), 40),
+                    "degraded": bool(decision.get("degraded", False)),
+                    "reason": _text(decision.get("reason"), 300),
                 }
             )
 
     return {
         "schemaVersion": _text(trace.get("schema_version", trace.get("schemaVersion", "")), 80),
-        "runId": _text(plan.get("run_id", state.get("run_id", scheduler.get("run_id", ""))), 160),
+        "runId": _text(run_id, 160),
+        "reviewPending": bool(pending_reason),
+        "reviewCloseout": redact_sensitive_text(review_pending_closeout(trace)) if pending_reason else "",
         "webRunId": _text(trace.get("web_run_id", trace.get("webRunId", "")), 160),
+        **({"agentCollaboration": _public_agent_collaboration(state)} if "agent_sessions" in state else {}),
+        **({"consultationBudget": {"policy": "shared-pool-v1", "allocation": "atomic_request_ledger",
+                                  "minimumRequestOutput": "full_configured_output"}}
+           if (state_schema == "minicode-runtime-state-v9" or (
+               state_schema == "minicode-runtime-state-v10"
+               and state.get("base_state_schema_version") == "minicode-runtime-state-v9"))
+           and state.get("consultation_budget_policy") == "shared-pool-v1" else {}),
+        **({"closureBudget": {
+            "primaryTokens": _optional_number(reserve.get("primary_tokens")),
+            "verificationTokens": _optional_number(reserve.get("verification_tokens")),
+            "primaryCost": _optional_number(reserve.get("primary_cost")),
+            "verificationCost": _optional_number(reserve.get("verification_cost")),
+        }} if reserve.get("version") == "closure-budget-v1" else {}),
         "profile": {
+            **({"collaboration": collaboration} if collaboration is not None else {}),
             "requestedMode": _text(profile.get("requested_mode", profile.get("requestedMode", "")), 40),
             "selectedRoute": _text(profile.get("selected_route", profile.get("selectedRoute", "")), 80),
             "reasoningBudget": _text(profile.get("reasoning_budget", profile.get("reasoningBudget", "")), 40),
             "maxActiveWorkers": _integer(profile.get("max_active_workers", profile.get("maxActiveWorkers", 0))),
             "verificationLevel": _text(profile.get("verification_level", profile.get("verificationLevel", "")), 40),
+            **({"primaryRuntimeProfile": _text(profile["primary_runtime_profile"], 40)}
+               if profile.get("primary_runtime_profile") else {}),
+            **_review_policy_fields(profile.get("review_policy", profile.get("reviewPolicy"))),
             "writeIsolation": _text(profile.get("write_isolation", profile.get("writeIsolation", "")), 60),
+            "maxTokens": _optional_number(profile.get("max_tokens", profile.get("maxTokens"))),
+            "maxCost": _optional_number(profile.get("max_cost", profile.get("maxCost"))),
+            "deadline": _optional_number(profile.get("deadline")),
         },
         "topology": {
             "selectedRoute": _text(topology.get("selected_route", topology.get("selectedRoute", "")), 80),
             "expectedParallelGain": _number(topology.get("expected_parallel_gain", topology.get("expectedParallelGain", 0))),
             "writeConflictRisk": _text(topology.get("write_conflict_risk", topology.get("writeConflictRisk", "")), 80),
             "deterministicVerifiability": bool(topology.get("deterministic_verifiability", topology.get("deterministicVerifiability", False))),
+            "requiresWorkspaceWrite": bool(topology.get("requires_workspace_write", topology.get("requiresWorkspaceWrite", False))),
             "reasons": _strings(topology.get("reasons", []), limit=10, item_limit=300),
         },
         "plan": {
@@ -796,15 +1168,35 @@ def public_runtime_trace(value: Any, workspace: str | Path) -> dict[str, Any]:
             "peakActiveWorkers": _integer(scheduler.get("peak_active_workers", scheduler.get("peakActiveWorkers", 0))),
             "peakActiveWriters": _integer(scheduler.get("peak_active_writers", scheduler.get("peakActiveWriters", 0))),
             "reasons": _strings(scheduler.get("reasons", []), limit=12, item_limit=300),
+            "unsettledTaskIds": _strings(scheduler.get("unsettled_task_ids", scheduler.get("unsettledTaskIds", [])),
+                                         limit=128, item_limit=200),
+            "usage": _public_usage(state.get("usage_summary") or scheduler, ledger=state.get("usage_ledger")),
         },
         "delivery": {
-            "completed": bool(delivery.get("completed", False)),
+            "completed": completion.completed,
             "outputSummary": _text(delivery.get("output_summary", delivery.get("outputSummary", "")), 900),
             "artifacts": [_public_artifact(raw) for raw in raw_delivery_artifacts[:30]] if isinstance(raw_delivery_artifacts, list) else [],
-            "verificationRecords": [_public_verification(raw) for raw in raw_delivery_verification[:30]] if isinstance(raw_delivery_verification, list) else [],
-            "reasons": _strings(delivery.get("reasons", []), limit=12, item_limit=300),
+            "verificationRecords": [_public_verification(workspace, raw) for raw in raw_delivery_verification[:50]] if isinstance(raw_delivery_verification, list) else [],
+            "reasons": delivery_reasons,
         },
         "contextManifests": context,
+        "taskMemory": task_memory_view(trace),
+        "taskFile": public_task_file(trace.get("task_file")),
+        "runBudget": public_run_budget(trace.get("web_run_budget")),
+        "continuationContractSaved": bool(trace.get("web_task_snapshot")),
+        "continuation": continuation_view(trace.get("web_continuation")),
+        "acceptanceCriteria": [
+            {
+                "id": _text(_mapping(raw).get("id"), 100),
+                "text": _text(_mapping(raw).get("text"), 500),
+            }
+            for raw in raw_acceptance_criteria[:50]
+        ] if isinstance(raw_acceptance_criteria, list) else [],
+        "reasoningBudgetDecisions": reasoning_decisions,
+        "expectedOutputs": [
+            _workspace_evidence_path(workspace, raw)
+            for raw in _strings(contract.get("expected_outputs", []), limit=50, item_limit=4_096)
+        ],
     }
 
 

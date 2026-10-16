@@ -10,6 +10,9 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from queue import Empty, Queue
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 from minicode.tooling import ToolDefinition, ToolResult
 
@@ -35,6 +38,27 @@ _WIN_EXEC_EXTS = (".exe", ".cmd", ".bat")
 JsonRpcProtocol = str
 
 
+def _http_origin(value: str) -> tuple[str, str, int]:
+    parsed = urlparse(value)
+    scheme = parsed.scheme.lower()
+    hostname = (parsed.hostname or "").lower()
+    port = parsed.port or (443 if scheme == "https" else 80)
+    return scheme, hostname, port
+
+
+class _SameOriginRedirectHandler(HTTPRedirectHandler):
+    """Allow endpoint canonicalization without forwarding secrets cross-origin."""
+
+    def __init__(self, endpoint: str) -> None:
+        super().__init__()
+        self.origin = _http_origin(endpoint)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if _http_origin(newurl) != self.origin:
+            raise URLError("MCP HTTP redirect changed the configured origin")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 @dataclass(slots=True)
 class McpServerSummary:
     name: str
@@ -45,6 +69,8 @@ class McpServerSummary:
     protocol: str | None = None
     resourceCount: int | None = None
     promptCount: int | None = None
+    transport: str = "stdio"
+    url: str | None = None
 
 
 def _sanitize_tool_segment(value: str) -> str:
@@ -149,11 +175,10 @@ def _prepare_spawn(command: str, args: list[str]) -> tuple[list[str] | str, dict
     a single string for shell=True.
     """
     resolved = shutil.which(command)
-    if os.name == "nt":
-        if resolved:
-            if resolved.lower().endswith((".cmd", ".bat")):
-                return subprocess.list2cmdline([resolved, *args]), {"shell": True}
-            return [resolved, *args], {}
+    if os.name == "nt" and resolved:
+        if resolved.lower().endswith((".cmd", ".bat")):
+            return subprocess.list2cmdline([resolved, *args]), {"shell": True}
+        return [resolved, *args], {}
 
     # Keep python MCP helpers in the current runtime when the plain command is
     # unavailable. This applies on Windows too, where the launcher may be
@@ -352,7 +377,7 @@ class StdioMcpClient:
         spawn_exec, spawn_extra = _prepare_spawn(command, spawn_args)
         popen_kwargs.update(spawn_extra)
         try:
-            self.process = subprocess.Popen(  # noqa: S603
+            self.process = subprocess.Popen(
                 spawn_exec,
                 cwd=str(process_cwd),
                 env=env,
@@ -386,7 +411,7 @@ class StdioMcpClient:
                 if text:
                     self.stderr_lines.append(text)
                     self.stderr_lines = self.stderr_lines[-8:]
-            except Exception:
+            except OSError:
                 continue
 
     def _ensure_stdout_thread(self) -> None:
@@ -511,7 +536,7 @@ class StdioMcpClient:
             self._ensure_stdout_thread()
             return
         
-        header = f"Content-Length: {len(payload_bytes)}\r\n\r\n".encode("utf-8")
+        header = f"Content-Length: {len(payload_bytes)}\r\n\r\n".encode()
         self.process.stdin.write(header + payload_bytes)
         self.process.stdin.flush()
         self._ensure_stdout_thread()
@@ -598,7 +623,8 @@ class StdioMcpClient:
                         subprocess.run(
                             ["taskkill", "/T", "/F", "/PID", str(self.process.pid)],
                             capture_output=True,
-                            timeout=5
+                            timeout=5,
+                            check=False,
                         )
                     except subprocess.TimeoutExpired:
                         # taskkill 本身超时，强制 kill
@@ -606,7 +632,7 @@ class StdioMcpClient:
                             self.process.kill()
                         except OSError:
                             pass
-                    except Exception:
+                    except (OSError, subprocess.SubprocessError):
                         try:
                             self.process.kill()
                         except OSError:
@@ -641,6 +667,265 @@ class StdioMcpClient:
         self._prompts_cache = None
 
 
+class HttpMcpClient:
+    """MCP Streamable HTTP client with JSON and SSE response support."""
+
+    def __init__(self, server_name: str, config: dict[str, Any], cwd: str) -> None:
+        self.server_name = server_name
+        self.config = config
+        self.cwd = cwd
+        self.url = str(config.get("url") or "").strip()
+        self.next_id = 1
+        self.session_id = ""
+        self._started = False
+        self._start_error: str | None = None
+        self._tools_cache: list[dict[str, Any]] | None = None
+        self._resources_cache: list[dict[str, Any]] | None = None
+        self._prompts_cache: list[dict[str, Any]] | None = None
+        self.protocol = "streamable-http"
+        self._opener = build_opener(_SameOriginRedirectHandler(self.url))
+
+    @property
+    def is_started(self) -> bool:
+        return self._started
+
+    @property
+    def start_error(self) -> str | None:
+        return self._start_error
+
+    def _validate_url(self) -> None:
+        parsed = urlparse(self.url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise RuntimeError(f'MCP server "{self.server_name}" has an invalid HTTP URL.')
+        if parsed.username or parsed.password:
+            raise RuntimeError(
+                f'MCP server "{self.server_name}" must not place credentials in its URL.'
+            )
+        local_hosts = {"localhost", "127.0.0.1", "::1"}
+        if (
+            parsed.scheme == "http"
+            and parsed.hostname not in local_hosts
+            and self.config.get("allowInsecureHttp") is not True
+        ):
+            raise RuntimeError(
+                f'MCP server "{self.server_name}" uses insecure HTTP. '
+                "Use HTTPS or set allowInsecureHttp=true explicitly."
+            )
+
+    def _headers(self, *, include_session: bool = True) -> dict[str, str]:
+        headers = {
+            "Accept": "application/json, text/event-stream",
+            "Content-Type": "application/json",
+            "MCP-Protocol-Version": "2024-11-05",
+        }
+        raw_headers = self.config.get("headers", {})
+        if isinstance(raw_headers, dict):
+            for key, value in raw_headers.items():
+                resolved = value
+                if isinstance(value, dict) and set(value) == {"secretRef"}:
+                    env_name = str(value.get("secretRef") or "").strip()
+                    resolved = os.environ.get(env_name, "")
+                    if not resolved:
+                        raise RuntimeError(
+                            f'MCP server "{self.server_name}" requires environment secret {env_name!r}.'
+                        )
+                headers[str(key)] = str(resolved)
+        if include_session and self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        return headers
+
+    @staticmethod
+    def _decode_sse(payload: bytes) -> dict[str, Any]:
+        data_lines: list[str] = []
+        for raw_line in payload.decode("utf-8", errors="replace").splitlines():
+            if raw_line.startswith("data:"):
+                data_lines.append(raw_line[5:].lstrip())
+            elif not raw_line.strip() and data_lines:
+                candidate = "\n".join(data_lines)
+                data_lines = []
+                try:
+                    decoded = json.loads(candidate)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(decoded, dict):
+                    return decoded
+        if data_lines:
+            decoded = json.loads("\n".join(data_lines))
+            if isinstance(decoded, dict):
+                return decoded
+        raise RuntimeError("MCP Streamable HTTP response did not contain a JSON-RPC SSE event.")
+
+    def _post(self, message: dict[str, Any], *, timeout_seconds: float) -> dict[str, Any]:
+        body = json.dumps(message, ensure_ascii=False).encode("utf-8")
+        if len(body) > MAX_MCP_PAYLOAD_BYTES:
+            raise RuntimeError(
+                f"MCP request payload too large: {len(body)} bytes (limit {MAX_MCP_PAYLOAD_BYTES})"
+            )
+        request = Request(
+            self.url,
+            data=body,
+            headers=self._headers(),
+            method="POST",
+        )
+        try:
+            with self._opener.open(request, timeout=timeout_seconds) as response:
+                if _http_origin(response.geturl()) != _http_origin(self.url):
+                    raise RuntimeError("MCP HTTP redirect changed the configured host.")
+                session_id = response.headers.get("Mcp-Session-Id")
+                if session_id:
+                    self.session_id = session_id[:512]
+                payload = response.read(MAX_MCP_PAYLOAD_BYTES + 1)
+                if len(payload) > MAX_MCP_PAYLOAD_BYTES:
+                    raise RuntimeError(
+                        f"MCP payload too large (limit {MAX_MCP_PAYLOAD_BYTES})"
+                    )
+                if not payload:
+                    return {}
+                content_type = str(response.headers.get("Content-Type") or "").lower()
+        except HTTPError as exc:
+            detail = exc.read(4_096).decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"MCP {self.server_name}: HTTP {exc.code}: {detail.strip()}"
+            ) from exc
+        except URLError as exc:
+            raise RuntimeError(f"MCP {self.server_name}: HTTP connection failed: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"MCP {self.server_name}: request timed out") from exc
+
+        if "text/event-stream" in content_type:
+            return self._decode_sse(payload)
+        try:
+            decoded = json.loads(payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"MCP {self.server_name}: invalid JSON response: {exc}") from exc
+        if not isinstance(decoded, dict):
+            raise TypeError(f"MCP {self.server_name}: JSON-RPC response must be an object.")
+        return decoded
+
+    def start(self) -> None:
+        if self._started:
+            return
+        self._validate_url()
+        try:
+            response = self._request_without_start(
+                "initialize",
+                {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {},
+                    "clientInfo": {"name": "mini-code", "version": "0.1.0"},
+                },
+                timeout_seconds=3.0,
+            )
+            if response is None:
+                raise RuntimeError("MCP initialize returned no result.")
+            self._notify_without_start("notifications/initialized", {})
+            self._started = True
+            self._start_error = None
+        except Exception as exc:
+            self._start_error = str(exc)
+            raise
+
+    def _ensure_started(self) -> None:
+        if not self._started:
+            self.start()
+
+    def _request_without_start(
+        self, method: str, params: Any, *, timeout_seconds: float
+    ) -> Any:
+        message_id = self.next_id
+        self.next_id += 1
+        response = self._post(
+            {"jsonrpc": "2.0", "id": message_id, "method": method, "params": params},
+            timeout_seconds=timeout_seconds,
+        )
+        if response.get("error"):
+            error = response["error"]
+            raise RuntimeError(
+                f"MCP {self.server_name}: {error.get('message', 'JSON-RPC error')}"
+            )
+        return response.get("result")
+
+    def request(self, method: str, params: Any, timeout_seconds: float = 5.0) -> Any:
+        self._ensure_started()
+        return self._request_without_start(method, params, timeout_seconds=timeout_seconds)
+
+    def _notify_without_start(self, method: str, params: Any) -> None:
+        self._post(
+            {"jsonrpc": "2.0", "method": method, "params": params},
+            timeout_seconds=3.0,
+        )
+
+    def notify(self, method: str, params: Any) -> None:
+        self._ensure_started()
+        self._notify_without_start(method, params)
+
+    def list_tools(self) -> list[dict[str, Any]]:
+        if self._tools_cache is None:
+            result = self.request("tools/list", {})
+            self._tools_cache = list(result.get("tools", []) if isinstance(result, dict) else [])
+        return self._tools_cache
+
+    def list_resources(self) -> list[dict[str, Any]]:
+        if self._resources_cache is None:
+            result = self.request("resources/list", {}, timeout_seconds=3.0)
+            self._resources_cache = list(result.get("resources", []) if isinstance(result, dict) else [])
+        return self._resources_cache
+
+    def read_resource(self, uri: str) -> ToolResult:
+        return _format_read_resource_result(
+            self.request("resources/read", {"uri": uri}, timeout_seconds=5.0)
+        )
+
+    def list_prompts(self) -> list[dict[str, Any]]:
+        if self._prompts_cache is None:
+            result = self.request("prompts/list", {}, timeout_seconds=3.0)
+            self._prompts_cache = list(result.get("prompts", []) if isinstance(result, dict) else [])
+        return self._prompts_cache
+
+    def get_prompt(self, name: str, args: dict[str, str] | None = None) -> ToolResult:
+        return _format_prompt_result(
+            self.request(
+                "prompts/get",
+                {"name": name, "arguments": args or {}},
+                timeout_seconds=5.0,
+            )
+        )
+
+    def call_tool(self, name: str, input_data: Any) -> ToolResult:
+        return _format_tool_call_result(
+            self.request("tools/call", {"name": name, "arguments": input_data or {}})
+        )
+
+    def close(self) -> None:
+        if self.session_id:
+            request = Request(
+                self.url,
+                headers=self._headers(),
+                method="DELETE",
+            )
+            try:
+                with self._opener.open(request, timeout=1.0):
+                    pass
+            except (HTTPError, URLError, TimeoutError, OSError, RuntimeError, ValueError):
+                pass
+        self.session_id = ""
+        self._started = False
+        self._tools_cache = None
+        self._resources_cache = None
+        self._prompts_cache = None
+
+
+def _create_mcp_client(server_name: str, config: dict[str, Any], cwd: str) -> Any:
+    transport = str(config.get("transport") or "").strip().lower()
+    if transport == "sse":
+        raise RuntimeError(
+            "Legacy MCP SSE transport is not supported; use 'streamable-http'."
+        )
+    if config.get("url") or transport in {"http", "streamable-http"}:
+        return HttpMcpClient(server_name, config, cwd)
+    return StdioMcpClient(server_name, config, cwd)
+
+
 def create_mcp_backed_tools(*, cwd: str, mcp_servers: dict[str, dict[str, Any]]) -> dict[str, Any]:
     """Create MCP-backed tools with lazy server initialization.
     
@@ -654,7 +939,7 @@ def create_mcp_backed_tools(*, cwd: str, mcp_servers: dict[str, dict[str, Any]])
     - Resilience: a failed server doesn't block other servers
     - Auto-retry: servers are retried on first use after failure
     """
-    clients: list[StdioMcpClient] = []
+    clients: list[Any] = []
     tools: list[ToolDefinition] = []
     servers: list[dict[str, Any]] = []
     resource_index: dict[str, dict[str, Any]] = {}
@@ -662,11 +947,47 @@ def create_mcp_backed_tools(*, cwd: str, mcp_servers: dict[str, dict[str, Any]])
 
     for server_name, config in mcp_servers.items():
         if config.get("enabled") is False:
-            servers.append(asdict(McpServerSummary(name=server_name, command=config.get("command", ""), status="disabled", toolCount=0, protocol=config.get("protocol"))))
+            servers.append(
+                asdict(
+                    McpServerSummary(
+                        name=server_name,
+                        command=config.get("command", ""),
+                        status="disabled",
+                        toolCount=0,
+                        protocol=config.get("protocol"),
+                        transport=(
+                            "streamable-http"
+                            if config.get("url")
+                            or str(config.get("transport") or "").lower() in {"http", "streamable-http"}
+                            else "stdio"
+                        ),
+                        url=str(config.get("url") or "") or None,
+                    )
+                )
+            )
             continue
 
-        client = StdioMcpClient(server_name, config, cwd)
+        try:
+            client = _create_mcp_client(server_name, config, cwd)
+        except Exception as error:  # noqa: BLE001 - isolate malformed server config
+            servers.append(
+                asdict(
+                    McpServerSummary(
+                        name=server_name,
+                        command=config.get("command", ""),
+                        status="error",
+                        toolCount=0,
+                        error=str(error)[:200],
+                        protocol=config.get("protocol"),
+                        transport=str(config.get("transport") or "stdio"),
+                        url=str(config.get("url") or "") or None,
+                    )
+                )
+            )
+            continue
         clients.append(client)
+        transport = "streamable-http" if isinstance(client, HttpMcpClient) else "stdio"
+        endpoint = str(config.get("url") or "") or None
         
         # Register server with "pending" status — will be connected lazily
         servers.append(
@@ -677,6 +998,8 @@ def create_mcp_backed_tools(*, cwd: str, mcp_servers: dict[str, dict[str, Any]])
                     status="pending",
                     toolCount=0,
                     protocol=config.get("protocol"),
+                    transport=transport,
+                    url=endpoint,
                 )
             )
         )
@@ -740,6 +1063,8 @@ def create_mcp_backed_tools(*, cwd: str, mcp_servers: dict[str, dict[str, Any]])
                             protocol=client.protocol,
                             resourceCount=len(resources),
                             promptCount=len(prompts),
+                            transport=transport,
+                            url=endpoint,
                         )
                     )
                     break
@@ -756,6 +1081,8 @@ def create_mcp_backed_tools(*, cwd: str, mcp_servers: dict[str, dict[str, Any]])
                             toolCount=0,
                             error=str(error)[:200],
                             protocol=config.get("protocol"),
+                            transport=transport,
+                            url=endpoint,
                         )
                     )
                     break

@@ -20,9 +20,17 @@ from typing import Any
 # search/get records that crowd out the source memories they reference.
 MEMORY_NAVIGATION_TOOL_NAMES = (
     "memory_search",
+    "history_search",
+    "session_history_search",
+    "session_history_read",
     "memory_get",
     "artifact_read",
     "checkpoint_restore",
+    "memory_note_update",
+    "context_rotate",
+    # Tool discovery also produces navigation receipts, not task knowledge.
+    "discover_tools",
+    "runtime_context_read",
 )
 
 
@@ -48,11 +56,18 @@ def content_hash_text(value: str) -> str:
 
 class MemoryMode(str, Enum):
     INLINE = "INLINE"
+    # Accepted only for legacy configuration/checkpoint decoding. Runtime
+    # packets use PAGED_MEMORY; explicit legacy selection keeps local retrieval.
     WORKING_SET = "WORKING_SET"
     PAGED_MEMORY = "PAGED_MEMORY"
 
+    @property
+    def canonical(self) -> MemoryMode:
+        return MemoryMode.PAGED_MEMORY if self is MemoryMode.WORKING_SET else self
+
 
 class EventType(str, Enum):
+    SESSION_TURN_STATUS = "SESSION_TURN_STATUS"
     USER_INPUT = "USER_INPUT"
     MODEL_OUTPUT = "MODEL_OUTPUT"
     TOOL_CALL = "TOOL_CALL"
@@ -64,6 +79,8 @@ class EventType(str, Enum):
     CONSTRAINT_CREATED = "CONSTRAINT_CREATED"
     ARTIFACT_CREATED = "ARTIFACT_CREATED"
     CHECKPOINT_CREATED = "CHECKPOINT_CREATED"
+    HANDOFF_NOTE_UPDATED = "HANDOFF_NOTE_UPDATED"
+    CONTEXT_ROTATED = "CONTEXT_ROTATED"
     MEMORY_MODE_CHANGED = "MEMORY_MODE_CHANGED"
     MEMORY_INDEX_REQUESTED = "MEMORY_INDEX_REQUESTED"
     MEMORY_INDEXED = "MEMORY_INDEXED"
@@ -77,6 +94,7 @@ class EventType(str, Enum):
 
 class MemoryStatus(str, Enum):
     ACTIVE = "ACTIVE"
+    ARCHIVED = "ARCHIVED"
     OPEN = "OPEN"
     RESOLVED = "RESOLVED"
     SUPERSEDED = "SUPERSEDED"
@@ -101,7 +119,6 @@ class ArchiveStatus(str, Enum):
 
 class StorageHealth(str, Enum):
     NORMAL = "NORMAL"
-    INDEX_DEGRADED = "INDEX_DEGRADED"
     ARTIFACT_DEGRADED = "ARTIFACT_DEGRADED"
     AUTHORITY_UNAVAILABLE = "AUTHORITY_UNAVAILABLE"
     RECOVERING = "RECOVERING"
@@ -155,6 +172,17 @@ class TaskMetrics:
     repeated_dependency_count: int = 0
     audit_required: bool = False
     mode_downgrade_streak: int = 0
+    mode_downgrade_observation_id: str = ""
+    rerank_eligible: bool | None = None
+    rerank_downgrade_streak: int = 0
+    rerank_downgrade_observation_id: str = ""
+    counter_run_id: str = ""
+    context_forecast_ratio: float = 0.0
+    context_protection_epoch: int = -1
+    context_protection_steps: int = 0
+    context_protection_observation_id: str = ""
+    context_protection_user_hash: str = ""
+    context_tool_token_peak: int = 0
 
 
 @dataclass(frozen=True)
@@ -162,6 +190,8 @@ class ModeSelection:
     mode: MemoryMode
     reason: str
     changed: bool = False
+    rerank_allowed: bool = False
+    rerank_reason: str = ""
 
 
 @dataclass
@@ -204,6 +234,8 @@ class TaskStateSnapshot:
     pending_steps: list[str] = field(default_factory=list)
     active_artifacts: list[str] = field(default_factory=list)
     blocked_by: list[str] = field(default_factory=list)
+    handoff_notes: dict[str, dict[str, Any]] = field(default_factory=dict)
+    context_rotations: dict[str, dict[str, Any]] = field(default_factory=dict)
     updated_at: float = field(default_factory=now_epoch)
 
     def to_dict(self) -> dict[str, Any]:
@@ -217,6 +249,30 @@ class TaskStateSnapshot:
         data["version"] = self.version + 1
         data["updated_at"] = float(patch.get("updated_at", now_epoch()))
         return TaskStateSnapshot(**data)
+
+
+class HandoffNoteConflict(ValueError):
+    """The writer must refresh its note revision or task contract before retrying."""
+
+
+class ContextRotationConflict(ValueError):
+    """The rotation epoch, note or task contract changed before commit."""
+
+
+def handoff_contract_hash(state: TaskStateSnapshot) -> str:
+    """Exclude progress and notes so their updates do not invalidate each other."""
+    return content_hash_text(stable_json({
+        "goal": state.goal,
+        "constraints": state.active_constraints,
+        # Runtime restoration can assign new IDs to identical decisions. New
+        # projections carry a semantic digest; legacy projections conservatively
+        # keep their immutable version identity until refreshed by the runtime.
+        "decisions": {
+            key: {"content": value.get("content_hash") or value,
+                  "status": value.get("status", "ACTIVE")}
+            for key, value in state.active_decisions.items()
+        },
+    }))
 
 
 def apply_transactional_state_patch(
@@ -236,6 +292,32 @@ def apply_transactional_state_patch(
     artifact_additions = effective.pop("_active_artifacts_append", None)
     error_additions = effective.pop("_open_errors_append", None)
     completed_step_additions = effective.pop("_completed_steps_append", None)
+    note_update = effective.pop("_handoff_note_update", None)
+    rotation_update = effective.pop("_context_rotation_update", None)
+
+    if rotation_update is not None:
+        owner = rotation_update["owner"]
+        current = state.context_rotations.get(owner, {})
+        if current.get("epoch", 0) != rotation_update["expected_epoch"]:
+            raise ContextRotationConflict("context epoch changed; refresh context before retrying")
+        if state.handoff_notes.get(owner, {}) != rotation_update["note_pointer"]:
+            raise ContextRotationConflict("handoff note changed; refresh context before rotating")
+        if handoff_contract_hash(state) != rotation_update["contract_hash"]:
+            raise ContextRotationConflict("task contract changed; refresh context before rotating")
+        effective["context_rotations"] = {
+            **state.context_rotations, owner: dict(rotation_update["pointer"]),
+        }
+
+    if note_update is not None:
+        owner = note_update["owner"]
+        current = state.handoff_notes.get(owner, {})
+        if current.get("revision", 0) != note_update["expected_revision"]:
+            raise HandoffNoteConflict("handoff note revision changed; refresh context before retrying")
+        if handoff_contract_hash(state) != note_update["contract_hash"]:
+            raise HandoffNoteConflict("task contract changed; refresh context before writing a note")
+        effective["handoff_notes"] = {
+            **state.handoff_notes, owner: dict(note_update["pointer"]),
+        }
 
     if decision_updates is not None:
         if not isinstance(decision_updates, Mapping):
@@ -340,6 +422,9 @@ class DependencyRecord:
     required: bool = True
     dependency_depth: int = 0
     created_at: float = field(default_factory=now_epoch)
+    # Resolution-only flag: the bounded traversal must not report a partial
+    # required closure as complete. It is not a persisted dependency column.
+    closure_truncated: bool = False
 
 
 @dataclass
@@ -413,9 +498,6 @@ class MemoryRecord:
     token_count: int = 0
     phase: str = ""
     facets: list[str] = field(default_factory=list)
-    milvus_collection: str = ""
-    milvus_primary_key: str = ""
-    indexed_at: float | None = None
     created_at: float = field(default_factory=now_epoch)
     updated_at: float = field(default_factory=now_epoch)
 
@@ -441,25 +523,6 @@ class CheckpointRecord:
     def __post_init__(self) -> None:
         if not self.content_hash:
             self.content_hash = content_hash_text(stable_json(self.snapshot))
-
-
-@dataclass
-class OutboxRecord:
-    aggregate_type: str
-    aggregate_id: str
-    event_type: str
-    payload: dict[str, Any]
-    id: str = field(default_factory=lambda: new_id("outbox"))
-    status: str = "PENDING"
-    retry_count: int = 0
-    next_retry_at: float = 0.0
-    created_at: float = field(default_factory=now_epoch)
-    processed_at: float | None = None
-    claim_token: str = ""
-
-
-class OutboxClaimLostError(RuntimeError):
-    """The outbox row was reclaimed after this consumer's lease expired."""
 
 
 @dataclass
@@ -498,6 +561,7 @@ class ContextPacket:
     recent_messages: list[ContextItem] = field(default_factory=list)
     working_set: list[ContextItem] = field(default_factory=list)
     supplemental_memories: list[ContextItem] = field(default_factory=list)
+    handoff_notes: list[ContextItem] = field(default_factory=list)
     loaded_raw_spans: list[ContextItem] = field(default_factory=list)
     artifact_manifest: list[dict[str, Any]] = field(default_factory=list)
     estimated_input_tokens: int = 0
@@ -515,6 +579,7 @@ class ContextPacket:
             *self.recent_messages,
             *self.working_set,
             *self.supplemental_memories,
+            *self.handoff_notes,
             *self.loaded_raw_spans,
         ]
 
@@ -533,6 +598,7 @@ class ContextPacket:
                 item.to_dict() for item in self.supplemental_memories
             ],
             "loaded_raw_spans": [item.to_dict() for item in self.loaded_raw_spans],
+            "handoff_notes": [item.to_dict() for item in self.handoff_notes],
             "artifact_manifest": list(self.artifact_manifest),
             "estimated_input_tokens": self.estimated_input_tokens,
             "token_budget": self.token_budget,
@@ -577,6 +643,7 @@ class MemorySearchRequest:
     candidate_limit: int = 40
     required_facets: tuple[str, ...] = ()
     excluded_facets: tuple[str, ...] = MEMORY_NAVIGATION_TOOL_NAMES
+    deadline_monotonic: float | None = None
 
 
 @dataclass
@@ -584,8 +651,8 @@ class MemoryHit:
     record: MemoryRecord
     score: float
     lexical_score: float = 0.0
-    vector_score: float = 0.0
     reason: str = ""
+    rerank_score: float | None = None
 
 
 @dataclass

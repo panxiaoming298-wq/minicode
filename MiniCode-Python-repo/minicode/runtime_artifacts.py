@@ -22,12 +22,30 @@ class ArtifactIntegrityError(RuntimeError):
 class RuntimeArtifactStore:
     """Persist complete outputs atomically and expose verified references."""
 
+    @staticmethod
+    def node_directory(node_id: str) -> str:
+        return node_id if len(node_id) <= 32 else "node-" + hashlib.sha256(node_id.encode("utf-8")).hexdigest()[:24]
+
+    @classmethod
+    def owns_reference(cls, ref: ArtifactRef, *, run_id: str, node_id: str) -> bool:
+        key = ref.store_key.replace("\\", "/")
+        return (ref.size > 0 and ".." not in key.split("/")
+            and key.startswith(f"{run_id}/{cls.node_directory(node_id)}/"))
+
     def __init__(self, root: Path | None = None) -> None:
         self.root = (
             Path(root)
             if root is not None
             else MINI_CODE_DIR / "memory-v2" / "runtime-artifacts"
         )
+        if os.name == "nt":
+            # Run IDs and Builder IDs can push an otherwise valid configured
+            # root past MAX_PATH. Keep relative store keys unchanged, but use
+            # the extended namespace for all storage and alias checks.
+            value = str(self.root.absolute())
+            if not value.startswith("\\\\?\\"):
+                value = "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
+            self.root = Path(value)
 
     def put_text(
         self,
@@ -56,7 +74,12 @@ class RuntimeArtifactStore:
         self._validate_component(node_id)
         digest = hashlib.sha256(data).hexdigest()
         artifact_id = new_id("artifact")
-        directory = self.root / run_id / node_id
+        # Durable consultation IDs include a full digest. Do not repeat that
+        # long logical ID in Windows paths: artifact IDs and content hashes
+        # still identify each file, and authorization uses the ArtifactRef,
+        # never this storage-only directory name. Old store_keys stay readable.
+        node_directory = self.node_directory(node_id)
+        directory = self.root / run_id / node_directory
         directory.mkdir(parents=True, exist_ok=True)
         self._ensure_safe_path(directory)
         content_path = directory / f"{artifact_id}.blob"
@@ -88,6 +111,26 @@ class RuntimeArtifactStore:
 
     def get_text(self, ref: ArtifactRef) -> str:
         return self.get_bytes(ref).decode("utf-8")
+
+    def owned_reference(self, artifact_id: str, *, run_id: str, node_id: str) -> ArtifactRef | None:
+        """Resolve only an explicitly authorized producer's immutable metadata."""
+        if not re.fullmatch(r"artifact-[a-f0-9]{32}", artifact_id):
+            return None
+        self._validate_component(run_id)
+        self._validate_component(node_id)
+        key = f"{run_id}/{self.node_directory(node_id)}/{artifact_id}"
+        metadata = self._resolve_key(key + ".json")
+        if not metadata.is_file():
+            return None
+        self._ensure_safe_path(metadata, reject_hardlinks=True)
+        try:
+            ref = ArtifactRef(**json.loads(metadata.read_text(encoding="utf-8")))
+        except (TypeError, ValueError) as error:
+            raise ArtifactIntegrityError("artifact metadata is invalid") from error
+        if ref.artifact_id != artifact_id or ref.store_key != key + ".blob":
+            raise ArtifactIntegrityError("artifact metadata does not match the authorized producer")
+        self.get_bytes(ref)
+        return ref
 
     def read_range(self, ref: ArtifactRef, *, start: int, end: int) -> bytes:
         """Return a verified half-open byte range without changing cursor units."""
@@ -158,7 +201,10 @@ class RuntimeArtifactStore:
 
     def _atomic_write(self, path: Path, data: bytes) -> None:
         self._ensure_safe_path(path, reject_hardlinks=True)
-        temporary = path.with_name(f".{path.name}.{new_id('tmp')}.tmp")
+        # The random name already guarantees exclusive staging. Repeating the
+        # target filename can exceed Windows MAX_PATH for an otherwise valid
+        # artifact path (especially with nested run / consultation IDs).
+        temporary = path.with_name(f".{new_id('tmp')}")
         self._ensure_safe_path(temporary, reject_hardlinks=True)
         try:
             with temporary.open("xb") as handle:

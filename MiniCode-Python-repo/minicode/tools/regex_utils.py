@@ -3,10 +3,19 @@ from __future__ import annotations
 import re
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
+from minicode.tools._validation import validate_fields
+
+
+def _validate_flags(flags: str) -> str:
+    flags = flags.strip()
+    if set(flags) - set("ims"):
+        raise ValueError("flags may contain only i, m and s")
+    return flags
 
 
 def _validate_regex_test(input_data: dict) -> dict:
     """Validate input for regex_test tool."""
+    validate_fields(input_data, required=("pattern", "text"), pattern=str, text=str, flags=str)
     pattern = input_data.get("pattern", "")
     text = input_data.get("text", "")
     if not isinstance(pattern, str) or not pattern.strip():
@@ -14,7 +23,7 @@ def _validate_regex_test(input_data: dict) -> dict:
     if not isinstance(text, str):
         raise ValueError("text is required and must be a string")
     flags = input_data.get("flags", "")
-    return {"pattern": pattern.strip(), "text": text, "flags": flags.strip()}
+    return {"pattern": pattern, "text": text, "flags": _validate_flags(flags)}
 
 
 def _run_regex_test(input_data: dict, context: ToolContext) -> ToolResult:
@@ -52,7 +61,7 @@ def _run_regex_test(input_data: dict, context: ToolContext) -> ToolResult:
         
         return ToolResult(ok=True, output="\n".join(lines))
     except re.error as e:
-        return ToolResult(ok=False, output=f"Invalid regex: {e}")
+        return ToolResult(ok=False, output=f"Invalid regex: {e}", failureKind="invalid_input")
 
 
 regex_test_tool = ToolDefinition(
@@ -60,6 +69,7 @@ regex_test_tool = ToolDefinition(
     description="Test a regex pattern against text. Shows all matches with groups and spans.",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "pattern": {"type": "string", "description": "Regular expression pattern"},
             "text": {"type": "string", "description": "Text to search"},
@@ -78,6 +88,8 @@ regex_test_tool = ToolDefinition(
 
 def _validate_regex_replace(input_data: dict) -> dict:
     """Validate input for regex_replace tool."""
+    validate_fields(input_data, required=("pattern", "text", "replacement"),
+                    pattern=str, text=str, replacement=str, flags=str)
     pattern = input_data.get("pattern", "")
     text = input_data.get("text", "")
     replacement = input_data.get("replacement", "")
@@ -88,7 +100,7 @@ def _validate_regex_replace(input_data: dict) -> dict:
     if not isinstance(replacement, str):
         raise ValueError("replacement is required and must be a string")
     flags = input_data.get("flags", "")
-    return {"pattern": pattern.strip(), "text": text, "replacement": replacement, "flags": flags.strip()}
+    return {"pattern": pattern, "text": text, "replacement": replacement, "flags": _validate_flags(flags)}
 
 
 def _run_regex_replace(input_data: dict, context: ToolContext) -> ToolResult:
@@ -114,7 +126,7 @@ def _run_regex_replace(input_data: dict, context: ToolContext) -> ToolResult:
         output = f"Replaced {count} match(es):\n\n--- Result ---\n{result}"
         return ToolResult(ok=True, output=output)
     except re.error as e:
-        return ToolResult(ok=False, output=f"Invalid regex: {e}")
+        return ToolResult(ok=False, output=f"Invalid regex: {e}", failureKind="invalid_input")
 
 
 regex_replace_tool = ToolDefinition(
@@ -122,6 +134,7 @@ regex_replace_tool = ToolDefinition(
     description="Replace regex matches in text. Returns the modified text and match count.",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "pattern": {"type": "string", "description": "Regular expression pattern"},
             "text": {"type": "string", "description": "Text to search and replace"},

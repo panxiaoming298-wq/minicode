@@ -1,0 +1,13 @@
+.skill-mention { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 0 3px; vertical-align: bottom; color: #1d4ed8; background: #2563eb14; border-radius: 4px; }
+.skill-mention > svg { flex: 0 0 auto; }
+.skill-mention-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.skill-mention-remove { display: inline-flex; align-items: center; justify-content: center; flex: 0 0 auto; width: 17px; height: 19px; padding: 0; border-radius: 3px; color: inherit; background: transparent; }
+.skill-mention-remove:hover { background: #2563eb20; }
+.composer-input { position: relative; overflow: hidden; }
+.composer-skill-chip { position: absolute; z-index: 1; top: 1px; left: 2px; display: flex; max-width: calc(100% - 32px); font-size: 15px; line-height: 1.55; }
+.composer-skill-chip.is-selected .skill-mention { background: #2563eb30; outline: 1px solid #2563eb80; outline-offset: -1px; }
+.composer .composer-input.has-skill textarea { text-indent: var(--skill-chip-offset, 0px); }
+@media (forced-colors: active) {
+  .skill-mention { color: LinkText; outline: 1px solid LinkText; }
+  .composer-skill-chip.is-selected .skill-mention { color: HighlightText; background: Highlight; }
+}

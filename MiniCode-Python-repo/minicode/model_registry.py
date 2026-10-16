@@ -21,8 +21,6 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-
-
 # ---------------------------------------------------------------------------
 # Provider types
 # ---------------------------------------------------------------------------
@@ -31,6 +29,7 @@ class Provider(str, Enum):
     ANTHROPIC = "anthropic"
     OPENAI = "openai"
     DEEPSEEK = "deepseek"
+    BAILIAN = "bailian"
     OPENROUTER = "openrouter"
     CUSTOM = "custom"
     MOCK = "mock"
@@ -73,6 +72,15 @@ OPENAI_COMPATIBLE_PROVIDER_SPECS: dict[Provider, OpenAICompatibleProviderSpec] =
         default_base_url="https://api.deepseek.com",
         chat_completions_path="/chat/completions",
         extra_headers_env="DEEPSEEK_API_EXTRA_HEADERS",
+    ),
+    Provider.BAILIAN: OpenAICompatibleProviderSpec(
+        provider=Provider.BAILIAN,
+        runtime_base_url_key="bailianBaseUrl",
+        runtime_api_key_key="bailianApiKey",
+        base_url_env_names=("DASHSCOPE_BASE_URL", "BAILIAN_BASE_URL"),
+        api_key_env_names=("DASHSCOPE_API_KEY", "BAILIAN_API_KEY"),
+        default_base_url="https://dashscope.aliyuncs.com/compatible-mode/v1",
+        extra_headers_env="BAILIAN_API_EXTRA_HEADERS",
     ),
     Provider.OPENROUTER: OpenAICompatibleProviderSpec(
         provider=Provider.OPENROUTER,
@@ -117,6 +125,7 @@ class ModelInfo:
     supports_streaming: bool = True
     supports_tools: bool = True
     supports_vision: bool = False
+    supported_reasoning_efforts: tuple[str, ...] = ()
     pricing_input: float = 3.0        # USD per 1M input tokens
     pricing_output: float = 15.0      # USD per 1M output tokens
 
@@ -278,6 +287,12 @@ class ModelSelectionController:
 # Built-in model catalog
 # ---------------------------------------------------------------------------
 
+# Metadata aliases only: adapters must preserve the configured ID on the wire.
+# V4.1 Flash is served as deepseek-flash by the official API and under this
+# versioned ID by compatible providers. Share its nominal capacity/capabilities,
+# without inheriting endpoint-specific output policies.
+MODEL_ID_ALIASES = {"deepseek-v4.1-flash": "deepseek-flash"}
+
 BUILTIN_MODELS: dict[str, ModelInfo] = {}
 _OPENAI_EXPOSED_MODELS_CACHE: dict[tuple[str, str], tuple[str, ...]] = {}
 
@@ -291,7 +306,7 @@ def _register(info: ModelInfo) -> None:
 
 def _aliases(name: str) -> list[str]:
     """Generate common aliases for a model name."""
-    result: list[str] = []
+    result = [alias for alias, canonical in MODEL_ID_ALIASES.items() if canonical == name]
     # e.g. "claude-sonnet-4-20250514" -> "claude-sonnet-4", "sonnet-4"
     parts = name.split("-")
     if "claude" in parts:
@@ -412,7 +427,7 @@ def probe_openai_exposed_models(
         models = _extract_model_ids(json.loads(payload))
     except (urllib.error.URLError, OSError, ValueError):
         return preset
-    except Exception:
+    except Exception:  # noqa: BLE001 - optional provider discovery must fail closed
         return preset
 
     cache_key = (_openai_models_endpoint(base_url), api_key)
@@ -477,16 +492,32 @@ _register(ModelInfo("o3-mini", Provider.OPENAI,
     pricing_input=1.10, pricing_output=4.40))
 
 # --- DeepSeek direct API models ---
+_register(ModelInfo("deepseek-flash", Provider.DEEPSEEK,
+    display_name="DeepSeek V4.1 Flash", context_window=1_000_000,
+    max_output_tokens=393_216, supports_vision=True,
+    pricing_input=0.30, pricing_output=1.20,
+    supported_reasoning_efforts=("low", "high", "max")))
 _register(ModelInfo("deepseek-v4-pro", Provider.DEEPSEEK,
     display_name="DeepSeek V4 Pro", context_window=1_000_000,
-    max_output_tokens=384_000, pricing_input=1.32, pricing_output=3.96))
+    max_output_tokens=393_216, pricing_input=1.32, pricing_output=3.96,
+    supported_reasoning_efforts=("low", "high", "max")))
 _register(ModelInfo("deepseek-v4-flash", Provider.DEEPSEEK,
     display_name="DeepSeek V4 Flash", context_window=1_000_000,
-    max_output_tokens=384_000, pricing_input=0.44, pricing_output=1.32))
+    max_output_tokens=384_000, pricing_input=0.44, pricing_output=1.32,
+    supported_reasoning_efforts=("low", "high", "max")))
 _register(ModelInfo("deepseek-v4-flash-vision-exp", Provider.DEEPSEEK,
     display_name="DeepSeek V4 Flash Vision (Experimental)",
     context_window=1_000_000, max_output_tokens=384_000,
-    supports_vision=True, pricing_input=0.44, pricing_output=1.32))
+    supports_vision=True, pricing_input=0.44, pricing_output=1.32,
+    supported_reasoning_efforts=("low", "high", "max")))
+
+# --- Alibaba Cloud Model Studio (Bailian) OpenAI-compatible models ---
+_register(ModelInfo("qwen-plus", Provider.BAILIAN,
+    display_name="Qwen Plus (Bailian)"))
+_register(ModelInfo("qwen-max", Provider.BAILIAN,
+    display_name="Qwen Max (Bailian)"))
+_register(ModelInfo("qwen-turbo", Provider.BAILIAN,
+    display_name="Qwen Turbo (Bailian)"))
 
 # --- OpenRouter popular models ---
 _register(ModelInfo("openrouter/auto", Provider.OPENROUTER,
@@ -546,10 +577,11 @@ def detect_provider(
     Priority:
     1. Explicit ``MINI_CODE_PROVIDER`` / runtime ``provider`` selection
     2. DeepSeek direct models and credentials
-    3. OpenRouter vendor-prefixed models
-    4. OpenAI models and explicitly exposed compatible models
-    5. Custom compatible endpoint
-    6. Anthropic default
+    3. Alibaba Cloud Model Studio (Bailian) Qwen models
+    4. OpenRouter vendor-prefixed models
+    5. OpenAI models and explicitly exposed compatible models
+    6. Custom compatible endpoint
+    7. Anthropic default
     """
     runtime = runtime or {}
     model_lower = model.lower()
@@ -600,6 +632,16 @@ def detect_provider(
         and model_lower.startswith("deepseek-")
     ):
         return Provider.DEEPSEEK
+
+    bailian_key = (
+        runtime.get("bailianApiKey")
+        or os.environ.get("DASHSCOPE_API_KEY")
+        or os.environ.get("BAILIAN_API_KEY")
+    )
+    if catalog_info is not None and catalog_info.provider == Provider.BAILIAN:
+        return Provider.BAILIAN
+    if bailian_key and catalog_info is None and model_lower.startswith(("qwen-", "qwq-", "qvq-")):
+        return Provider.BAILIAN
 
     # OpenRouter detection
     if os.environ.get("OPENROUTER_API_KEY") or model_lower.startswith("openrouter/"):
@@ -798,6 +840,25 @@ def build_provider_config(model: str, runtime: dict[str, Any] | None = None) -> 
             chat_completions_path=spec.chat_completions_path,
         )
 
+    if provider == Provider.BAILIAN:
+        spec = OPENAI_COMPATIBLE_PROVIDER_SPECS[Provider.BAILIAN]
+        return ProviderConfig(
+            provider=Provider.BAILIAN,
+            model=model,
+            base_url=_first_runtime_or_env(
+                runtime,
+                spec.runtime_base_url_key,
+                spec.base_url_env_names,
+                spec.default_base_url,
+            ).rstrip("/"),
+            api_key=_first_runtime_or_env(
+                runtime,
+                spec.runtime_api_key_key,
+                spec.api_key_env_names,
+            ),
+            extra_headers=_parse_extra_headers(spec.extra_headers_env or ""),
+        )
+
     if provider == Provider.OPENROUTER:
         spec = OPENAI_COMPATIBLE_PROVIDER_SPECS[Provider.OPENROUTER]
         return ProviderConfig(
@@ -858,12 +919,19 @@ def build_provider_config(model: str, runtime: dict[str, Any] | None = None) -> 
             spec.runtime_api_key_key,
             spec.api_key_env_names,
         )
+        runtime_headers = runtime.get("customExtraHeaders", {})
+        extra_headers = (
+            {str(key): str(value) for key, value in runtime_headers.items()}
+            if isinstance(runtime_headers, dict)
+            else {}
+        )
+        extra_headers.update(_parse_extra_headers(spec.extra_headers_env or ""))
         return ProviderConfig(
             provider=Provider.CUSTOM,
             model=model,
             base_url=base_url,
             api_key=api_key,
-            extra_headers=_parse_extra_headers(spec.extra_headers_env or ""),
+            extra_headers=extra_headers,
         )
 
     # Default: Anthropic

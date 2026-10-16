@@ -1,0 +1,68 @@
+.settings-tool-catalog { display: grid; gap: 16px; min-width: 0; padding-bottom: 8px; }
+.tool-catalog-scope { display: flex; align-items: center; gap: 12px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); }
+.tool-catalog-scope > label { flex-shrink: 0; font-size: 12px; color: var(--muted); }
+.tool-catalog-scope-picker { display: flex; flex: 1; min-width: 0; align-items: center; gap: 8px; }
+.tool-catalog-scope-picker svg { flex-shrink: 0; color: var(--text-soft); }
+.tool-catalog-scope select { width: 100%; min-width: 0; min-height: 40px; padding: 8px 10px; border: 1px solid var(--line-strong); border-radius: 8px; font-size: 13px; background: var(--surface-raised); text-overflow: ellipsis; }
+.tool-catalog-scope .icon-button { min-width: 40px; min-height: 40px; flex-shrink: 0; }
+.tool-catalog-help { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
+.tool-catalog-toolbar { display: flex; align-items: center; gap: 14px; }
+.tool-catalog-search { display: flex; align-items: center; flex: 1; min-width: 0; gap: 9px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 10px; background: var(--surface-raised); color: var(--muted); }
+.tool-catalog-search input { width: 100%; min-width: 0; height: 44px; border: 0; background: transparent; font-size: 13px; }
+.tool-catalog-search:focus-within { outline: 2px solid var(--focus-ring); }
+.tool-catalog-search input:focus-visible { box-shadow: none; }
+.tool-catalog-count { flex-shrink: 0; color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.tool-catalog-filters { display: flex; flex-wrap: wrap; gap: 6px; }
+.tool-catalog-filters button { display: inline-flex; align-items: center; gap: 7px; min-height: 38px; padding: 7px 11px; border-radius: 9px; background: transparent; color: var(--text-soft); font-size: 12px; white-space: nowrap; }
+.tool-catalog-filters button[aria-pressed='true'] { background: var(--panel-deep); color: var(--text); font-weight: 550; }
+.tool-catalog-filters button:hover { background: var(--panel); }
+.tool-catalog-filters button span { color: var(--muted); font-size: 11px; }
+.tool-catalog-list { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+.tool-catalog-card { min-width: 0; padding: 18px 20px; border: 1px solid var(--line-strong); border-radius: 16px; background: var(--surface-raised); }
+.tool-catalog-card > header { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+.tool-catalog-card > header > div { display: grid; min-width: 0; gap: 4px; }
+.tool-catalog-card strong { font-size: 14px; font-weight: 600; overflow-wrap: anywhere; }
+.tool-catalog-card code { color: var(--muted); font-family: var(--font-code); font-size: 11px; overflow-wrap: anywhere; }
+.tool-catalog-card > p { margin: 12px 0; font-size: 12px; color: var(--text-soft); line-height: 1.8; overflow-wrap: anywhere; }
+.tool-catalog-status { flex-shrink: 0; border-radius: 6px; padding: 3px 7px; font-size: 10px; line-height: 1.6; color: var(--muted); background: var(--panel); }
+.tool-catalog-status.is-ready { color: var(--success); background: var(--success-soft); }
+.tool-catalog-status.is-pending { color: var(--warning); background: var(--warning-soft); }
+.tool-catalog-meta { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 12px; color: var(--muted); font-size: 11px; }
+.tool-catalog-meta > span { min-width: 0; overflow-wrap: anywhere; }
+.tool-catalog-meta .effect-badge { font-size: 10px; }
+.tool-catalog-destructive { color: var(--danger); }
+.tool-catalog-parameters { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); color: var(--text-soft); font-size: 12px; }
+.tool-catalog-parameters summary { min-height: 36px; padding-block: 8px; cursor: pointer; }
+.tool-catalog-parameters dl { display: grid; gap: 8px; margin: 6px 0; }
+.tool-catalog-parameters dl > div { display: flex; justify-content: space-between; gap: 16px; }
+.tool-catalog-parameters dd { margin: 0; color: var(--muted); }
+.tool-catalog-empty { display: grid; justify-items: center; gap: 12px; padding: 36px 16px; color: var(--muted); font-size: 13px; text-align: center; }
+.tool-catalog-empty p { margin: 0; }
+.tool-catalog-error { display: flex; align-items: flex-start; gap: 10px; padding: 12px; border-radius: 10px; color: var(--danger); background: var(--danger-soft); font-size: 12px; }
+.tool-catalog-error > svg { flex-shrink: 0; margin-top: 3px; }
+.tool-catalog-error p { flex: 1; min-width: 0; margin: 0; line-height: 1.7; overflow-wrap: anywhere; }
+.tool-catalog-error .button { min-height: 36px; flex-shrink: 0; font-size: 12px; }
+.tool-catalog-mcp { display: grid; gap: 14px; margin-top: 8px; padding: 18px 20px; border: 1px solid var(--line); border-radius: 16px; background: var(--panel); }
+.tool-catalog-mcp h3 { display: flex; align-items: center; gap: 8px; margin: 0; font-size: 14px; font-weight: 600; }
+.tool-catalog-mcp h3 span { margin-left: auto; color: var(--muted); font-size: 11px; font-weight: 400; }
+.tool-catalog-mcp ul { margin: 0; padding: 0; list-style: none; }
+.tool-catalog-mcp li + li { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 12px; }
+.tool-catalog-mcp li > div { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 6px 12px; }
+.tool-catalog-mcp li strong { min-width: 0; font-size: 12px; font-weight: 550; overflow-wrap: anywhere; }
+.tool-catalog-mcp li span { color: var(--muted); font-size: 11px; }
+.tool-catalog-mcp li p { margin: 6px 0 0; color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.capability-catalog-link { display: inline-flex; align-items: center; gap: 4px; min-height: 36px; padding: 0; color: var(--text-soft); background: transparent; font-size: 11px; white-space: nowrap; }
+.capability-catalog-link:hover { color: var(--text); }
+@media (max-width: 700px) {
+  .tool-catalog-scope { gap: 8px; padding: 10px; }
+  .tool-catalog-scope select { min-height: 44px; padding-inline: 6px; }
+  .tool-catalog-scope .icon-button { min-width: 44px; min-height: 44px; }
+  .tool-catalog-toolbar { align-items: stretch; flex-direction: column; gap: 8px; }
+  .tool-catalog-count { text-align: right; }
+  .tool-catalog-filters button { min-height: 44px; }
+  .tool-catalog-card { padding: 16px; border-radius: 14px; }
+  .tool-catalog-card > header { flex-wrap: wrap; }
+  .tool-catalog-parameters summary { min-height: 44px; }
+  .tool-catalog-mcp { padding: 16px; }
+  .capability-catalog-link { min-height: 44px; font-size: 12px; }
+}

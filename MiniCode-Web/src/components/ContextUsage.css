@@ -1,0 +1,80 @@
+.context-usage,
+.context-usage-popover { --context-usage-color: var(--muted); }
+.context-usage { flex: 0 0 auto; }
+.context-usage-trigger { display: grid; place-items: center; width: 36px; min-height: 44px; padding: 0; border-radius: var(--radius-control); background: transparent; color: var(--context-usage-color); }
+.context-usage-trigger:hover,
+.context-usage-trigger[aria-expanded="true"] { background: var(--panel-deep); }
+.context-usage-trigger:active { background: var(--accent-soft); }
+.context-usage-track { stroke: var(--line-strong); }
+.context-usage-fill { stroke: currentColor; transition: stroke-dashoffset .25s ease; }
+.context-usage-trigger:focus-visible,
+.context-usage-popover button:focus-visible,
+.context-usage-popover summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; box-shadow: none; }
+.context-usage-popover { position: fixed; z-index: var(--z-overlay); width: min(310px, calc(100vw - 24px)); overflow: auto; padding: 14px 16px 10px; border: 1px solid var(--line-strong); border-radius: var(--radius-card); background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow-soft); font-size: 12px; }
+.context-usage-popover:focus { outline: none; }
+.context-usage-popover header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.context-usage-popover header > strong { font-weight: 600; }
+.context-usage-popover header button { display: grid; place-items: center; width: 28px; min-height: 28px; margin: -4px -6px -4px 0; border-radius: 6px; background: transparent; color: var(--muted); }
+.context-usage-popover button:hover:not(:disabled) { background: var(--panel); color: var(--text); }
+.context-usage-summary-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-top: 16px; color: var(--muted); font-size: 11px; }
+.context-usage-badge { padding: 2px 6px; border-radius: 4px; background: var(--panel-deep); font-size: 10px; }
+.context-usage-total { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: 6px; margin-top: 7px; font-variant-numeric: tabular-nums; }
+.context-usage-total > strong { color: var(--context-usage-color); font-size: 23px; font-weight: 600; }
+.context-usage-total > span { color: var(--muted); font-size: 11px; }
+.context-usage-meter { height: 4px; margin: 9px 0; border-radius: 4px; background: var(--panel-deep); overflow: hidden; }
+.context-usage-meter > i { display: block; height: 100%; border-radius: inherit; background: var(--context-usage-color); transition: width .25s ease; }
+.context-usage-popover dl { display: grid; gap: 9px; margin: 0; }
+.context-usage-popover dl > div { display: flex; justify-content: space-between; gap: 16px; }
+.context-usage-popover dt { color: var(--muted); }
+.context-usage-popover dd { margin: 0; font-variant-numeric: tabular-nums; }
+.context-usage-popover p { margin: 12px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }
+.context-usage-popover p.context-usage-notice { color: var(--context-usage-color); }
+.context-usage-popover p.context-usage-status:empty { display: none; }
+.context-usage-popover p.context-usage-empty { padding: 5px 0 8px; font-size: 12px; }
+.context-usage-details { margin-top: 12px; padding-top: 7px; border-top: 1px solid var(--line); }
+.context-usage-details > summary { padding: 5px 0; cursor: pointer; color: var(--muted); font-size: 11px; }
+.context-usage-capacity { margin-top: 14px; padding-top: 10px; border-top: 1px solid var(--line); }
+.context-usage-capacity h3 { margin: 0 0 12px; color: var(--muted); font-size: 11px; font-weight: 500; }
+.context-usage-popover p.context-usage-timestamp { margin-top: 7px; font-size: 11px; overflow-wrap: anywhere; }
+.context-usage-popover footer { display: flex; justify-content: space-between; gap: 12px; margin-top: 12px; padding-top: 7px; border-top: 1px solid var(--line); }
+.context-usage-popover footer button { display: inline-flex; align-items: center; justify-content: center; min-height: 32px; padding: 4px 6px; gap: 5px; border-radius: 6px; background: transparent; color: var(--muted); font-size: 11px; }
+.context-usage-popover button:disabled { opacity: .55; cursor: wait; }
+.conversation-context-fields { display: grid; gap: 8px; margin: 14px 0; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
+.conversation-context-fields.is-compact { margin: 12px 0 0; padding: 7px 0 0; border-top: 1px solid var(--line); border-bottom: 0; }
+.conversation-context-controls { display: grid; gap: 8px; }
+.conversation-context-controls > label { font-weight: 500; }
+.conversation-context-disclosure > summary { display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 32px; cursor: pointer; list-style: none; }
+.conversation-context-disclosure > summary::-webkit-details-marker { display: none; }
+.conversation-context-choice { display: inline-flex; align-items: center; gap: 8px; font-variant-numeric: tabular-nums; }
+.conversation-context-choice strong { font-weight: 500; }
+.conversation-context-choice > span { color: var(--muted); font-size: 11px; }
+.conversation-context-choice svg { color: var(--muted); }
+.conversation-context-disclosure[open] .conversation-context-choice svg { transform: rotate(180deg); }
+.conversation-context-disclosure[open] .conversation-context-controls { margin-top: 10px; }
+.conversation-context-fields select,
+.conversation-context-fields input { box-sizing: border-box; width: 100%; min-width: 0; min-height: 36px; padding: 6px 9px; border: 1px solid var(--line-strong); border-radius: 6px; background: var(--surface-raised); color: var(--text); font: inherit; }
+.conversation-context-fields select:focus-visible,
+.conversation-context-fields input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.conversation-context-custom { display: flex; gap: 8px; }
+.conversation-context-custom button { flex: 0 0 auto; padding: 6px 12px; border-radius: 6px; background: var(--accent-soft); color: var(--text); }
+.context-usage-popover .conversation-context-fields p { margin: 0; }
+.context-usage-popover .conversation-context-error { color: var(--danger); }
+.conversation-context-error button { margin-left: 6px; padding: 3px; background: transparent; color: var(--accent); }
+@media (max-width: 600px) {
+  .conversation-context-disclosure > summary { min-height: 44px; }
+  .context-usage-details > summary { padding: 12px 0; }
+  .conversation-context-fields select,
+  .conversation-context-fields input,
+  .conversation-context-fields button { min-height: 44px; }
+  .context-usage-trigger { width: 44px; }
+  .context-usage-popover header button { width: 44px; min-height: 44px; margin-top: -10px; margin-bottom: -10px; }
+  .context-usage-popover footer button { min-height: 44px; }
+  .composer-footer:has(.environment-select) { flex-wrap: wrap; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .context-usage-fill,
+  .context-usage-meter > i { transition: none; }
+}
+@media (max-width: 420px) {
+  .composer-footer:has(.environment-select) .composer-model { flex: 1 0 calc(100% - 100px); max-width: none; }
+}

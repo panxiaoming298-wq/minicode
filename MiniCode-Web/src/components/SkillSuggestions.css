@@ -1,0 +1,29 @@
+.skill-suggestions {
+  position: absolute;
+  z-index: 30;
+  bottom: calc(100% + 8px);
+  inset-inline: 0;
+  overflow: hidden;
+  border: 1px solid var(--line-strong);
+  border-radius: 14px;
+  background: var(--surface-raised);
+  color: var(--text);
+  box-shadow: var(--shadow-soft);
+}
+.skill-suggestions-heading { display: flex; justify-content: space-between; gap: 12px; padding: 12px 14px 8px; font-size: 12px; }
+.skill-suggestions-heading span, .skill-suggestions-help { color: var(--muted); }
+.skill-suggestions-list { max-height: min(280px, 35dvh); overflow-y: auto; overscroll-behavior: contain; padding: 0 6px; }
+.skill-suggestions-list > button { display: flex; flex-direction: column; width: 100%; text-align: left; gap: 4px; padding: 10px 9px; border-radius: 8px; background: transparent; color: var(--text); }
+.skill-suggestions-list > button:hover { background: var(--accent-faint); }
+.skill-suggestions-list > button[aria-selected="true"] { background: var(--accent-soft); }
+.skill-suggestion-name { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 14px; font-weight: 600; overflow-wrap: anywhere; color: #1d4ed8; }
+.skill-suggestion-name svg { flex: 0 0 auto; color: var(--text-soft); }
+.skill-suggestion-name > span { min-width: 0; }
+.skill-suggestion-name + .skill-suggestion-description { margin-inline-start: 25px; }
+.skill-suggestion-description { color: var(--text-soft); font-size: 12px; line-height: 1.45; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.composer-command-name { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 14px; }
+.composer-command-name svg { flex: 0 0 auto; color: var(--text-soft); }
+.composer-command-name code { margin-left: auto; color: var(--muted); font-size: 12px; font-weight: 400; }
+.skill-suggestions-list > button[aria-disabled="true"] { opacity: .55; cursor: not-allowed; }
+.skill-suggestions-help { border-top: 1px solid var(--line); margin-top: 6px; padding: 8px 14px; font-size: 11px; }
+.skill-suggestions > p { padding: 12px 14px; font-size: 13px; color: var(--text-soft); }

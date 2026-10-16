@@ -96,14 +96,16 @@ def _render_footer_cached(
     return result
 
 
-def _render_prompt_panel(state: ScreenState) -> str:
-    commands = _get_visible_commands(state.input)
+def _render_prompt_panel(state: ScreenState, cwd: str | None = None) -> str:
+    commands = _get_visible_commands(state.input, cwd, state)
     prompt_body = render_input_prompt(state.input, state.cursor_offset)
     if commands:
-        prompt_body += "\n" + render_slash_menu(
-            commands,
-            min(state.selected_slash_index, len(commands) - 1),
-        )
+        selected = min(state.selected_slash_index, len(commands) - 1)
+        # Keep the selected item visible without pushing the prompt off screen.
+        page_size = min(8, len(commands))
+        start = max(0, min(selected - page_size // 2, len(commands) - page_size))
+        prompt_body += "\n" + render_slash_menu(commands[start:start + page_size], selected - start)
+        prompt_body += f"\n{SUBTLE}{start + 1}–{start + page_size} / {len(commands)} · ↑↓ 选择 · Enter/Tab 填入 · Esc 关闭{RESET}"
     return render_panel("prompt", prompt_body)
 
 
@@ -133,6 +135,8 @@ def _compute_render_hash(args: TtyAppArgs, state: ScreenState) -> int:
         scroll,
         input_hash,
         cursor,
+        state.selected_slash_index,
+        state.slash_dismissed_input,
         status,
         state.active_tool,
         recent_tool_state,
@@ -273,7 +277,7 @@ def _render_screen(args: TtyAppArgs, state: ScreenState) -> None:
     buf.append("\n\n")
 
     # Prompt
-    buf.append(_render_prompt_panel(state))
+    buf.append(_render_prompt_panel(state, args.cwd))
     buf.append("\n\n")
 
     # Footer (cached)

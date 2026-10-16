@@ -11,11 +11,13 @@ from minicode.api_retry import (
     RETRYABLE_STATUS,
     calculate_backoff,
 )
+from minicode.provider_usage import ProviderCall
 from minicode.state import add_cost, record_api_error, update_context_usage
+from minicode.tooling import model_tool_registry
 from minicode.types import AgentStep, StepDiagnostics
 
 if TYPE_CHECKING:
-    from minicode.state import Store, AppState
+    from minicode.state import AppState, Store
 
 DEFAULT_MAX_RETRIES = 4
 
@@ -143,6 +145,8 @@ def _to_anthropic_messages(messages: list[dict[str, Any]]) -> tuple[str, list[di
 
 
 class AnthropicModelAdapter:
+    supports_runtime_usage = True
+
     def __init__(self, runtime: dict[str, Any], tools) -> None:
         self.runtime = runtime
         self.tools = tools
@@ -153,8 +157,11 @@ class AnthropicModelAdapter:
 
     def _get_serialized_tools(self) -> list[dict[str, Any]]:
         """Get serialized tool list with caching."""
-        current_tools = self.tools.list()
-        current_key = hash(tuple((t.name, t.description) for t in current_tools))
+        from minicode.tooling import ToolRegistry
+
+        registry = model_tool_registry(self.tools) or self.tools or ToolRegistry([])
+        current_tools = registry.list()
+        current_key = hash(tuple((t.name, t.description, json.dumps(t.input_schema, sort_keys=True)) for t in current_tools))
         if self._cached_tools_json is None or current_key != self._tools_cache_key:
             self._cached_tools_json = [
                 {
@@ -168,6 +175,16 @@ class AnthropicModelAdapter:
         return self._cached_tools_json
 
     def next(self, messages: list[dict[str, Any]], on_stream_chunk: Callable[[str], None] | None = None, on_thinking_delta: Callable[[str], None] | None = None, store: Store[AppState] | None = None) -> AgentStep:
+        with ProviderCall(self.runtime, "anthropic") as call:
+            step = self._next(messages, on_stream_chunk, on_thinking_delta, store, call=call)
+        step.usage = call.usage
+        step.imageInputIds = list(call.image_input_ids)
+        if step.diagnostics is not None:
+            step.diagnostics.outputBudget = dict(call.request_diagnostics.get("output_budget", {}))
+        return step
+
+    def context_request(self, messages, *, stream=False):
+        """Pure request preview; replay state is consumed only by dispatch."""
         system_message, converted_messages = _to_anthropic_messages(messages)
 
         # Replay stored thinking blocks into the first assistant message
@@ -181,7 +198,6 @@ class AnthropicModelAdapter:
                         converted_messages[i] = dict(msg)
                         converted_messages[i]["content"] = list(self._thinking_blocks) + content
                         break
-            self._thinking_blocks = []
 
         request_body = {
             "model": self.runtime.get("model", ""),
@@ -195,11 +211,18 @@ class AnthropicModelAdapter:
             request_body["thinking"] = {"type": "disabled"}
         if self.runtime.get("maxOutputTokens") is not None:
             request_body["max_tokens"] = self.runtime["maxOutputTokens"]
-        if on_stream_chunk:
+        if stream:
             request_body["stream"] = True
+        from minicode.image_input import prepare_request
+        endpoint = _messages_endpoint(self.runtime.get("baseUrl", ""))
+        return prepare_request(request_body, self.runtime, "anthropic", endpoint, source_messages=messages), endpoint, "anthropic"
+
+    def _next(self, messages: list[dict[str, Any]], on_stream_chunk: Callable[[str], None], on_thinking_delta: Callable[[str], None], store: Store[AppState] | None, *, call: ProviderCall) -> AgentStep:
+        request_body, endpoint, _ = self.context_request(messages, stream=bool(on_stream_chunk))
+        self._thinking_blocks = []
 
         request = urllib.request.Request(
-            url=_messages_endpoint(self.runtime.get("baseUrl", "")),
+            url=endpoint,
             data=json.dumps(request_body).encode("utf-8"),
             headers={
                 "content-type": "application/json",
@@ -219,7 +242,7 @@ class AnthropicModelAdapter:
         for attempt in range(max_retries + 1):
             try:
                 timeout = int(os.environ.get("MINICODE_MODEL_TIMEOUT", "60"))
-                response = urllib.request.urlopen(request, timeout=timeout)
+                response = call.open(request, timeout=timeout)
                 break
             except urllib.error.HTTPError as error:
                 last_exception = error
@@ -233,10 +256,13 @@ class AnthropicModelAdapter:
                 wait = calculate_backoff(attempt, retry_after=retry_after,
                                         category=category)
                 time.sleep(wait)
-            except urllib.error.URLError as error:
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as error:
                 last_exception = error
+                response = None
                 if attempt >= max_retries:
-                    break
+                    if isinstance(error, urllib.error.URLError):
+                        break
+                    raise
                 wait = calculate_backoff(attempt)
                 time.sleep(wait)
         if response is None:
@@ -248,6 +274,8 @@ class AnthropicModelAdapter:
 
         if not on_stream_chunk:
             data = _read_json_body(response)
+            call.observe(data.get("usage"), complete=True)
+            call.check()
             status = getattr(response, "status", getattr(response, "code", 200))
             if status >= 400:
                 if store:
@@ -307,7 +335,7 @@ class AnthropicModelAdapter:
                     type="tool_calls",
                     calls=tool_calls,
                     content=parsed_text,
-                    contentKind="progress" if kind == "progress" else None,
+                    contentKind=kind,
                     diagnostics=diagnostics,
                 )
             return AgentStep(type="assistant", content=parsed_text, kind=kind, diagnostics=diagnostics)
@@ -319,7 +347,20 @@ class AnthropicModelAdapter:
         ignored_block_types = []
         active_tool_call = None
         active_thinking_block = None
+        active_block = False
+        active_block_index = None
         stop_reason = None
+        saw_message_stop = False
+        parse_complete = True
+        assembly_complete = True
+        loss_reasons = []
+        lost_event_count = 0
+
+        def record_loss(reason):
+            nonlocal lost_event_count
+            lost_event_count += 1
+            if reason not in loss_reasons:
+                loss_reasons.append(reason)
         
         # Streaming cost tracking
         stream_input_tokens = 0
@@ -328,15 +369,27 @@ class AnthropicModelAdapter:
         stream_cache_creation_tokens = 0
         
         for line in response:
-            line_str = line.decode("utf-8").strip()
-            if not line_str.startswith("data: "):
+            call.check_first_output()
+            try:
+                line_str = line.decode("utf-8").strip()
+            except UnicodeDecodeError:
+                parse_complete = False
+                record_loss("invalid_utf8")
                 continue
-            data_str = line_str[6:]
+            if not line_str.startswith("data:"):
+                continue
+            data_str = line_str[5:].strip()
             if data_str == "[DONE]":
                 continue
             try:
                 event = json.loads(data_str)
             except json.JSONDecodeError:
+                parse_complete = False
+                record_loss("invalid_json")
+                continue
+            if not isinstance(event, dict):
+                parse_complete = False
+                record_loss("invalid_event")
                 continue
                 
             etype = event.get("type")
@@ -344,23 +397,37 @@ class AnthropicModelAdapter:
                 # Initial usage from message_start
                 msg = event.get("message", {})
                 usage = msg.get("usage", {})
+                call.observe(usage, complete=False)
                 stream_input_tokens = usage.get("input_tokens", 0)
                 stream_cache_read_tokens = usage.get("cache_read_input_tokens", 0)
                 stream_cache_creation_tokens = usage.get("cache_creation_input_tokens", 0)
             elif etype == "content_block_start":
+                if active_block:
+                    assembly_complete = False
+                    record_loss("overlapping_content_blocks")
+                active_block = True
+                active_block_index = event.get("index")
                 cb = event.get("content_block", {})
                 c_type = cb.get("type")
                 block_types.append(c_type)
                 if c_type == "tool_use":
+                    if cb.get("name"):
+                        call.observe_first_output()
                     active_tool_call = {
                         "id": cb.get("id"),
                         "name": cb.get("name"),
+                        "input": cb.get("input", {}),
                         "input_json": ""
                     }
                 elif c_type == "thinking":
                     active_thinking_block = {"type": "thinking", "thinking": ""}
             elif etype == "content_block_delta":
+                if not active_block or event.get("index") != active_block_index:
+                    assembly_complete = False
+                    record_loss("unmatched_content_delta")
                 delta = event.get("delta", {})
+                if delta.get("text") or delta.get("thinking") or delta.get("partial_json"):
+                    call.observe_first_output()
                 d_type = delta.get("type")
                 if d_type == "text_delta":
                     chunk = delta.get("text", "")
@@ -379,11 +446,19 @@ class AnthropicModelAdapter:
                     if active_thinking_block:
                         active_thinking_block["signature"] = active_thinking_block.get("signature", "") + delta.get("signature", "")
             elif etype == "content_block_stop":
+                if not active_block or event.get("index") != active_block_index:
+                    assembly_complete = False
+                    record_loss("unmatched_content_stop")
+                active_block = False
+                active_block_index = None
                 if active_tool_call:
                     try:
-                        parsed_input = json.loads(active_tool_call["input_json"])
-                    except Exception:
-                        parsed_input = {}
+                        parsed_input = (json.loads(active_tool_call["input_json"])
+                            if active_tool_call["input_json"] else active_tool_call["input"])
+                    except json.JSONDecodeError:
+                        parse_complete = False
+                        record_loss("invalid_tool_arguments")
+                        parsed_input = None
                     tool_calls.append({
                         "id": active_tool_call["id"],
                         "toolName": active_tool_call["name"],
@@ -399,11 +474,38 @@ class AnthropicModelAdapter:
                     stop_reason = delta["stop_reason"]
                 # Final output tokens from message_delta
                 usage = event.get("usage", {})
+                call.observe(usage, complete=bool(delta.get("stop_reason")))
                 if usage.get("output_tokens"):
                     stream_output_tokens = usage["output_tokens"]
+            elif etype == "message_stop":
+                call.observe({}, complete=True)
+                saw_message_stop = True
+                call.check()
+                break
             elif etype == "error":
                 err = event.get("error", {})
                 raise RuntimeError(f"Streaming error: {err.get('message', 'Unknown')}")
+            call.check()
+
+        if active_block:
+            assembly_complete = False
+            record_loss("unclosed_content_block")
+        if active_tool_call is not None:
+            # Keep the interrupted proposal visible to the batch refusal path.
+            # It must not be mistaken for an assistant-only response or executed.
+            tool_calls.append({"id": active_tool_call["id"], "toolName": active_tool_call["name"],
+                "input": None, "rawArguments": active_tool_call["input_json"],
+                "inputError": "Stream ended before the tool content block completed"})
+        if not saw_message_stop:
+            loss_reasons.append("missing_message_stop")
+        transport_complete = saw_message_stop and parse_complete and assembly_complete
+        if not transport_complete:
+            self._thinking_blocks = []
+        termination = "message_stop" if saw_message_stop else "eof"
+        call.record_stream_integrity(transport_termination=termination,
+            network_complete=saw_message_stop, parse_complete=parse_complete,
+            assembly_complete=assembly_complete, loss_reasons=loss_reasons,
+            lost_events=[], lost_event_count=lost_event_count)
         
         # Update store with streaming cost tracking
         if store:
@@ -425,13 +527,21 @@ class AnthropicModelAdapter:
             stopReason=stop_reason,
             blockTypes=block_types,
             ignoredBlockTypes=ignored_block_types,
+            transportComplete=transport_complete,
+            transportTermination=termination,
+            rawResponseIncompleteReason=None if transport_complete else ",".join(loss_reasons),
+            networkComplete=saw_message_stop,
+            parseComplete=parse_complete,
+            assemblyComplete=assembly_complete,
+            lostEventCount=lost_event_count,
+            streamLossReasons=loss_reasons,
         )
         if tool_calls:
             return AgentStep(
                 type="tool_calls",
                 calls=tool_calls,
                 content=parsed_text,
-                contentKind="progress" if kind == "progress" else None,
+                contentKind=kind,
                 diagnostics=diagnostics,
             )
         return AgentStep(type="assistant", content=parsed_text, kind=kind, diagnostics=diagnostics)

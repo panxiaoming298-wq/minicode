@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
 
-from minicode.memory import MemoryManager, MemoryScope, MemoryEntry
+from minicode.memory import MemoryManager, MemoryScope, MemoryEntry, MemoryTier
 from minicode.logging_config import get_logger
 
 logger = get_logger("memory_injector")
@@ -19,6 +19,7 @@ class InjectedMemory:
     category: str
     relevance_score: float
     source: str  # "search", "tag", "category"
+    id: str = ""
 
 
 class MemoryInjectionMode(str, Enum):
@@ -166,6 +167,13 @@ class MemoryInjector:
                 h.update(f.encode())
         return h.hexdigest()
 
+    def _memory_signature(self) -> tuple:
+        return tuple(
+            (entry.id, entry.content, entry.tier, entry.usage_count, entry.last_decay_at)
+            for memory in self._memory.memories.values()
+            for entry in self._memory.context_eligible_entries(memory.entries, self._last_query)
+        )
+
     def inject_for_task(
         self,
         task_description: str,
@@ -201,7 +209,11 @@ class MemoryInjector:
                 return []  # Same query within cooldown, skip
 
         # Cache check: return cached result for identical tasks (after cooldown)
-        if task_hash == self._task_hash and self._cached_result:
+        self._last_query = task_description
+        memory_signature = self._memory_signature()
+        if (task_hash == self._task_hash and self._cached_result
+                and memory_signature == getattr(self, "_cache_signature", None)):
+            self._memory.record_access([item.id for item in self._cached_result if item.id])
             return self._cached_result.copy()
 
         self._last_query = task_description
@@ -282,6 +294,7 @@ class MemoryInjector:
                 category=entry.category,
                 relevance_score=relevance,
                 source=f"{scope_name}_search",
+                id=entry.id,
             ))
 
         # Inject reranker summary as a special memory entry if available
@@ -309,6 +322,8 @@ class MemoryInjector:
 
         self._task_hash = task_hash
         self._cached_result = injected.copy()
+        self._memory.record_access([item.id for item in injected if item.id])
+        self._cache_signature = self._memory_signature()
         return injected
 
     def inject_on_failure(
@@ -370,6 +385,7 @@ class MemoryInjector:
                 category=entry.category,
                 relevance_score=relevance,
                 source=f"{scope_name}_failure_recovery",
+                id=entry.id,
             ))
 
         if injected:
@@ -379,6 +395,7 @@ class MemoryInjector:
                 tool_name,
             )
 
+        self._memory.record_access([item.id for item in injected if item.id])
         return injected
 
     @property
@@ -470,7 +487,9 @@ class MemoryInjector:
         for keyword in keywords[:3]:  # Limit to top 3 keywords
             for scope in MemoryScope:
                 tagged = self._memory.search_by_tag(scope, keyword)
-                for entry in tagged:
+                for entry in self._memory.context_eligible_entries(tagged, task_description):
+                    if entry.tier == MemoryTier.ARCHIVAL:
+                        continue
                     content_key = entry.content[:100].lower()
                     if content_key not in seen:
                         seen.add(content_key)
@@ -479,6 +498,7 @@ class MemoryInjector:
                             category=entry.category,
                             relevance_score=0.6,  # Tag matches are fairly relevant
                             source=f"{scope.value}_tag",
+                            id=entry.id,
                         ))
 
         return memories[:decision.max_memories]

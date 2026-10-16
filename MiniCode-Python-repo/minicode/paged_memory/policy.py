@@ -6,14 +6,22 @@ import json
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+from minicode.runtime_messages import is_user_input, runtime_message_kind
+
 from .config import PagedMemoryConfig
 from .models import ContextItem, MemoryMode, ModeSelection, TaskMetrics
 
-_MODE_RANK = {
-    MemoryMode.INLINE: 0,
-    MemoryMode.WORKING_SET: 1,
-    MemoryMode.PAGED_MEMORY: 2,
-}
+def initialize_rerank_state(metrics: TaskMetrics, previous_mode: MemoryMode) -> None:
+    """Recover old policy state before canonicalizing a legacy mode.
+
+    Old PAGED_MEMORY alone admitted reranking. Never infer permission from the
+    canonical mode of an old WORKING_SET or a new local-only paged checkpoint.
+    """
+    if metrics.rerank_eligible is None:
+        metrics.rerank_eligible = previous_mode is MemoryMode.PAGED_MEMORY
+        if metrics.rerank_eligible:
+            metrics.rerank_downgrade_streak = metrics.mode_downgrade_streak
+            metrics.rerank_downgrade_observation_id = metrics.mode_downgrade_observation_id
 
 
 class MemoryModePolicy:
@@ -28,72 +36,119 @@ class MemoryModePolicy:
         task_id: str = "default",
         manual_override: MemoryMode | None = None,
         phase_boundary: bool = False,
+        observation_id: str = "",
+        minimum_mode: MemoryMode = MemoryMode.INLINE,
     ) -> ModeSelection:
+        initialize_rerank_state(metrics, current_mode)
         override = manual_override or self.config.manual_mode
-        if override is not None:
-            metrics.mode_downgrade_streak = 0
+        if override is not None or not self.config.auto_mode:
+            raw_target = override if override is not None else self.config.default_mode
+            target = raw_target.canonical
+            self._reset_downgrade(metrics, "mode")
+            self._reset_downgrade(metrics, "rerank")
+            metrics.rerank_eligible = raw_target is MemoryMode.PAGED_MEMORY
             return ModeSelection(
-                mode=override,
-                reason="task manual override",
-                changed=override != current_mode,
-            )
-        if not self.config.auto_mode:
-            target = self.config.default_mode
-            return ModeSelection(
-                target, "automatic mode selection disabled", target != current_mode
+                mode=target,
+                reason=("task manual override" if override is not None
+                        else "automatic mode selection disabled"),
+                changed=target != current_mode,
+                rerank_allowed=metrics.rerank_eligible,
+                rerank_reason=("legacy WORKING_SET selects local retrieval"
+                               if raw_target is MemoryMode.WORKING_SET
+                               else "explicit mode configuration"),
             )
 
-        target, reason = self._candidate(metrics)
-        if _MODE_RANK[target] >= _MODE_RANK[current_mode]:
-            metrics.mode_downgrade_streak = 0
-            return ModeSelection(target, reason, target != current_mode)
+        rerank_target, rerank_reason = self._rerank_candidate(metrics)
+        paging_target, reason = self._paging_candidate(metrics)
+        if rerank_target and not self.config.context_utilization_enabled:
+            paging_target, reason = True, rerank_reason
+        if minimum_mode.canonical is MemoryMode.PAGED_MEMORY and not paging_target:
+            paging_target, reason = True, "active rotation requires a paged context"
+        paged, reason = self._stabilize(
+            metrics, "mode", current_mode.canonical is MemoryMode.PAGED_MEMORY,
+            paging_target, reason, phase_boundary, observation_id,
+        )
+        target = MemoryMode.PAGED_MEMORY if paged else MemoryMode.INLINE
+        if paged:
+            metrics.rerank_eligible, rerank_reason = self._stabilize(
+                metrics, "rerank", bool(metrics.rerank_eligible), rerank_target,
+                rerank_reason, phase_boundary, observation_id,
+            )
+        else:
+            metrics.rerank_eligible = False
+            self._reset_downgrade(metrics, "rerank")
+            rerank_reason = "inline context uses no supplemental reranking"
+        return ModeSelection(
+            target, reason, target != current_mode,
+            metrics.rerank_eligible, rerank_reason,
+        )
+
+    @staticmethod
+    def _reset_downgrade(metrics: TaskMetrics, prefix: str) -> None:
+        setattr(metrics, f"{prefix}_downgrade_streak", 0)
+        setattr(metrics, f"{prefix}_downgrade_observation_id", "")
+
+    def _stabilize(
+        self, metrics: TaskMetrics, prefix: str, current: bool, target: bool,
+        reason: str, phase_boundary: bool, observation_id: str,
+    ) -> tuple[bool, str]:
+        if target or not current:
+            self._reset_downgrade(metrics, prefix)
+            return target, reason
 
         if not phase_boundary:
-            return ModeSelection(
-                current_mode, "downgrade deferred until a phase boundary", False
-            )
+            return current, "downgrade deferred until a phase boundary"
 
-        metrics.mode_downgrade_streak += 1
-        streak = metrics.mode_downgrade_streak
+        observation_key = f"{prefix}_downgrade_observation_id"
+        if observation_id and observation_id == getattr(metrics, observation_key):
+            return current, "downgrade observation already counted"
+        setattr(metrics, observation_key, observation_id)
+        streak = getattr(metrics, f"{prefix}_downgrade_streak") + 1
+        setattr(metrics, f"{prefix}_downgrade_streak", streak)
         if streak < self.config.downgrade_stable_steps:
-            return ModeSelection(
-                current_mode,
-                f"downgrade hysteresis {streak}/{self.config.downgrade_stable_steps}",
-                False,
-            )
-        metrics.mode_downgrade_streak = 0
-        return ModeSelection(target, f"stable phase-boundary downgrade: {reason}", True)
+            return current, f"downgrade hysteresis {streak}/{self.config.downgrade_stable_steps}"
+        self._reset_downgrade(metrics, prefix)
+        return target, f"stable phase-boundary downgrade: {reason}"
 
-    def _candidate(self, metrics: TaskMetrics) -> tuple[MemoryMode, str]:
+    def _rerank_candidate(self, metrics: TaskMetrics) -> tuple[bool, str]:
+        # Preserve the previous high-tier admission conditions independently of
+        # paging. Admission still requires the global switch and query policy.
         if metrics.cross_session_required:
-            return MemoryMode.PAGED_MEMORY, "cross-session recovery required"
+            return True, "cross-session recovery required"
         if metrics.restart_recovery_required:
-            return MemoryMode.PAGED_MEMORY, "restart recovery required"
+            return True, "restart recovery required"
         if metrics.parallel_subtasks > 1:
-            return (
-                MemoryMode.PAGED_MEMORY,
-                "parallel subtasks require shared paged memory",
-            )
+            return True, "parallel subtasks require shared paged memory"
         if metrics.context_usage_ratio >= self.config.paged_context_ratio:
-            return MemoryMode.PAGED_MEMORY, "paged context-usage threshold reached"
+            return True, "rerank context-usage threshold reached"
         if metrics.completed_steps >= self.config.paged_step_threshold:
-            return MemoryMode.PAGED_MEMORY, "paged step threshold reached"
+            return True, "rerank step threshold reached"
         if metrics.audit_required:
-            return MemoryMode.PAGED_MEMORY, "auditability explicitly required"
+            return True, "auditability explicitly required"
+        return False, "automatic rerank admission threshold not reached"
+
+    def _paging_candidate(self, metrics: TaskMetrics) -> tuple[bool, str]:
+        if self.config.context_utilization_enabled:
+            if (metrics.cross_session_required or metrics.restart_recovery_required
+                    or metrics.parallel_subtasks > 1 or metrics.audit_required):
+                return True, "task requires paged memory capabilities"
+            if max(metrics.context_usage_ratio, metrics.context_forecast_ratio) >= self.config.context_note_warning_ratio:
+                return True, "current or forecast context pressure requires handoff capability"
+            return False, "live context fits; counters alone do not shorten history"
         if metrics.context_usage_ratio >= self.config.working_set_context_ratio:
-            return MemoryMode.WORKING_SET, "working-set context-usage threshold reached"
+            return True, "paging context-usage threshold reached"
         if metrics.completed_steps >= self.config.working_set_step_threshold:
-            return MemoryMode.WORKING_SET, "working-set step threshold reached"
+            return True, "paging step threshold reached"
         if metrics.large_artifact_count >= self.config.large_artifact_threshold:
-            return MemoryMode.WORKING_SET, "large artifact threshold reached"
+            return True, "large artifact threshold reached"
         if (
             metrics.cumulative_tool_result_tokens
             >= self.config.tool_result_token_threshold
         ):
-            return MemoryMode.WORKING_SET, "tool-result token threshold reached"
+            return True, "tool-result token threshold reached"
         if metrics.repeated_dependency_count > 1:
-            return MemoryMode.WORKING_SET, "repeated phase dependencies detected"
-        return MemoryMode.INLINE, "task remains small"
+            return True, "repeated phase dependencies detected"
+        return False, "task remains small"
 
 
 class TokenBudgetManager:
@@ -137,8 +192,10 @@ class TokenBudgetManager:
         return max(1, int(self._estimate_fn(text)))
 
     def estimate_message(self, message: Mapping[str, Any]) -> int:
+        # Journal references survive checkpoints but never enter provider input.
         material = json.dumps(
-            dict(message), ensure_ascii=False, sort_keys=True, default=str
+            {key: value for key, value in message.items() if key != "_historyEvent"},
+            ensure_ascii=False, sort_keys=True, default=str
         )
         return self.estimate_text(material) + 4
 
@@ -201,42 +258,73 @@ class TokenBudgetManager:
         messages: Sequence[Mapping[str, Any]],
         *,
         token_budget: int,
+        retain_latest_user: bool = False,
+        retain_all_users: bool = False,
     ) -> list[dict[str, Any]]:
-        """Select a recent provider-valid tail without splitting tool pairs."""
+        """Pack whole tool exchanges and optionally pin the live user request.
+
+        Overlapping call/result intervals form one atomic group, including
+        parallel tool calls. Required groups may exceed the soft tail budget;
+        the provider guard enforces the hard limit without losing instructions.
+        """
         if not messages:
             return []
-        selected: list[tuple[int, dict[str, Any]]] = []
-        used = 0
-        required_tool_ids: set[str] = set()
-        for index in range(len(messages) - 1, -1, -1):
-            message = messages[index]
-            material = dict(message)
-            tokens = self.estimate_message(material)
-            role = str(material.get("role", ""))
-            tool_id = str(material.get("toolUseId", ""))
-            must_take = bool(tool_id and tool_id in required_tool_ids)
-            if used + tokens > token_budget and selected and not must_take:
-                continue
-            selected.append((index, material))
-            used += tokens
-            if role == "tool_result" and tool_id:
-                required_tool_ids.add(tool_id)
-            elif role == "assistant_tool_call" and tool_id:
-                required_tool_ids.discard(tool_id)
-            if used >= token_budget and not required_tool_ids:
-                break
-        selected.reverse()
-        if required_tool_ids:
-            # A missing call is less safe than retaining a larger tail.
-            first_selected = selected[0][0] if selected else len(messages)
-            for index in range(first_selected - 1, -1, -1):
-                candidate = dict(messages[index])
-                if (
-                    candidate.get("role") == "assistant_tool_call"
-                    and str(candidate.get("toolUseId", "")) in required_tool_ids
-                ):
-                    selected.insert(0, (index, candidate))
-                    required_tool_ids.discard(str(candidate.get("toolUseId")))
-                if not required_tool_ids:
-                    break
-        return [message for _, message in selected]
+        call_indices: dict[str, int] = {}
+        interval_ends: dict[int, int] = {}
+        for index, message in enumerate(messages):
+            tool_id = str(message.get("toolUseId", ""))
+            if message.get("role") == "assistant_tool_call" and tool_id:
+                call_indices[tool_id] = index
+            elif message.get("role") == "tool_result" and tool_id in call_indices:
+                start = call_indices.pop(tool_id)
+                interval_ends[start] = index
+        groups: list[tuple[int, int]] = []
+        start = 0
+        while start < len(messages):
+            end = interval_ends.get(start, start)
+            cursor = start
+            while cursor <= end:
+                end = max(end, interval_ends.get(cursor, cursor))
+                cursor += 1
+            groups.append((start, end + 1))
+            start = end + 1
+
+        latest_user = next(
+            (
+                i
+                for i in range(len(messages) - 1, -1, -1)
+                if is_user_input(messages[i])
+            ),
+            -1,
+        )
+        required_groups = {len(groups) - 1}
+        # Persistent native instructions must not depend on search recall.
+        # Keep their original role, order and complete tool-exchange group.
+        required_groups.update(
+            i for i, (start, end) in enumerate(groups)
+            if any(runtime_message_kind(message) == "control" for message in messages[start:end])
+        )
+        if retain_latest_user and latest_user >= 0:
+            required_groups.update(
+                i for i, (start, end) in enumerate(groups) if start <= latest_user < end
+            )
+        if retain_all_users:
+            required_groups.update(
+                i for i, (start, end) in enumerate(groups)
+                if any(is_user_input(message) for message in messages[start:end])
+            )
+        costs = [
+            sum(self.estimate_message(message) for message in messages[start:end])
+            for start, end in groups
+        ]
+        chosen = set(required_groups)
+        used = sum(costs[i] for i in chosen)
+        for index in range(len(groups) - 1, -1, -1):
+            if index not in chosen and used + costs[index] <= token_budget:
+                chosen.add(index)
+                used += costs[index]
+        return [
+            dict(message)
+            for index in sorted(chosen)
+            for message in messages[groups[index][0] : groups[index][1]]
+        ]

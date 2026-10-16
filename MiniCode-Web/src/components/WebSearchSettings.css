@@ -1,0 +1,51 @@
+.search-settings { max-width: 760px; }
+.search-settings-loading { display: flex; align-items: center; gap: 9px; padding: 16px 0; color: var(--muted); font-size: 13px; }
+.search-settings-unavailable .button { margin-top: 12px; }
+.search-settings .search-provider-card { padding: 18px; border: 1px solid var(--line); border-radius: 12px; gap: 12px; }
+.search-provider-heading { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.search-provider-heading h3 { margin: 0; font-size: 14px; font-weight: 600; }
+.search-key-status { flex-shrink: 0; padding: 3px 7px; border-radius: 5px; background: var(--panel); color: var(--muted); font-size: 11px; }
+.search-key-status.is-configured { color: var(--success); background: var(--success-soft); }
+.search-settings-source { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.search-service-docs { width: fit-content; color: var(--accent-dark); font-size: 12px; text-decoration: none; }
+.search-service-docs:hover { text-decoration: underline; }
+.search-settings .settings-field { min-width: 0; }
+.search-settings .settings-field > label { display: block; margin-bottom: 7px; font-size: 12px; }
+.search-key-list { display: grid; gap: 10px; }
+.search-key-row { min-width: 0; padding: 13px; border: 1px solid var(--line); border-radius: 8px; }
+.search-key-row.is-disabled { background: var(--panel); }
+.search-key-row-heading, .search-key-controls { display: flex; align-items: center; gap: 14px; }
+.search-key-row-heading { justify-content: space-between; margin-bottom: 12px; }
+.search-key-index { display: flex; gap: 8px; color: var(--muted); font-size: 12px; }
+.search-key-index > span { color: var(--accent-dark); }
+.search-settings .search-key-enabled { display: flex; align-items: center; gap: 6px; margin: 0; font-size: 12px; }
+.search-settings .search-key-enabled input { width: 14px; height: 14px; min-height: 14px; padding: 0; margin: 0; accent-color: var(--accent); }
+.search-key-remove { display: inline-flex; align-items: center; gap: 5px; padding: 3px; border: 0; background: none; color: var(--muted); cursor: pointer; font-size: 12px; }
+.search-key-remove:hover { color: var(--danger); }
+.search-key-fields { display: grid; grid-template-columns: minmax(100px, .8fr) minmax(170px, 1.6fr); gap: 12px; }
+.search-key-list-footer { display: grid; justify-items: start; gap: 9px; }
+.search-key-list-footer .button { min-height: 32px; font-size: 12px; }
+.search-keys-empty { margin: 0; padding: 12px 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.search-key-usage { margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); font-size: 12px; }
+.search-key-usage p { margin: 7px 0 0; color: var(--muted); line-height: 1.6; }
+.search-usage-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; color: var(--muted); }
+.search-usage-stale { margin-left: 7px; font-size: 11px; }
+.search-usage-refresh { display: inline-flex; align-items: center; gap: 5px; padding: 4px 0; background: transparent; border: 0; color: var(--accent-dark); cursor: pointer; font-size: 12px; }
+.search-usage-refresh:hover { text-decoration: underline; }
+.search-usage-metrics { display: grid; gap: 10px; margin: 11px 0 0; grid-template-columns: repeat(auto-fit, minmax(135px, 1fr)); }
+.search-usage-metrics dt { margin-bottom: 4px; color: var(--muted); font-size: 11px; }
+.search-usage-metrics dd { margin: 0; }
+.search-usage-metrics strong { font-size: 17px; font-weight: 600; }
+.search-usage-metrics strong span { font-size: 11px; font-weight: 400; }
+.search-usage-limit { color: var(--muted); font-size: 11px; }
+.search-key-usage .search-usage-error { color: var(--danger); }
+.search-key-usage .search-usage-time, .search-usage-metrics small { font-size: 11px; }
+.search-settings .settings-actions { flex-wrap: wrap; }
+.search-settings :is(input, select, button):disabled { cursor: not-allowed; opacity: .6; }
+.search-settings .settings-help, .search-settings .settings-section small { line-height: 1.6; }
+@media (max-width: 600px) {
+  .search-settings .search-provider-card { padding: 14px; }
+  .search-key-fields { grid-template-columns: minmax(0, 1fr); }
+  .search-key-row { padding: 10px; }
+  .search-provider-heading { flex-wrap: wrap; gap: 8px; }
+}

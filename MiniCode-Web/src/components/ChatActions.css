@@ -1,0 +1,77 @@
+.chat-actions { position: relative; display: inline-flex; flex: 0 0 auto; }
+.chat-actions-trigger.is-active { background: var(--accent-soft); color: var(--text); }
+.chat-actions-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  width: 246px;
+  max-width: calc(100vw - 32px);
+  padding: 5px;
+  border: 1px solid var(--line-strong);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: 0 8px 28px rgba(38, 43, 55, 0.12);
+}
+.chat-actions-menu > button {
+  display: flex;
+  width: 100%;
+  min-height: 38px;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 10px;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  text-align: left;
+  font-size: 13px;
+}
+.chat-actions-menu > button:hover, .chat-actions-menu > button:focus-visible { background: var(--accent-faint); }
+.chat-actions-menu > button[aria-disabled="true"] { color: var(--muted); cursor: default; }
+.chat-actions-hint, .chat-actions-error { margin: 5px 10px 8px; font-size: 12px; line-height: 1.5; }
+.chat-actions-hint { color: var(--muted); }
+.chat-actions-error { color: var(--danger); }
+.chat-actions-status {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: max-content;
+  padding: 9px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-soft);
+  color: var(--success);
+  font-size: 12px;
+}
+.chat-copy-dialog {
+  width: min(680px, calc(100vw - 32px));
+  max-height: calc(100dvh - 32px);
+  padding: 20px;
+  border: 1px solid var(--line-strong);
+  border-radius: 16px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: var(--shadow-soft);
+}
+.chat-copy-dialog::backdrop { background: var(--scrim); }
+.chat-copy-dialog > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.chat-copy-dialog > p { color: var(--muted); font-size: 13px; line-height: 1.6; }
+.chat-copy-dialog > textarea {
+  display: block;
+  width: 100%;
+  height: min(400px, 50dvh);
+  padding: 12px;
+  resize: vertical;
+  border: 1px solid var(--line-strong);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--text);
+  font: 12px/1.6 var(--font-code);
+}
+@media (max-width: 819px) {
+  .run-header.has-chat-actions { padding-right: 60px; }
+  .chat-actions-menu > button { min-height: 44px; }
+}

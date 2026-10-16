@@ -1,15 +1,15 @@
 """Runtime coordination for tiered context and lossless authoritative memory.
 
 This module is the only component the agent loop needs to know about.  It
-coordinates the relational authority, artifact persistence, derived vector
-index and context builder while keeping every derived summary linked to raw
-source material.
+coordinates SQLite, local artifact persistence and the context builder while
+keeping every derived summary linked to raw source material.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import threading
 import time
 from collections.abc import Mapping, MutableMapping, Sequence
@@ -18,6 +18,10 @@ from pathlib import Path
 from types import TracebackType
 from typing import Any, Self
 
+from minicode.runtime_protocol import AgentResultStatus
+from minicode.runtime_messages import is_user_input, runtime_message_kind
+from minicode.context_borrowing import ContextBorrowing
+
 from .artifacts import (
     ArtifactIntegrityError,
     ArtifactStoreUnavailable,
@@ -25,10 +29,15 @@ from .artifacts import (
     build_artifact_store,
     build_encrypted_spool,
 )
-from .chunking import artifact_chunk_records, chunk_utf8_text
+from .chunking import chunk_utf8_text, event_chunk_records, tool_text_chunk_records
 from .config import PagedMemoryConfig
 from .context_builder import PagedContextBuilder
-from .indexer import OutboxIndexer, make_memory_index_outbox
+from .code_focus import CodeFocus
+from .handoff import HandoffNotes
+from .rotation import ContextRotation
+from .history_journal import HistoryIntegrityError
+from .tool_result_projection import output_summary, prepare_projection
+from .result_reclamation import ResultReclamation
 from .models import (
     MEMORY_NAVIGATION_TOOL_NAMES,
     AgentEvent,
@@ -40,12 +49,13 @@ from .models import (
     DependencyRecord,
     DependencyType,
     EventType,
-    MemoryMode,
+    HandoffNoteConflict,
+    ContextRotationConflict,
     MemoryRecord,
+    MemoryMode,
     MemorySearchRequest,
     MemoryStatus,
     MemoryType,
-    OutboxRecord,
     PreflightAuditResult,
     SourceRange,
     StorageHealth,
@@ -59,16 +69,18 @@ from .models import (
     now_epoch,
     stable_json,
 )
-from .policy import MemoryModePolicy, TokenBudgetManager
-from .postgres_store import PostgresMemoryStore
+from .policy import MemoryModePolicy, TokenBudgetManager, initialize_rerank_state
+from .context_utilization import ContextUtilization
+from .query import retrieval_query
+from .markdown_export import is_generated_export, is_export_read
 from .retrieval import (
     DependencyResolver,
-    HybridMemoryRetriever,
+    LexicalMemoryRetriever,
     WorkingSetManager,
+    dependency_contract_hash,
     merge_state_dependencies,
 )
 from .sqlite_store import SqliteMemoryStore, StateVersionConflict
-from .vector_index import build_vector_index, configured_index_descriptor
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +91,10 @@ class PagedMemoryError(RuntimeError):
 
 class AuthorityUnavailableError(PagedMemoryError):
     """The authoritative store cannot durably accept or verify an operation."""
+
+
+class AuthorityRecoveringError(AuthorityUnavailableError):
+    """A rolled-back operation needs a fresh authority read before resuming."""
 
 
 class ArtifactPersistenceRequired(PagedMemoryError):
@@ -126,7 +142,7 @@ def _stable_artifact_id(idempotency_key: str) -> str:
 
 def _latest_user_text(messages: Sequence[Mapping[str, Any]]) -> str:
     for message in reversed(messages):
-        if message.get("role") == "user":
+        if is_user_input(message):
             return _message_content(message)
     return ""
 
@@ -150,12 +166,17 @@ class PagedMemoryRuntime:
         model_context_limit: int = 128_000,
         authority: Any | None = None,
         artifact_store: Any | None = None,
-        vector_index: Any | None = None,
         spool_store: Any | None = None,
         run_id: str | None = None,
         step_namespace: str = "",
+        runtime_values: Mapping[str, Any] | None = None,
     ) -> None:
         self.config = config
+        # Display/tool filtering only; execution still checks the live Worker.
+        # A restored checkpoint never restores this process-local scope.
+        from minicode.runtime_protocol import ToolEffect
+        effects = (runtime_values or {}).get("_allowedToolEffects")
+        self.context_tool_effects = None if effects is None else frozenset(ToolEffect(v) for v in effects)
         self.cwd = Path(cwd).resolve()
         self.tenant_id = config.tenant_id
         self.task_id = _safe_identifier(task_id, fallback=new_id("task"))
@@ -166,21 +187,26 @@ class PagedMemoryRuntime:
         self.goal = goal
         self.model_name = model_name
         self.model_context_limit = max(1_024, int(model_context_limit or 128_000))
-        self.current_mode = config.manual_mode or config.default_mode
+        initial_mode = config.manual_mode or config.default_mode
+        self.current_mode = initial_mode.canonical
         self.storage_health = StorageHealth.NORMAL
-        self.metrics = TaskMetrics()
+        self._authority_health_before_recovery: StorageHealth | None = None
+        self.metrics = TaskMetrics(counter_run_id=self.run_id)
+        initialize_rerank_state(self.metrics, initial_mode)
         self.last_packet: ContextPacket | None = None
+        self._request_budget = None
         self.current_step_id = ""
         self._step_sequence = 0
         self._step_finalized = True
         self._last_checkpoint: CheckpointRecord | None = None
+        self._step_contract_sources: list[str] = []
+        self._step_acceptance_criteria: dict[str, Any] = {}
         self._operational_metrics: dict[str, float | int] = {
             "page_fault_count": 0,
             "raw_page_tokens": 0,
             "artifact_read_latency_ms": 0.0,
             "artifact_upload_failure_count": 0,
             "source_pointer_resolution_failure_count": 0,
-            "outbox_retry_count": 0,
             "tool_result_original_size": 0,
             "tool_result_prompt_size": 0,
             "output_tokens": 0,
@@ -190,8 +216,9 @@ class PagedMemoryRuntime:
         self._lock = threading.RLock()
         self._owns_authority = authority is None
         self._owns_artifact_store = artifact_store is None
-        self._owns_vector_index = vector_index is None
         self._closed = False
+        self._last_maintenance_at: float | None = None
+        self._last_maintenance_report: dict[str, Any] = {}
 
         try:
             self.authority = authority or self._build_authority(config)
@@ -205,7 +232,7 @@ class PagedMemoryRuntime:
             if isinstance(exc, AuthorityUnavailableError):
                 raise
             raise AuthorityUnavailableError(
-                "authoritative memory store is unavailable"
+                f"authoritative memory store is unavailable ({getattr(exc, 'sqlite_errorname', type(exc).__name__)}: {exc})"
             ) from exc
 
         self.artifact_store = artifact_store or build_artifact_store(config)
@@ -218,24 +245,8 @@ class PagedMemoryRuntime:
                 # unusable; an outage will still fail closed rather than truncate.
                 logger.warning("Encrypted artifact spool disabled: %s", exc)
                 self.spool_store = None
-        self.vector_index = vector_index
-        self.index_descriptor = configured_index_descriptor(config)
-        if self.vector_index is None and config.milvus_enabled:
-            try:
-                self.vector_index = build_vector_index(config)
-            except Exception as exc:  # noqa: BLE001 - optional SDK errors vary by adapter.
-                logger.warning(
-                    "Milvus unavailable; authority lexical retrieval remains active: %s",
-                    exc,
-                )
-                self.vector_index = None
-                self.storage_health = StorageHealth.INDEX_DEGRADED
-        if self.vector_index is not None:
-            descriptor = getattr(self.vector_index, "index_descriptor", None)
-            if descriptor is not None:
-                self.index_descriptor = descriptor
-
         self.token_budget = TokenBudgetManager(model_name=model_name)
+        self.result_reclamation = ResultReclamation(self)
         self.mode_policy = MemoryModePolicy(config)
         self.dependency_resolver = DependencyResolver(
             self.authority,
@@ -243,7 +254,16 @@ class PagedMemoryRuntime:
             source_validator=self._dependency_source_is_resolvable,
         )
         self.working_set = WorkingSetManager(self.authority)
-        self.retriever = HybridMemoryRetriever(self.authority, self.vector_index)
+        self.retriever = LexicalMemoryRetriever(
+            self.authority,
+            lexical_candidate_limit=config.lexical_candidate_limit,
+            timeout_seconds=config.retrieval_timeout_seconds,
+        )
+        self.handoff_notes = HandoffNotes(self, runtime_values)
+        self.context_rotation = ContextRotation(self)
+        self.context_utilization = ContextUtilization(self)
+        self.context_borrowing = ContextBorrowing(self)
+        self.code_focus = CodeFocus(self)
         self.context_builder = PagedContextBuilder(
             authority=self.authority,
             config=config,
@@ -252,6 +272,13 @@ class PagedMemoryRuntime:
             retriever=self.retriever,
             dependency_resolver=self.dependency_resolver,
             working_set=self.working_set,
+            handoff_notes=self.handoff_notes,
+            context_rotation=self.context_rotation,
+            code_focus=self.code_focus,
+            context_tool_names=self.context_tool_names,
+            reranker=self._build_reranker(
+                config, runtime_values, authority=self.authority
+            ),
         )
         try:
             self.authority.ensure_task(
@@ -311,6 +338,18 @@ class PagedMemoryRuntime:
     def controls_context(self) -> bool:
         return self.config.enabled
 
+    def context_tool_names(self) -> frozenset[str]:
+        from .tools import create_paged_memory_tools
+        return frozenset(tool.name for tool in create_paged_memory_tools(self))
+
+    @staticmethod
+    def _build_reranker(
+        config: PagedMemoryConfig, runtime: Mapping[str, Any] | None, *, authority=None
+    ):
+        from .reranking import OptionalMemoryReranker
+
+        return OptionalMemoryReranker(config, runtime, authority=authority)
+
     @classmethod
     def from_runtime(
         cls,
@@ -320,16 +359,28 @@ class PagedMemoryRuntime:
         messages: Sequence[Mapping[str, Any]],
         session: Any | None = None,
         model_name: str = "",
-        model_context_limit: int = 128_000,
+        model_context_limit: int | None = None,
     ) -> PagedMemoryRuntime | None:
         runtime_values: Mapping[str, Any] = runtime or {}
+        from minicode.context_manager import resolve_context_limit
+
+        model_name = model_name or str(runtime_values.get("model", ""))
+        resolved_limit = resolve_context_limit(model_name, dict(runtime_values))
+        model_context_limit = min(resolved_limit, model_context_limit) if model_context_limit is not None else resolved_limit
         config = PagedMemoryConfig.from_sources(runtime_values, cwd=cwd)
         if not (config.enabled or config.shadow_write):
             return None
         session_id = str(
             getattr(session, "session_id", "") or getattr(session, "id", "")
         )
-        goal = _latest_user_text(messages)
+        # Helpers may receive only a scoped assignment and the server-owned
+        # user contract. Never promote an injected control message to the goal.
+        instructions = runtime_values.get("_memoryUserInstructions") or ()
+        contract = runtime_values.get("_memoryTaskContract")
+        goal = _latest_user_text(messages) or (
+            str(instructions[-1]) if instructions else
+            str(contract.get("request", "")) if isinstance(contract, Mapping) else ""
+        )
         explicit_task_id = str(
             runtime_values.get("_memoryTaskId")
             or runtime_values.get("memoryTaskId")
@@ -354,6 +405,16 @@ class PagedMemoryRuntime:
             or runtime_values.get("_memoryRunId")
             or ""
         ).strip()
+        node_id = str(runtime_values.get("_runtimeNodeId") or "")
+        attempt_id = str(runtime_values.get("_runtimeAttemptId") or "")
+        step_namespace = node_id
+        if node_id and attempt_id:
+            # A resumed Worker starts its local sequence at one again. Its
+            # attempt owns a new step namespace; reusing only node_id would
+            # overwrite COMPLETED steps and collide with their finalization
+            # idempotency keys. Hash both full IDs before identifier truncation.
+            activation = content_hash_text(stable_json([node_id, attempt_id])).removeprefix("sha256:")
+            step_namespace = f"{node_id[:64]}.attempt.{activation}"
         instance: PagedMemoryRuntime | None = None
         try:
             instance = cls(
@@ -364,14 +425,35 @@ class PagedMemoryRuntime:
                 model_name=model_name,
                 model_context_limit=model_context_limit,
                 run_id=configured_run_id or None,
-                step_namespace=str(runtime_values.get("_runtimeNodeId", "")),
+                step_namespace=step_namespace,
+                runtime_values=runtime_values,
             )
             # A new process/session resumes the last verified view
             # automatically; callers should not need a model tool invocation
             # merely to recover mode and progress counters.
             instance.restore_latest_checkpoint()
+            # A checkpoint restores progress, not provider message history.
+            # Detect an abbreviated history before the new run writes it again.
+            incoming_user_hashes = {
+                content_hash_text(_message_content(message))
+                for message in messages
+                if is_user_input(message)
+            }
+            previous_inputs = instance.authority.recent_events(
+                tenant_id=instance.tenant_id,
+                task_id=instance.task_id,
+                event_types=(EventType.USER_INPUT.value,),
+                limit=100,
+            )
+            if any(
+                event.run_id != instance.run_id
+                and event.content_hash not in incoming_user_hashes
+                for event in previous_inputs
+            ):
+                instance.metrics.cross_session_required = True
             if config.manual_mode is not None:
-                instance.current_mode = config.manual_mode
+                instance.current_mode = config.manual_mode.canonical
+                instance.metrics.rerank_eligible = config.manual_mode is MemoryMode.PAGED_MEMORY
             instance.authority.update_run_mode(
                 tenant_id=instance.tenant_id,
                 task_id=instance.task_id,
@@ -427,6 +509,7 @@ class PagedMemoryRuntime:
                 restart_recovery_required=instance.metrics.restart_recovery_required,
             )
             instance.record_initial_messages(messages)
+            instance.configure_task_contract(runtime_values, messages)
             return instance
         except Exception as exc:
             if instance is not None:
@@ -440,8 +523,7 @@ class PagedMemoryRuntime:
 
     @staticmethod
     def _build_authority(config: PagedMemoryConfig) -> Any:
-        if config.backend == "postgres":
-            return PostgresMemoryStore(config.database_url)
+        config.validate()
         return SqliteMemoryStore(config.sqlite_path)
 
     def _persist_event(
@@ -451,9 +533,7 @@ class PagedMemoryRuntime:
         state_patch: Mapping[str, Any] | None = None,
         artifact: ArtifactRecord | None = None,
         memory: MemoryRecord | None = None,
-        outbox: OutboxRecord | None = None,
         memories: Sequence[MemoryRecord] = (),
-        outboxes: Sequence[OutboxRecord] = (),
         decision: DecisionRecord | None = None,
         checkpoint: CheckpointRecord | None = None,
         step_status: str = "",
@@ -467,19 +547,31 @@ class PagedMemoryRuntime:
                 state_patch=state_patch,
                 artifact=artifact,
                 memory=memory,
-                outbox=outbox,
                 memories=memories,
-                outboxes=outboxes,
                 decision=decision,
                 checkpoint=checkpoint,
                 step_status=step_status,
             )
+        except (HandoffNoteConflict, ContextRotationConflict, HistoryIntegrityError):
+            # Preserve exact conflicts/integrity failures instead of presenting
+            # them as retryable storage outages.
+            raise
         except StateVersionConflict as exc:
             self._operational_metrics["task_state_version_conflict"] += 1
-            self.storage_health = StorageHealth.RECOVERING
-            raise AuthorityUnavailableError(
-                "authoritative state changed concurrently; state advancement is blocked"
+            self._mark_authority_recovering()
+            raise AuthorityRecoveringError(
+                "authoritative state changed concurrently; the operation was rolled back. "
+                "Re-read current state before resuming; completed tool effects must not be replayed."
             ) from exc
+        except sqlite3.OperationalError as exc:
+            busy = getattr(exc, "sqlite_errorcode", 0) & 0xff in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+            if busy:
+                self._mark_authority_recovering()
+            else:
+                self.storage_health = StorageHealth.AUTHORITY_UNAVAILABLE
+            error_type = AuthorityRecoveringError if busy else AuthorityUnavailableError
+            raise error_type(f"authoritative write could not be committed ({getattr(exc, 'sqlite_errorname', type(exc).__name__)}: {exc}); existing results are retained, "
+                             "state advancement is blocked until storage recovery") from exc
         except Exception as exc:
             self.storage_health = StorageHealth.AUTHORITY_UNAVAILABLE
             raise AuthorityUnavailableError(
@@ -489,7 +581,16 @@ class PagedMemoryRuntime:
             self._operational_metrics["authority_write_latency_ms"] = (
                 time.perf_counter() - write_started
             ) * 1_000
+        if self._authority_health_before_recovery is not None:
+            if self.storage_health == StorageHealth.RECOVERING:
+                self.storage_health = self._authority_health_before_recovery
+            self._authority_health_before_recovery = None
         return result
+
+    def _mark_authority_recovering(self) -> None:
+        if self._authority_health_before_recovery is None:
+            self._authority_health_before_recovery = self.storage_health
+        self.storage_health = StorageHealth.RECOVERING
 
     def _idempotent_event(self, idempotency_key: str) -> AgentEvent | None:
         try:
@@ -644,16 +745,6 @@ class PagedMemoryRuntime:
         if health != StorageHealth.AUTHORITY_UNAVAILABLE:
             self._record_health_event(health, reason)
 
-    def _index_outbox_for(self, memory: MemoryRecord) -> OutboxRecord | None:
-        """Create durable index work even while the optional index is offline."""
-        if not self.config.indexer_enabled or not (
-            self.config.milvus_enabled or self.vector_index is not None
-        ):
-            return None
-        return make_memory_index_outbox(
-            memory,
-            index_descriptor=self.index_descriptor,
-        )
 
     def _text_artifact_chunk_records(
         self,
@@ -664,30 +755,22 @@ class PagedMemoryRuntime:
         tool_name: str,
         ok: bool,
     ) -> list[MemoryRecord]:
-        """Project every byte of a text artifact into searchable source ranges.
+        """Project tool text beyond its navigation preview into searchable ranges.
 
-        The artifact remains the authority for the original payload.  Chunk
-        records contain bounded text used by database FTS and Milvus, plus an
+        The event or artifact remains the authority for the original payload. Chunk
+        records contain bounded text used by SQLite keyword retrieval, plus an
         exact byte range and digest that can be independently verified.
         """
 
-        if artifact is None or not artifact.media_type.casefold().startswith("text/"):
-            return []
-        chunk_size = max(
-            1_024,
-            min(7_000, self.config.raw_page_token_limit * 3),
-        )
-        return artifact_chunk_records(
-            text=output,
-            event=event,
-            artifact=artifact,
-            tool_name=tool_name,
-            phase=self.metrics.current_phase,
-            ok=ok,
-            estimate_tokens=self.token_budget.estimate_text,
-            max_bytes=chunk_size,
-            max_tokens=384,
-        )
+        return tool_text_chunk_records(output=output, event=event, artifact=artifact,
+            tool_name=tool_name, phase=self.metrics.current_phase, ok=ok,
+            estimate_tokens=self._estimate_chunk_tokens, raw_page_token_limit=self.config.raw_page_token_limit)
+
+    def _estimate_chunk_tokens(self, text: str) -> int:
+        return self.token_budget.estimate_text(text)
+
+    def _chunk_token_limit(self) -> int:
+        return max(1, min(384, self.config.raw_page_token_limit))
 
     def _persist_text_artifact_chunks(
         self,
@@ -711,7 +794,6 @@ class PagedMemoryRuntime:
             stored.append(
                 self.authority.put_memory(
                     memory,
-                    outbox=self._index_outbox_for(memory),
                 )
             )
         return stored
@@ -719,7 +801,7 @@ class PagedMemoryRuntime:
     def _message_memory(self, event: AgentEvent, *, role: str) -> MemoryRecord | None:
         """Project a raw conversation event into a source-linked search card."""
         content = event.content_text
-        if not content:
+        if not content or is_generated_export(content):
             return None
         preview_limit = max(800, min(4_000, self.config.raw_page_token_limit * 4))
         labels = {
@@ -750,6 +832,7 @@ class PagedMemoryRuntime:
 
     def record_initial_messages(self, messages: Sequence[Mapping[str, Any]]) -> None:
         """Idempotently capture the input history before any lossy context operation."""
+        self.context_rotation.remember_initial_history(messages)
         role_types = {
             "user": EventType.USER_INPUT,
             "assistant": EventType.MODEL_OUTPUT,
@@ -759,7 +842,8 @@ class PagedMemoryRuntime:
         }
         for index, message in enumerate(messages):
             role = str(message.get("role", ""))
-            event_type = role_types.get(role)
+            runtime_kind = runtime_message_kind(message)
+            event_type = EventType.STATE_UPDATED if runtime_kind else role_types.get(role)
             if event_type is None:
                 continue
             content = _message_content(message)
@@ -778,6 +862,8 @@ class PagedMemoryRuntime:
                 event_type = EventType.TOOL_ERROR
             digest = content_hash_text(content)
             event_metadata = {"role": role, "history_index": index}
+            if runtime_kind:
+                event_metadata["runtime_message_kind"] = runtime_kind
             if role in {"assistant_tool_call", "tool_result"}:
                 event_metadata["tool_name"] = str(message.get("toolName", ""))
                 event_metadata["tool_call_id"] = str(message.get("toolUseId", ""))
@@ -792,16 +878,190 @@ class PagedMemoryRuntime:
             )
             memory = (
                 self._message_memory(event, role=role)
-                if role in {"user", "assistant", "assistant_progress"}
+                if not runtime_kind and role in {"user", "assistant", "assistant_progress"}
                 else None
             )
             if memory is not None:
                 event.content_json["memory_id"] = memory.id
-            self._persist_event(
+            chunks = self._conversation_chunks(event, role=role) if memory else []
+            persisted_event, _ = self._persist_event(
                 event,
                 memory=memory,
-                outbox=self._index_outbox_for(memory) if memory else None,
+                memories=chunks,
             )
+            if chunks and persisted_event.id != event.id:
+                # Replaying history written by an older version repairs only
+                # missing derived chunks, without rewriting its raw event.
+                for chunk in self._conversation_chunks(persisted_event, role=role):
+                    if not self.authority.get_memories(
+                        tenant_id=self.tenant_id,
+                        task_id=self.task_id,
+                        memory_ids=[chunk.id],
+                    ):
+                        self.authority.put_memory(
+                            chunk
+                        )
+
+    def _conversation_chunks(
+        self, event: AgentEvent, *, role: str
+    ) -> list[MemoryRecord]:
+        if is_generated_export(event.content_text):
+            return []
+        preview_limit = max(800, min(4_000, self.config.raw_page_token_limit * 4))
+        if (
+            len(event.content_text) <= preview_limit
+            and self._estimate_chunk_tokens(event.content_text)
+            <= self._chunk_token_limit()
+        ):
+            return []
+        return event_chunk_records(
+            event=event,
+            role=role,
+            phase=self.metrics.current_phase,
+            estimate_tokens=self._estimate_chunk_tokens,
+            max_tokens=self._chunk_token_limit(),
+        )
+
+    def configure_task_contract(
+        self, runtime: Mapping[str, Any], messages: Sequence[Mapping[str, Any]]
+    ) -> None:
+        """Project server-owned task and Worker contracts into required evidence.
+
+        User prose is retained verbatim; this does not pretend to infer every
+        constraint from natural language. Structured constraints and acceptance
+        criteria come from the same contract the Scheduler executes.
+        """
+        contract = runtime.get("_memoryTaskContract")
+        if not isinstance(contract, Mapping):
+            user_instructions = runtime.get("_memoryUserInstructions")
+            if user_instructions is None:
+                user_instructions = [
+                    _message_content(message)
+                    for message in messages
+                    if is_user_input(message)
+                ]
+            contract = {
+                "request": str(user_instructions[-1]) if user_instructions else "",
+                "constraints": runtime.get(
+                    "_taskContextConstraints", runtime.get("taskConstraints", ())
+                ),
+                "acceptance_criteria": runtime.get("acceptanceCriteria", ()),
+                "expected_outputs": runtime.get("expectedOutputs", ()),
+                "contract_revision": runtime.get("runtimeContractRevision", 1),
+                "user_instructions": user_instructions,
+            }
+        revision = contract.get("contract_revision", 1)
+        values = {
+            "runtime.task_request": str(contract.get("request", "")),
+            "runtime.task_rules": stable_json(
+                {
+                    "constraints": contract.get("constraints", ()),
+                    "acceptance_criteria": contract.get("acceptance_criteria", ()),
+                    "expected_outputs": contract.get("expected_outputs", ()),
+                }
+            ),
+        }
+        for key, text in values.items():
+            if not text:
+                continue
+            if key == "runtime.task_rules" and not any(json.loads(text).values()):
+                active = self.authority.active_decisions(
+                    tenant_id=self.tenant_id, task_id=self.task_id
+                )
+                if not any(decision.decision_key == key for decision in active):
+                    continue
+            decision = self.record_decision(
+                key=key,
+                text=text,
+                structured_value={"contract_revision": revision},
+                idempotency_key=f"{self.run_id}:contract:{key}:{revision}:{content_hash_text(text)}",
+            )
+            if decision.status != MemoryStatus.ACTIVE:
+                raise ValueError(
+                    "task contract has been superseded; refresh the Worker contract"
+                )
+
+        worker_contract = runtime.get("_memoryWorkerContract")
+        if not isinstance(worker_contract, Mapping):
+            worker_contract = {
+                "objective": _latest_user_text(messages),
+                "acceptance_criteria": contract.get("acceptance_criteria", ()),
+            }
+        self._step_acceptance_criteria = {
+            "criteria": list(worker_contract.get("acceptance_criteria", ()) or ())
+        }
+        payloads = [("worker_contract", dict(worker_contract))]
+        instructions = contract.get(
+            "user_instructions", runtime.get("_memoryUserInstructions")
+        )
+        if instructions is None:
+            instructions = [
+                _message_content(message)
+                for message in messages
+                if is_user_input(message)
+            ]
+        payloads.extend(
+            ("user_instruction", str(instruction))
+            for instruction in instructions
+            if instruction
+        )
+        results = runtime.get("_memoryDependencyResults", {})
+        for node_id in worker_contract.get("dependency_result_refs", ()):
+            result = results.get(node_id) if isinstance(results, Mapping) else None
+            # Consultation visibility is not a successful DAG dependency. The
+            # Scheduler can return a failed review so the primary can repair it;
+            # retain its native disposition without granting completion credit.
+            consultation = (
+                isinstance(result, Mapping)
+                and worker_contract.get("node_id") == "primary"
+                and node_id in worker_contract.get("consultation_result_refs", ())
+                and result.get("node_id") == node_id
+                and isinstance(runtime.get("_runtimeActiveRunId"), str)
+                and bool(runtime["_runtimeActiveRunId"])
+                and result.get("run_id") == runtime.get("_runtimeActiveRunId")
+                and bool(result.get("attempt_id"))
+                and (result.get("consultation_state"), result.get("status")) in {
+                    ("FAILED_TERMINAL", AgentResultStatus.FAILED_TERMINAL.value),
+                    ("CANCELED", AgentResultStatus.CANCELED.value),
+                }
+            )
+            if (
+                not isinstance(result, Mapping)
+                or (result.get("status") != AgentResultStatus.SUCCEEDED.value and not consultation)
+            ):
+                raise ValueError(f"required Worker result is unavailable: {node_id}")
+            dependency_result = dict(result)
+            # Saved-note receipts deliberately do not enter the knowledge index.
+            # Give the declared successor their exact current-run audit pointer,
+            # so review does not have to search old summaries for a missing ID.
+            if result.get("node_id") == node_id and isinstance(result.get("run_id"), str):
+                receipt = self.handoff_notes.dependency_receipt(node_id=node_id, run_id=result["run_id"],
+                    attempt_id=str(result.get("attempt_id") or ""))
+                if receipt:
+                    dependency_result["handoff_note_receipt"] = receipt
+            payloads.append((f"worker_result:{node_id}", dependency_result))
+        sources = []
+        for kind, payload in payloads:
+            text = payload if kind == "user_instruction" else stable_json(payload)
+            digest = content_hash_text(text)
+            event = AgentEvent(
+                tenant_id=self.tenant_id,
+                task_id=self.task_id,
+                run_id=self.run_id,
+                event_type=(
+                    EventType.USER_INPUT
+                    if kind == "user_instruction"
+                    else EventType.STATE_UPDATED
+                ),
+                content_text=text,
+                content_json={"contract_source": kind},
+                content_hash=digest,
+                token_count=self.token_budget.estimate_text(text),
+                idempotency_key=f"{self.run_id}:{self.step_namespace}:{kind}:{digest}",
+            )
+            persisted, _ = self._persist_event(event)
+            sources.append(persisted.id)
+        self._step_contract_sources = sources
 
     def begin_step(
         self,
@@ -812,6 +1072,8 @@ class PagedMemoryRuntime:
         phase: str = "EXECUTION",
     ) -> str:
         with self._lock:
+            if user_input:
+                self.code_focus.user_input = user_input
             if self.current_step_id and not self._step_finalized:
                 self.finalize_step(success=True)
             self._step_sequence = max(self._step_sequence, sequence_no)
@@ -828,7 +1090,11 @@ class PagedMemoryRuntime:
                     title=f"Agent step {sequence_no}",
                     description=user_input[:1_000],
                     status="RUNNING",
-                    acceptance_criteria=acceptance_criteria,
+                    acceptance_criteria=(
+                        acceptance_criteria
+                        if acceptance_criteria is not None
+                        else self._step_acceptance_criteria
+                    ),
                 )
                 event = self._event(
                     EventType.STATE_UPDATED,
@@ -843,6 +1109,13 @@ class PagedMemoryRuntime:
                         "phase": phase,
                     },
                 )
+                for source_id in self._step_contract_sources:
+                    self.add_dependency(
+                        step_id=self.current_step_id,
+                        dependency_type=DependencyType.EVENT,
+                        dependency_id=source_id,
+                        required=True,
+                    )
             except AuthorityUnavailableError:
                 raise
             except Exception as exc:
@@ -873,10 +1146,11 @@ class PagedMemoryRuntime:
         memory = self._message_memory(event, role="assistant")
         if memory is not None:
             event.content_json["memory_id"] = memory.id
+        chunks = self._conversation_chunks(event, role="assistant") if memory else []
         self._persist_event(
             event,
             memory=memory,
-            outbox=self._index_outbox_for(memory) if memory else None,
+            memories=chunks,
         )
         self._operational_metrics["output_tokens"] = event.token_count
         return event
@@ -905,29 +1179,9 @@ class PagedMemoryRuntime:
 
     @staticmethod
     def _tool_summary(
-        output: str, *, tool_name: str, ok: bool
+        output: str, *, tool_name: str, ok: bool, enhanced: bool = True, query: str = ""
     ) -> tuple[str, dict[str, Any], list[str]]:
-        lines = output.splitlines()
-        non_empty = [line.strip() for line in lines if line.strip()]
-        preview = "\n".join(non_empty[:6])[:800]
-        sample = [line[:240] for line in non_empty[:3]]
-        status = "succeeded" if ok else "failed"
-        summary = f"{tool_name} {status}; {len(output.encode('utf-8'))} bytes, {len(lines)} lines"
-        if preview:
-            summary += f"\n{preview}"
-        statistics: dict[str, Any] = {
-            "bytes": len(output.encode("utf-8")),
-            "characters": len(output),
-            "lines": len(lines),
-        }
-        try:
-            parsed = json.loads(output)
-            statistics["json_type"] = type(parsed).__name__
-            if isinstance(parsed, (list, dict)):
-                statistics["json_items"] = len(parsed)
-        except (json.JSONDecodeError, TypeError):
-            pass
-        return summary, statistics, sample
+        return output_summary(output, tool_name=tool_name, ok=ok, enhanced=enhanced, query=query)
 
     def _observe_tool_envelope(self, *, raw_size: int, prompt_output: str) -> None:
         self._operational_metrics["tool_result_original_size"] = raw_size
@@ -942,6 +1196,7 @@ class PagedMemoryRuntime:
         output: str,
         ok: bool,
         force_inline: bool = False,
+        read_sha256: str = "",
     ) -> tuple[ToolResultEnvelope, str]:
         """Serialize concurrent receipts before touching one authority connection."""
         with self._lock:
@@ -950,6 +1205,7 @@ class PagedMemoryRuntime:
                 output=output,
                 ok=ok,
                 force_inline=force_inline,
+                read_sha256=read_sha256,
             )
 
     def _capture_tool_result(
@@ -959,6 +1215,7 @@ class PagedMemoryRuntime:
         output: str,
         ok: bool,
         force_inline: bool = False,
+        read_sha256: str = "",
     ) -> tuple[ToolResultEnvelope, str]:
         """Persist a real tool receipt before returning a compact prompt value.
 
@@ -967,11 +1224,14 @@ class PagedMemoryRuntime:
         """
         call_id = str(call.get("id", ""))
         tool_name = str(call.get("toolName", "unknown"))
-        is_navigation_receipt = tool_name in MEMORY_NAVIGATION_TOOL_NAMES
+        is_navigation_receipt = tool_name in MEMORY_NAVIGATION_TOOL_NAMES or is_export_read(
+            call, output, root=self.config.export_root, cwd=self.cwd
+        )
         raw = output.encode("utf-8")
         digest = content_hash_bytes(raw)
         summary, statistics, sample = self._tool_summary(
-            output, tool_name=tool_name, ok=ok
+            output, tool_name=tool_name, ok=ok, enhanced=self.config.tool_result_projection_enabled,
+            query=self.context_rotation.user_input or self.goal,
         )
         event_type = EventType.TOOL_RESULT if ok else EventType.TOOL_ERROR
         idempotency_key = f"{self.current_step_id}:tool-result:{call_id}:{digest}"
@@ -1083,9 +1343,10 @@ class PagedMemoryRuntime:
             "statistics": statistics,
             "full_content_location": "artifact" if artifact else "event",
             "searchable_memory": not is_navigation_receipt,
+            "context_projection_allowed": not force_inline and not is_navigation_receipt,
+            **self.code_focus.observe(call, output, ok=ok and not is_navigation_receipt, read_sha256=read_sha256),
         }
         memory: MemoryRecord | None = None
-        outbox: OutboxRecord | None = None
         if not is_navigation_receipt:
             preview_text = summary
             if artifact is None:
@@ -1116,7 +1377,6 @@ class PagedMemoryRuntime:
                 phase=self.metrics.current_phase,
                 facets=["tool_result", tool_name, "success" if ok else "error"],
             )
-            outbox = self._index_outbox_for(memory)
         state_patch: dict[str, Any] = {}
         if artifact and not is_navigation_receipt:
             state_patch["_active_artifacts_append"] = [artifact.id]
@@ -1140,19 +1400,12 @@ class PagedMemoryRuntime:
             if not is_navigation_receipt
             else []
         )
-        chunk_outboxes = [
-            candidate
-            for chunk in chunk_memories
-            if (candidate := self._index_outbox_for(chunk)) is not None
-        ]
         persisted_event, _ = self._persist_event(
             event,
             state_patch=state_patch or None,
             artifact=artifact,
             memory=memory,
-            outbox=outbox,
             memories=chunk_memories,
-            outboxes=chunk_outboxes,
         )
         if persisted_event.id != event.id:
             committed_artifact = self._artifact_from_event(persisted_event)
@@ -1272,7 +1525,7 @@ class PagedMemoryRuntime:
         if success:
             # Merge under the authority transaction lock.  Replacing the full
             # list from this stale pre-read can otherwise lose a sibling
-            # Worker's completed Step on PostgreSQL.
+            # Worker's completed Step in SQLite.
             patch["_completed_steps_append"] = [self.current_step_id]
         projected_state = apply_transactional_state_patch(state, patch)
         projected_metrics = asdict(self.metrics)
@@ -1320,6 +1573,17 @@ class PagedMemoryRuntime:
         return checkpoint
 
     def create_checkpoint(self, *, reason: str = "manual") -> CheckpointRecord:
+        # A checkpoint without a state patch is an observation, not a state
+        # transition. Rebuild it from fresh authority after a sibling commits.
+        for attempt in range(3):
+            try:
+                return self._create_checkpoint(reason=reason)
+            except AuthorityRecoveringError as error:
+                if attempt == 2 or not isinstance(error.__cause__, StateVersionConflict):
+                    raise
+        raise AssertionError("unreachable")
+
+    def _create_checkpoint(self, *, reason: str) -> CheckpointRecord:
         if self.storage_health == StorageHealth.AUTHORITY_UNAVAILABLE:
             raise AuthorityUnavailableError(
                 "cannot checkpoint without the authority store"
@@ -1394,12 +1658,12 @@ class PagedMemoryRuntime:
                 tenant_id=self.tenant_id, task_id=self.task_id
             )
         )
-        if checkpoint is None:
+        if checkpoint is None or checkpoint.snapshot.get("checkpoint_type", "TASK_STATE") != "TASK_STATE":
             return None
         expected = content_hash_text(stable_json(checkpoint.snapshot))
         if expected != checkpoint.content_hash:
             raise ArtifactIntegrityError("checkpoint content hash mismatch")
-        self.current_mode = checkpoint.memory_mode
+        self.current_mode = checkpoint.memory_mode.canonical
         self.current_step_id = checkpoint.current_step_id
         metrics = checkpoint.snapshot.get("metrics", {})
         if isinstance(metrics, dict):
@@ -1407,7 +1671,12 @@ class PagedMemoryRuntime:
             self.metrics = TaskMetrics(
                 **{key: value for key, value in metrics.items() if key in allowed}
             )
+            if not self.metrics.counter_run_id:
+                self.metrics.counter_run_id = checkpoint.run_id
+        initialize_rerank_state(self.metrics, checkpoint.memory_mode)
         self._last_checkpoint = checkpoint
+        self.context_borrowing.stop()
+        self._request_budget = None
         if preserve_active_step and active_step and not active_step_finalized:
             # A model-visible recovery read must not orphan the currently
             # running Step. It restores the checkpoint view while keeping the
@@ -1418,7 +1687,40 @@ class PagedMemoryRuntime:
             self._step_finalized = True
         return checkpoint
 
-    def prepare_model_messages(
+    def prepare_model_messages(self, messages, **options):
+        budget = options.get("request_budget")
+        normal = getattr(budget, "normal_budget", budget)
+        recovery = self.context_borrowing
+        selected = recovery.request_budget(normal) if recovery.handoff_only else normal
+        # Full request -> early/failed-capacity handoff -> borrowed handoff.
+        # These are local measurements, not extra model requests. Restoration
+        # remains pending until ProviderCall admits the final complete body.
+        for attempt in range(3):
+            try:
+                prepared, packet = self._prepare_model_messages(messages, **{**options, "request_budget": selected})
+                if recovery.restoring and self._request_budget is not normal:
+                    # An explicit rotation may only become visible during
+                    # this build. Discard its loan-sized planning view too.
+                    return self._prepare_model_messages(messages, **{**options, "request_budget": normal})
+                if recovery.begin_preparation(packet, normal):
+                    # Rebuild with the actual restricted tool schemas and
+                    # handoff guidance before the first model dispatch.
+                    selected = recovery.request_budget(normal)
+                    continue
+                return prepared, packet
+            except ContextBudgetExceeded as error:
+                if recovery.restoring and self._request_budget is not normal:
+                    return self._prepare_model_messages(messages, **{**options, "request_budget": normal})
+                if recovery.restoring or attempt == 2:
+                    raise
+                if not recovery.handoff_only:
+                    if not recovery.begin_handoff(error, normal):
+                        raise
+                elif not recovery.activate(error, selected):
+                    raise
+                selected = recovery.request_budget(normal)
+
+    def _prepare_model_messages(
         self,
         messages: Sequence[Mapping[str, Any]],
         *,
@@ -1427,7 +1729,14 @@ class PagedMemoryRuntime:
         required_facets: Sequence[str] = (),
         acceptance_criteria: Mapping[str, Any] | None = None,
         system_context: str = "",
+        request_budget: Any | None = None,
+        _rotation_retry: bool = False,
+        bind_history: bool = False,
     ) -> tuple[list[dict[str, Any]], ContextPacket]:
+        self._request_budget = request_budget
+        self.maintain_memories()
+        self.context_rotation.capture(messages, user_input=_latest_user_text(messages) or self.goal, bind_history=bind_history)
+        messages = self.context_rotation.request_messages
         estimated = sum(
             self.token_budget.estimate_message(message) for message in messages
         )
@@ -1443,38 +1752,82 @@ class PagedMemoryRuntime:
             else self.metrics.current_phase
         )
         context_started = time.perf_counter()
+        # Use the same whole-exchange tail selection as model_messages(). This
+        # proves source presence in the actual request, not merely in history.
+        visible_tail = self.token_budget.recent_messages(
+            [message for message in messages if message.get("role") != "system"],
+            token_budget=(0 if self.config.elastic_context_budget_enabled else self.config.recent_event_token_budget),
+            retain_latest_user=True,
+        )
+        inline_content_hashes: dict[str, list[str]] = {}
+        for message in visible_tail:
+            role, content = message.get("role"), message.get("content")
+            if not isinstance(content, str) or not content:
+                continue
+            event_type = (
+                EventType.USER_INPUT if is_user_input(message) else
+                (EventType.TOOL_ERROR if message.get("isError") else EventType.TOOL_RESULT)
+                if role == "tool_result" else None
+            )
+            if event_type is not None:
+                inline_content_hashes.setdefault(event_type.value, []).append(content_hash_text(content))
         packet = self.context_builder.build(
             tenant_id=self.tenant_id,
             task_id=self.task_id,
             run_id=self.run_id,
             step_id=step_id or self.current_step_id or f"{self.run_id}.step.0",
-            user_input=_latest_user_text(messages),
+            user_input=_latest_user_text(messages) or self.goal,
             metrics=self.metrics,
             current_mode=self.current_mode,
             model_context_limit=self.model_context_limit,
             system_context=system_context,
-            acceptance_criteria=acceptance_criteria,
+            acceptance_criteria=(
+                acceptance_criteria
+                if acceptance_criteria is not None
+                else self._step_acceptance_criteria
+            ),
             required_facets=required_facets,
             phase_boundary=phase_boundary,
+            inline_content_hashes=inline_content_hashes,
+            history_messages=messages,
+            tool_schema_tokens=int((self.last_packet.debug_metadata if self.last_packet else {}).get(
+                "actual_tool_schema_tokens", 0)),
+            request_budget=request_budget,
         )
         packet.debug_metadata["context_build_latency_ms"] = (
             time.perf_counter() - context_started
         ) * 1_000
+        rotation = packet.debug_metadata.get("context_rotation", {})
+        if rotation.get("status") == "active":
+            self.context_borrowing.rotated(rotation)
+        if self.context_rotation.enabled:
+            packet.debug_metadata["history_journal"] = {
+                "basis": self.context_rotation.frame.get("history_basis"),
+                "events": len(self.context_rotation.journal.records),
+                "rebuilt_view": self.context_rotation.journal.rebuilt,
+                "tools_reexecuted": False,
+            }
+        packet.debug_metadata["memory_lifecycle"] = dict(self._last_maintenance_report)
+        if self.config.tool_result_projection_enabled and packet.memory_mode != MemoryMode.INLINE:
+            packet.debug_metadata["tool_result_projection"] = prepare_projection(
+                self, packet, self.context_builder.recent_history(packet, messages),
+                user_input=_latest_user_text(messages) or self.goal)
+            preview_sources = {item["source_event_id"] for item in packet.debug_metadata["tool_result_projection"]["replacements"]}
+            # Previously deduplicated optional cards now have a bounded source
+            # receipt, not full inline evidence. Facet obligations and semantic
+            # records were excluded from this deduplication in the first place.
+            covered = packet.debug_metadata["inline_source_covered_sources"]
+            packet.debug_metadata["preview_source_covered_memory_ids"] = sorted(
+                key for key, source in covered.items() if source in preview_sources)
+            packet.debug_metadata["inline_source_covered_memory_ids"] = sorted(
+                key for key, source in covered.items() if source not in preview_sources)
+        else:
+            self.result_reclamation.clear()
+        from .inline_sources import prepare_render_coverage
+        packet.debug_metadata["render_inline_source_proofs"] = prepare_render_coverage(self, packet)
         previous_mode = self.current_mode
         self.current_mode = packet.memory_mode
         self.last_packet = packet
-        if packet.memory_mode == MemoryMode.PAGED_MEMORY:
-            if self.retriever.last_vector_error or self.vector_index is None:
-                self._set_health(
-                    StorageHealth.INDEX_DEGRADED,
-                    "paged mode rejected or could not use Milvus candidates; "
-                    "authority lexical retrieval remains active",
-                )
-            elif self.storage_health == StorageHealth.INDEX_DEGRADED:
-                self._set_health(
-                    StorageHealth.NORMAL,
-                    "verified Milvus retrieval recovered",
-                )
         if previous_mode != self.current_mode:
             self.authority.update_run_mode(
                 tenant_id=self.tenant_id,
@@ -1495,13 +1848,55 @@ class PagedMemoryRuntime:
                 ),
             )
             self._persist_event(event)
+        if self.controls_context:
+            packet = self.context_builder.fit_request_budget(packet, messages, request_budget)
+            self.last_packet = packet
+        # Decide from the input actually being sent after optional paging. The
+        # canonical transcript remains searchable but is not all in this request.
+        self._update_request_pressure(packet, messages)
+        self.context_borrowing.mark_packet(packet)
+        auto_rotation = self.context_utilization.try_auto_rotate(packet) if not _rotation_retry else False
+        if auto_rotation:
+            self.context_borrowing.rotated(auto_rotation)
+            prepared, recovered = self.prepare_model_messages(messages, step_id=step_id, phase_boundary=phase_boundary,
+                required_facets=required_facets, acceptance_criteria=acceptance_criteria,
+                system_context=system_context, request_budget=request_budget, _rotation_retry=True, bind_history=bind_history)
+            recovered.debug_metadata["context_auto_rotation"] = auto_rotation
+            return prepared, recovered
         prepared = (
             self.context_builder.model_messages(packet, messages)
             if self.controls_context
             else [dict(message) for message in messages]
         )
+        if packet.memory_mode is MemoryMode.INLINE:
+            self.context_utilization.before_request(packet, step_id=step_id or self.current_step_id)
         self.enforce_provider_budget(prepared)
+        # A real capacity failure must reach the restricted handoff fallback
+        # even when the earlier, ordinary protection budget has been used up.
+        if packet.memory_mode is not MemoryMode.INLINE:
+            self.context_utilization.before_request(packet, step_id=step_id or self.current_step_id)
+        if self.controls_context:
+            self._touch_memories([
+                item.item_id for item in (
+                    *packet.mandatory_dependencies, *packet.working_set,
+                    *packet.supplemental_memories,
+                )
+            ])
         return prepared, packet
+
+    def _update_request_pressure(self, packet, messages):
+        if self._request_budget is None or not self.controls_context:
+            return
+        from .context_utilization import pressure_status
+        pressure = packet.debug_metadata["context_pressure"]
+        measured = self._request_budget.measure(self.context_builder.model_messages(packet, messages))
+        pressure.setdefault("unpaged_input_tokens", pressure["admission_input_tokens"])
+        pressure["admission_input_tokens"] = measured
+        limit = max(1, pressure.get("pressure_window", pressure["input_limit"]))
+        pressure["effective_pressure_ratio"] = min(2.0, pressure["admission_input_tokens"] / limit)
+        pressure["forecast_pressure_ratio"] = min(2.0,
+            (pressure["admission_input_tokens"] + pressure["growth_reserve_tokens"]) / limit)
+        packet.debug_metadata["context_utilization"] = pressure_status(self.config, pressure)
 
     def enforce_provider_budget(
         self,
@@ -1551,6 +1946,12 @@ class PagedMemoryRuntime:
             - self.config.output_token_reserve
             - self.config.safety_token_reserve,
         )
+        if self._request_budget is not None:
+            if tool_definitions:
+                from minicode.tooling import ToolRegistry
+                self._request_budget.tools = ToolRegistry(list(tool_definitions))
+            provider_input_tokens = self._request_budget.measure(messages)
+            input_limit = self._request_budget.input_limit
         if self.last_packet is not None:
             self.last_packet.debug_metadata.update(
                 {
@@ -1559,6 +1960,7 @@ class PagedMemoryRuntime:
                     "reserved_tool_tokens": reserved_tool_tokens,
                     "actual_provider_input_tokens": provider_input_tokens,
                     "hard_input_token_limit": input_limit,
+                    "provider_budget_exceeded": provider_input_tokens > input_limit,
                 }
             )
         if provider_input_tokens > input_limit:
@@ -1575,12 +1977,16 @@ class PagedMemoryRuntime:
         key: str,
         text: str,
         structured_value: Mapping[str, Any] | None = None,
+        idempotency_key: str = "",
     ) -> DecisionRecord:
         value = dict(structured_value or {})
         decision_digest = content_hash_text(
             stable_json({"key": key, "text": text, "value": value})
         )
-        idempotency_key = f"{self.current_step_id}:decision:{key}:{decision_digest}"
+        idempotency_key = (
+            idempotency_key
+            or f"{self.current_step_id}:decision:{key}:{decision_digest}"
+        )
         existing_event = self._idempotent_event(idempotency_key)
         if existing_event is not None:
             return self._decision_from_source_event(
@@ -1617,11 +2023,11 @@ class PagedMemoryRuntime:
             phase=self.metrics.current_phase,
             facets=["decision", key],
         )
-        outbox = self._index_outbox_for(memory)
         active_decision = {
             "decision_id": decision.id,
             "source_event_id": event.id,
             "status": MemoryStatus.ACTIVE.value,
+            "content_hash": decision_digest,
         }
         try:
             persisted_event, _ = self._persist_event(
@@ -1629,7 +2035,6 @@ class PagedMemoryRuntime:
                 state_patch={"_active_decisions_upsert": {key: active_decision}},
                 decision=decision,
                 memory=memory,
-                outbox=outbox,
             )
             stored = (
                 decision
@@ -1688,7 +2093,6 @@ class PagedMemoryRuntime:
             phase=self.metrics.current_phase,
             facets=list(dict.fromkeys(["constraint", *normalized_facets])),
         )
-        outbox = self._index_outbox_for(memory)
         persisted_event, _ = self._persist_event(
             event,
             state_patch={
@@ -1701,7 +2105,6 @@ class PagedMemoryRuntime:
                 ]
             },
             memory=memory,
-            outbox=outbox,
         )
         if persisted_event.id != event.id:
             return self._memory_from_source_event(
@@ -1746,6 +2149,7 @@ class PagedMemoryRuntime:
         step_id: str | None = None,
         high_risk: bool = True,
         expected_state_version: int | None = None,
+        expected_contract_hash: str | None = None,
         idempotency_key: str = "",
     ) -> PreflightAuditResult:
         target_step = step_id or self.current_step_id
@@ -1774,6 +2178,15 @@ class PagedMemoryRuntime:
                 task_id=self.task_id,
                 step_id=target_step,
             )
+            if (
+                high_risk
+                and expected_contract_hash is not None
+                and dependency_contract_hash(dependencies, state)
+                != expected_contract_hash
+            ):
+                errors.append(
+                    "required context changed after model input; rebuild context before execution"
+                )
             items, missing, unresolved = self.dependency_resolver.load_items(
                 tenant_id=self.tenant_id,
                 task_id=self.task_id,
@@ -2093,23 +2506,37 @@ class PagedMemoryRuntime:
     ) -> bytes:
         if start < 0 or end < start:
             raise ValueError("event range must satisfy 0 <= start <= end")
-        text = self.read_event(event_id).content_text
-        normalized = unit.upper()
-        if normalized == "BYTE":
-            return text.encode("utf-8")[start:end]
-        if normalized == "CHAR":
-            return text[start:end].encode("utf-8")
-        if normalized == "LINE":
-            return "\n".join(text.splitlines()[start:end]).encode("utf-8")
-        if normalized == "PAGE":
-            return "\f".join(text.split("\f")[start:end]).encode("utf-8")
-        raise ValueError("event range unit must be BYTE, CHAR, LINE, or PAGE")
+        return _select_bytes(
+            self._event_source_payload(event_id), start=start, end=end, unit=unit
+        )
+
+    def _event_source_payload(self, event_id: str) -> bytes:
+        """Resolve and verify the same source for event length and range reads."""
+        event = self.read_event(event_id)
+        if event.artifact_uri:
+            artifact = self._artifact_from_event(event)
+            if artifact is None or artifact.content_hash != event.content_hash:
+                raise ArtifactIntegrityError("event artifact registry/hash mismatch")
+            payload = self.read_artifact_range(
+                artifact.id, start=0, end=artifact.size_bytes, unit="BYTE"
+            )
+        else:
+            payload = event.content_text.encode("utf-8")
+            # An empty tool result is still a complete, verifiable original.
+            # Structured events use the JSON fallback only when its hash is
+            # actually needed to resolve the event's source representation.
+            if not payload and content_hash_bytes(payload) != event.content_hash:
+                payload = stable_json(event.content_json).encode("utf-8")
+        if content_hash_bytes(payload) != event.content_hash:
+            raise ArtifactIntegrityError("event source content hash mismatch")
+        return payload
 
     def event_source_end(self, event_id: str, *, unit: str) -> int:
-        text = self.read_event(event_id).content_text
+        payload = self._event_source_payload(event_id)
         normalized = unit.upper()
         if normalized == "BYTE":
-            return len(text.encode("utf-8"))
+            return len(payload)
+        text = payload.decode("utf-8")
         if normalized == "CHAR":
             return len(text)
         if normalized == "LINE":
@@ -2239,7 +2666,7 @@ class PagedMemoryRuntime:
                     unit=source_unit,
                 )
             else:
-                payload = event.content_text.encode("utf-8")
+                payload = self._event_source_payload(event.id)
         else:
             raise ArtifactIntegrityError("memory has no raw source pointer")
 
@@ -2269,7 +2696,9 @@ class PagedMemoryRuntime:
             raise KeyError(f"memory not found in task scope: {memory_id}")
         memory = memories[0]
         payload = self._memory_source_payload(memory)
-        return _select_bytes(payload, start=start, end=end, unit=unit)
+        selected = _select_bytes(payload, start=start, end=end, unit=unit)
+        self._touch_memories([memory_id])
+        return selected
 
     def memory_source_end(self, memory_id: str, *, unit: str) -> int | None:
         """Return the exclusive end in Memory-relative coordinates."""
@@ -2351,42 +2780,55 @@ class PagedMemoryRuntime:
             memory_id, start=start, end=end, unit=unit
         ).decode("utf-8", errors="replace")
 
+    def maintain_memories(self, *, force: bool = False) -> dict[str, Any]:
+        """Age this task's supplemental memories independently of legacy context."""
+        from minicode.memory_lifecycle import MAINTENANCE_INTERVAL_SECONDS
+
+        with self._lock:
+            now = time.monotonic()
+            if (not force and self._last_maintenance_at is not None
+                    and now - self._last_maintenance_at < MAINTENANCE_INTERVAL_SECONDS):
+                return dict(self._last_maintenance_report)
+            try:
+                report = self.authority.maintain_memories(
+                    tenant_id=self.tenant_id, task_id=self.task_id, now=now_epoch(),
+                )
+            except Exception as exc:
+                logger.warning("Paged memory lifecycle maintenance failed: %s", exc)
+                self._last_maintenance_report = {"error": type(exc).__name__}
+                return dict(self._last_maintenance_report)
+            self._last_maintenance_report = report
+            self._last_maintenance_at = None if report.get("has_more") else now
+            return dict(report)
+
+    def _touch_memories(self, memory_ids: Sequence[str]) -> None:
+        if not memory_ids:
+            return
+        try:
+            self.authority.touch_memories(
+                tenant_id=self.tenant_id, task_id=self.task_id,
+                memory_ids=memory_ids, now=now_epoch(),
+            )
+        except Exception as exc:
+            logger.warning("Paged memory access persistence failed: %s", exc)
+
     def search(self, query: str, *, limit: int | None = None) -> list[MemoryRecord]:
+        self.maintain_memories()
         request = MemorySearchRequest(
             tenant_id=self.tenant_id,
             task_id=self.task_id,
-            query=query,
+            query=retrieval_query(query),
             candidate_limit=limit or self.config.candidate_limit,
         )
-        return [
+        records = [
             hit.record
             for hit in self.retriever.search(
                 request,
-                use_vector=(self.current_mode == MemoryMode.PAGED_MEMORY),
             )
         ]
+        self._touch_memories([record.id for record in records])
+        return records
 
-    def process_outbox(self, *, limit: int = 100) -> dict[str, int]:
-        counts = {"processed": 0, "retried": 0, "failed": 0, "skipped": 0}
-        if self.vector_index is None:
-            return counts
-        counts = OutboxIndexer(
-            authority=self.authority,
-            vector_index=self.vector_index,
-            config=self.config,
-        ).run_once(limit=limit)
-        self._operational_metrics["outbox_retry_count"] += counts["retried"]
-        if counts["retried"] or counts["failed"]:
-            self._set_health(
-                StorageHealth.INDEX_DEGRADED, "index outbox processing incomplete"
-            )
-        elif (
-            counts["processed"]
-            and self.vector_index.health_check()
-            and self.storage_health == StorageHealth.INDEX_DEGRADED
-        ):
-            self._set_health(StorageHealth.NORMAL, "index outbox caught up")
-        return counts
 
     def replay_pending_artifacts(self) -> dict[str, int]:
         """Idempotently move encrypted spool objects into the primary store."""
@@ -2505,11 +2947,6 @@ class PagedMemoryRuntime:
             self._set_health(
                 StorageHealth.ARTIFACT_DEGRADED, "pending artifact replay incomplete"
             )
-        elif self.vector_index is None and self.config.milvus_enabled:
-            self._set_health(
-                StorageHealth.INDEX_DEGRADED,
-                "artifact store recovered; index unavailable",
-            )
         else:
             self._set_health(StorageHealth.NORMAL, "pending artifact replay verified")
         return counts
@@ -2536,17 +2973,14 @@ class PagedMemoryRuntime:
             )
 
         pending: list[ArtifactRecord] = []
-        index_lag = 0
         try:
             pending = self.authority.list_artifacts(
                 tenant_id=self.tenant_id,
                 task_id=self.task_id,
                 statuses=(ArtifactStatus.PENDING_UPLOAD.value,),
             )
-            index_lag = len(self.authority.pending_outbox(limit=1_000_000))
         except Exception:  # noqa: BLE001 - telemetry cannot alter execution.
             pending = []
-            index_lag = 0
 
         selected_count = int(debug.get("selected_memory_count", 0))
         working_count = int(debug.get("working_set_item_count", 0))
@@ -2556,6 +2990,9 @@ class PagedMemoryRuntime:
             "step_id": self.current_step_id,
             "memory_mode": self.current_mode.value,
             "mode_change_reason": debug.get("mode_reason", ""),
+            "rerank_admission": debug.get("rerank_admission", {}),
+            "context_utilization": debug.get("context_utilization", {}),
+            "context_tool_forecast": debug.get("context_tool_forecast", {}),
             "model_context_limit": self.model_context_limit,
             "estimated_input_tokens": (
                 packet.estimated_input_tokens if packet is not None else 0
@@ -2568,24 +3005,36 @@ class PagedMemoryRuntime:
             "recent_event_tokens": section_tokens("recent_messages"),
             "dependency_tokens": section_tokens("mandatory_dependencies"),
             "working_set_tokens": section_tokens("working_set"),
-            "milvus_memory_tokens": section_tokens("supplemental_memories"),
+            "supplemental_memory_tokens": section_tokens("supplemental_memories"),
+            "handoff_note_tokens": section_tokens("handoff_notes"),
+            "handoff_note": dict(debug.get("handoff_note", {"status": "disabled"})),
+            "context_rotation": dict(debug.get("context_rotation", {"status": "disabled"})),
+            "context_pressure": dict(debug.get("context_pressure", {})),
+            "context_allocation": dict(debug.get("context_allocation", {})),
+            "code_focus": dict(debug.get("code_focus", {"status": "disabled"})),
+            "prepared_message_tokens_estimated": debug.get("actual_prepared_input_tokens"),
+            "tool_schema_tokens_estimated": debug.get("actual_tool_schema_tokens"),
+            "provider_input_tokens_estimated": debug.get("actual_provider_input_tokens"),
+            "provider_budget_exceeded": debug.get("provider_budget_exceeded", False),
+            "lexical_latency_ms": debug.get("lexical_latency_ms", 0.0),
+            "tool_result_projection": {key: value for key, value in debug.get("tool_result_projection", {}).items()
+                                       if key != "replacements"},
             "raw_page_tokens": int(self._operational_metrics["raw_page_tokens"]),
             "retrieved_candidate_count": int(debug.get("retrieved_candidate_count", 0)),
             "selected_memory_count": selected_count,
+            "adaptive_retrieval": dict(debug.get("adaptive_retrieval", {})),
+            "rerank": dict(debug.get("rerank", {"status": "not_requested"})),
             "duplicate_memory_count": int(debug.get("duplicate_memory_count", 0)),
             "superseded_memory_count": 0,
             "page_fault_count": int(self._operational_metrics["page_fault_count"]),
             "working_set_hit_rate": working_count
             / max(1, working_count + selected_count),
-            "milvus_latency_ms": float(debug.get("milvus_latency_ms", 0.0)),
             "artifact_read_latency_ms": float(
                 self._operational_metrics["artifact_read_latency_ms"]
             ),
             "context_build_latency_ms": float(
                 debug.get("context_build_latency_ms", 0.0)
             ),
-            "index_lag": index_lag,
-            "outbox_retry_count": int(self._operational_metrics["outbox_retry_count"]),
             "task_state_version_conflict": int(
                 self._operational_metrics["task_state_version_conflict"]
             ),
@@ -2615,10 +3064,10 @@ class PagedMemoryRuntime:
                     len(debug.get("unresolved_source_ids", ())),
                 )
             ),
-            "postgres_write_latency_ms": float(
+            "authority_write_latency_ms": float(
                 self._operational_metrics["authority_write_latency_ms"]
             ),
-            "postgres_availability_state": (
+            "authority_availability_state": (
                 "AVAILABLE" if self._safe_health(self.authority) else "UNAVAILABLE"
             ),
             "artifact_store_availability_state": (
@@ -2630,9 +3079,6 @@ class PagedMemoryRuntime:
             "local_durable_spool_bytes": sum(item.size_bytes for item in pending),
             "supplemental_retrieval_degraded": bool(
                 debug.get("supplemental_retrieval_degraded", False)
-            ),
-            "vector_candidate_mismatch_count": int(
-                debug.get("vector_candidate_mismatch_count", 0)
             ),
             # Lifecycle metrics are emitted by LifecycleManager operations.
             "artifact_orphan_candidate_count": None,
@@ -2655,97 +3101,24 @@ class PagedMemoryRuntime:
     def health_snapshot(self) -> dict[str, Any]:
         authority_ok = self._safe_health(self.authority)
         artifact_ok = self._safe_health(self.artifact_store)
-        index_ok = self._safe_health(
-            self.vector_index,
-            absent_is_healthy=not self.config.milvus_enabled,
-        )
-        expected_entries: dict[str, str] = {}
-        actual_entries: dict[str, str] = {}
-        reconciliation_error = ""
-        if authority_ok and self.config.milvus_enabled:
-            try:
-                expected_entries = {
-                    memory.id: memory.content_hash
-                    for memory in self.authority.all_memories(
-                        tenant_id=self.tenant_id,
-                        task_id=self.task_id,
-                    )
-                    if memory.status in {MemoryStatus.ACTIVE, MemoryStatus.OPEN}
-                }
-                if self.vector_index is None:
-                    reconciliation_error = "vector index unavailable"
-                else:
-                    list_entries = getattr(self.vector_index, "list_entries", None)
-                    if not callable(list_entries):
-                        raise TypeError(
-                            "vector index does not expose hash reconciliation"
-                        )
-                    actual_entries = dict(
-                        list_entries(
-                            tenant_id=self.tenant_id,
-                            task_id=self.task_id,
-                            statuses=(
-                                MemoryStatus.ACTIVE.value,
-                                MemoryStatus.OPEN.value,
-                            ),
-                        )
-                    )
-            except Exception as exc:  # noqa: BLE001 - health output is fail-safe.
-                reconciliation_error = type(exc).__name__
-                index_ok = False
-        expected_ids = set(expected_entries)
-        actual_ids = set(actual_entries)
-        missing_ids = sorted(expected_ids - actual_ids)
-        orphan_ids = sorted(actual_ids - expected_ids)
-        hash_mismatch_ids = sorted(
-            memory_id
-            for memory_id in expected_ids & actual_ids
-            if actual_entries[memory_id] != expected_entries[memory_id]
-        )
         effective_state = self.storage_health
         if not authority_ok:
             effective_state = StorageHealth.AUTHORITY_UNAVAILABLE
-        elif self.config.milvus_enabled and (
-            not index_ok
-            or reconciliation_error
-            or missing_ids
-            or orphan_ids
-            or hash_mismatch_ids
-        ):
-            effective_state = StorageHealth.INDEX_DEGRADED
-        return {
-            "state": effective_state.value,
-            "authority": authority_ok,
-            "artifact_store": artifact_ok,
-            "vector_index": index_ok,
-            "vector_consistency": {
-                "index_id": self.index_descriptor.index_id,
-                "collection": self.index_descriptor.collection,
-                "expected": len(expected_ids),
-                "actual": len(actual_ids),
-                "missing": len(missing_ids),
-                "orphan": len(orphan_ids),
-                "hash_mismatch": len(hash_mismatch_ids),
-                "missing_ids": missing_ids[:20],
-                "orphan_ids": orphan_ids[:20],
-                "hash_mismatch_ids": hash_mismatch_ids[:20],
-                "error": reconciliation_error,
-            },
-            "task_id": self.task_id,
-            "run_id": self.run_id,
-            "mode": self.current_mode.value,
-            "metrics": self.metrics_snapshot(),
-        }
+        elif not artifact_ok:
+            effective_state = StorageHealth.ARTIFACT_DEGRADED
+        return {"state": effective_state.value, "authority": authority_ok,
+                "artifact_store": artifact_ok, "task_id": self.task_id,
+                "run_id": self.run_id, "mode": self.current_mode.value,
+                "metrics": self.metrics_snapshot()}
 
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
-        if self._owns_vector_index and self.vector_index is not None:
-            try:
-                self.vector_index.close()
-            except Exception:
-                logger.warning("Could not close vector index", exc_info=True)
+        self.context_borrowing.stop()
+        builder = getattr(self, "context_builder", None)
+        if builder is not None and builder.reranker is not None:
+            builder.reranker.close()
         if (
             self._owns_artifact_store
             and getattr(self, "artifact_store", None) is not None
@@ -2773,6 +3146,7 @@ class PagedMemoryRuntime:
 
 __all__ = [
     "ArtifactPersistenceRequired",
+    "AuthorityRecoveringError",
     "AuthorityUnavailableError",
     "ContextBudgetExceeded",
     "PagedMemoryError",

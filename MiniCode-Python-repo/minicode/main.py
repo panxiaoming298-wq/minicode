@@ -10,6 +10,7 @@ from pathlib import Path
 from minicode.unified_runtime import run_runtime_turn as run_agent_turn
 from minicode.cli_commands import try_handle_local_command
 from minicode.config import load_runtime_config
+from minicode.extension_commands import expand_extension_command
 from minicode.history import load_history_entries, save_history_entries
 from minicode.local_tool_shortcuts import parse_local_tool_shortcut
 from minicode.manage_cli import maybe_handle_management_command
@@ -373,7 +374,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--profile",
-        choices=["standard", "ultra"],
+        choices=["standard", "deep", "ultra"],
         default=None,
         help="Unified Runtime execution profile (default: standard)",
     )
@@ -499,7 +500,7 @@ def main() -> None:
     logger = get_logger("main")
     context_mgr = None
     if runtime:
-        context_mgr = ContextManager(model=runtime.get("model", "default"))
+        context_mgr = ContextManager.from_runtime(runtime)
         logger.info("Context manager initialized for model: %s", runtime.get("model", "unknown"))
     
     # Initialize MemoryManager for cross-session knowledge retention
@@ -593,6 +594,11 @@ def main() -> None:
                     _append_transcript(transcript, kind="assistant", body=local_result)
                     print(local_result)
                     continue
+                from minicode.skill_runtime import user_skill_request
+                user_input = user_skill_request(user_input, runtime)
+                extension_command = expand_extension_command(cwd, user_input)
+                if extension_command is not None:
+                    user_input = extension_command.prompt
                 shortcut = parse_local_tool_shortcut(user_input)
                 if shortcut is not None:
                     _append_transcript(transcript, kind="user", body=user_input)

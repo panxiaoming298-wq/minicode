@@ -103,7 +103,7 @@ def classify_error(error: Exception) -> ErrorCategory:
     the error category, enabling more intelligent retry decisions.
     """
     # Check HTTP status code first (most reliable)
-    status_code = getattr(error, "status_code", None)
+    status_code = getattr(error, "status_code", None) or getattr(error, "code", None)
     
     if status_code is not None:
         if status_code == 429:

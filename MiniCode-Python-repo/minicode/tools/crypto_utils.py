@@ -5,11 +5,15 @@ import hmac
 from datetime import datetime, timezone
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
+from minicode.tools._validation import validate_fields
 # ---------------------------------------------------------------------------
 # Timestamp Convert
 # ---------------------------------------------------------------------------
 
 def _validate_timestamp(input_data: dict) -> dict:
+    validate_fields(input_data, required=("value",), value=str, direction=str)
+    if input_data.get("direction", "to_iso") not in {"to_iso", "to_timestamp"}:
+        raise ValueError("direction must be to_iso or to_timestamp")
     value = input_data.get("value", "")
     if not isinstance(value, str) or not value.strip():
         raise ValueError("value is required")
@@ -29,21 +33,24 @@ def _run_timestamp(input_data: dict, context: ToolContext) -> ToolResult:
         else:
             # ISO -> Unix timestamp
             dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                raise ValueError("ISO date must include a timezone offset or Z")
             output = str(int(dt.timestamp()))
         
         return ToolResult(ok=True, output=output)
     except Exception as e:
-        return ToolResult(ok=False, output=f"Conversion error: {e}")
+        return ToolResult(ok=False, output=f"Conversion error: {e}", failureKind="invalid_input")
 
 
 timestamp_tool = ToolDefinition(
     name="timestamp_convert",
-    description="Convert between Unix timestamp and ISO date format.",
+    description="Convert between integer Unix seconds and an ISO date with an explicit timezone offset or Z.",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "value": {"type": "string", "description": "Timestamp (int) or ISO date (str)"},
-            "direction": {"type": "string", "description": "to_iso or to_timestamp"}
+            "direction": {"type": "string", "enum": ["to_iso", "to_timestamp"], "description": "to_iso or to_timestamp"}
         },
         "required": ["value"]
     },
@@ -57,6 +64,7 @@ timestamp_tool = ToolDefinition(
 # ---------------------------------------------------------------------------
 
 def _validate_hash(input_data: dict) -> dict:
+    validate_fields(input_data, required=("text",), text=str, algorithm=str, hex=bool)
     text = input_data.get("text", "")
     algorithm = input_data.get("algorithm", "sha256").lower()
     if not isinstance(text, str):
@@ -87,6 +95,7 @@ hash_tool = ToolDefinition(
     description="Calculate hash (MD5, SHA1, SHA256, SHA512) of text.",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "text": {"type": "string", "description": "Text to hash"},
             "algorithm": {"type": "string", "description": "md5, sha1, sha256, sha512 (default: sha256)"},
@@ -104,6 +113,7 @@ hash_tool = ToolDefinition(
 # ---------------------------------------------------------------------------
 
 def _validate_hmac(input_data: dict) -> dict:
+    validate_fields(input_data, required=("text", "key"), text=str, key=str, algorithm=str)
     text = input_data.get("text", "")
     key = input_data.get("key", "")
     algorithm = input_data.get("algorithm", "sha256").lower()
@@ -132,6 +142,7 @@ hmac_tool = ToolDefinition(
     description="Calculate HMAC (keyed-hash message authentication code).",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "text": {"type": "string", "description": "Message to authenticate"},
             "key": {"type": "string", "description": "Secret key"},

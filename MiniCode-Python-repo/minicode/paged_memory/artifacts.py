@@ -56,16 +56,20 @@ def _select_bytes(
         raise ValueError("artifact range must satisfy 0 <= start <= end")
     unit = unit.upper()
     if unit == "BYTE":
+        if query or log_level:
+            raise ValueError("Filtered artifact views require CHAR, LINE or PAGE units; BYTE addresses the original artifact")
         return data[start:end]
     text = data.decode("utf-8")
     if query:
         lowered = query.casefold()
         lines = text.splitlines()
-        selected: list[str] = []
+        selected: set[int] = set()
         for index, line in enumerate(lines):
             if lowered in line.casefold():
-                selected.extend(lines[max(0, index - 2) : min(len(lines), index + 3)])
-        text = "\n".join(dict.fromkeys(selected))
+                selected.update(range(max(0, index - 2), min(len(lines), index + 3)))
+        # Merge overlapping windows by source position. Equal lines at distinct
+        # positions are evidence (e.g. repeated numeric rows), not duplicates.
+        text = "\n".join(lines[index] for index in sorted(selected))
     if log_level:
         marker = log_level.upper()
         text = "\n".join(line for line in text.splitlines() if marker in line.upper())
@@ -82,6 +86,11 @@ def _select_bytes(
 class FileArtifactStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root).resolve()
+        if os.name == "nt" and not str(self.root).startswith("\\\\?\\"):
+            # os.replace uses Windows path APIs that can otherwise reject long
+            # task/object keys even when Python's open() created the staging file.
+            absolute = str(self.root)
+            self.root = Path("\\\\?\\UNC\\" + absolute[2:] if absolute.startswith("\\\\") else "\\\\?\\" + absolute)
         self.root.mkdir(parents=True, exist_ok=True)
 
     def put_bytes(
@@ -228,162 +237,8 @@ class FileArtifactStore:
         return target
 
 
-class S3ArtifactStore:
-    """S3/MinIO adapter using boto3 with content-hash verification."""
-
-    def __init__(self, config: PagedMemoryConfig) -> None:
-        try:
-            import boto3
-            from botocore.config import Config as BotoConfig
-        except ImportError as exc:
-            raise RuntimeError(
-                "S3/MinIO artifacts require the optional 'memory' dependencies"
-            ) from exc
-        scheme = "https" if config.artifact_secure else "http"
-        endpoint = config.artifact_endpoint
-        if endpoint and "://" not in endpoint:
-            endpoint = f"{scheme}://{endpoint}"
-        self.bucket = config.artifact_bucket
-        self._client = boto3.client(
-            "s3",
-            endpoint_url=endpoint or None,
-            aws_access_key_id=config.artifact_access_key or None,
-            aws_secret_access_key=config.artifact_secret_key or None,
-            region_name=config.artifact_region,
-            config=BotoConfig(
-                connect_timeout=10, read_timeout=30, retries={"max_attempts": 3}
-            ),
-        )
-
-    def put_bytes(
-        self,
-        data: bytes,
-        *,
-        artifact_id: str = "",
-        tenant_id: str,
-        task_id: str,
-        run_id: str,
-        step_id: str,
-        media_type: str,
-        artifact_type: str,
-    ) -> ArtifactRecord:
-        artifact_id = _component(artifact_id) if artifact_id else new_id("artifact")
-        key = "/".join(
-            [_component(tenant_id), _component(task_id), f"{artifact_id}.blob"]
-        )
-        digest = content_hash_bytes(data)
-        try:
-            self._client.put_object(
-                Bucket=self.bucket,
-                Key=key,
-                Body=data,
-                ContentType=media_type,
-                Metadata={"sha256": digest.removeprefix("sha256:")},
-            )
-        except Exception as exc:
-            raise ArtifactStoreUnavailable("S3/MinIO artifact upload failed") from exc
-        return ArtifactRecord(
-            id=artifact_id,
-            tenant_id=tenant_id,
-            task_id=task_id,
-            run_id=run_id,
-            step_id=step_id,
-            artifact_type=artifact_type,
-            uri=f"s3://{self.bucket}/{key}",
-            content_hash=digest,
-            media_type=media_type,
-            size_bytes=len(data),
-            metadata={"backend": "s3", "bucket": self.bucket, "key": key},
-            status=ArtifactStatus.ACTIVE,
-        )
-
-    def get_bytes(self, artifact: ArtifactRecord) -> bytes:
-        bucket, key = self._location(artifact)
-        try:
-            response = self._client.get_object(Bucket=bucket, Key=key)
-            data = response["Body"].read()
-        except Exception as exc:
-            raise ArtifactStoreUnavailable(
-                f"artifact unavailable: {artifact.id}"
-            ) from exc
-        if (
-            len(data) != artifact.size_bytes
-            or content_hash_bytes(data) != artifact.content_hash
-        ):
-            raise ArtifactIntegrityError(
-                f"artifact integrity check failed: {artifact.id}"
-            )
-        return data
-
-    def read_range(
-        self,
-        artifact: ArtifactRecord,
-        *,
-        start: int,
-        end: int,
-        unit: str = "BYTE",
-        query: str = "",
-        log_level: str = "",
-    ) -> bytes:
-        # Only a whole-object digest is registered today.  A remote Range
-        # response cannot be authenticated independently, so verify the full
-        # authoritative object before selecting a page.  Per-chunk digests can
-        # later restore true remote range I/O without weakening integrity.
-        return _select_bytes(
-            self.get_bytes(artifact),
-            start=start,
-            end=end,
-            unit=unit,
-            query=query,
-            log_level=log_level,
-        )
-
-    def delete(self, artifact: ArtifactRecord) -> None:
-        bucket, key = self._location(artifact)
-        try:
-            self._client.delete_object(Bucket=bucket, Key=key)
-        except Exception as exc:
-            raise ArtifactStoreUnavailable(
-                f"artifact deletion failed: {artifact.id}"
-            ) from exc
-
-    def list_objects(self) -> Iterable[tuple[str, float]]:
-        values: list[tuple[str, float]] = []
-        try:
-            paginator = self._client.get_paginator("list_objects_v2")
-            for page in paginator.paginate(Bucket=self.bucket):
-                for item in page.get("Contents", []):
-                    stamp = item.get("LastModified")
-                    values.append(
-                        (
-                            f"s3://{self.bucket}/{item['Key']}",
-                            stamp.timestamp() if stamp else 0.0,
-                        )
-                    )
-        except Exception as exc:
-            raise ArtifactStoreUnavailable("S3/MinIO listing failed") from exc
-        return tuple(values)
-
-    def health_check(self) -> bool:
-        try:
-            self._client.head_bucket(Bucket=self.bucket)
-            return True
-        except Exception:  # noqa: BLE001 - SDKs expose backend-specific failures.
-            return False
-
-    @staticmethod
-    def _location(artifact: ArtifactRecord) -> tuple[str, str]:
-        if not artifact.uri.startswith("s3://"):
-            raise ArtifactIntegrityError("artifact URI is not owned by S3")
-        path = artifact.uri.removeprefix("s3://")
-        bucket, separator, key = path.partition("/")
-        if not separator or not bucket or not key or ".." in PurePosixPath(key).parts:
-            raise ArtifactIntegrityError("invalid S3 artifact URI")
-        return bucket, key
-
-
 class EncryptedSpoolArtifactStore(FileArtifactStore):
-    """Bounded AES-GCM spool used only when the remote artifact store is down."""
+    """Bounded AES-GCM spool used when the primary artifact directory is unavailable."""
 
     _MAGIC = b"MCSP1"
 
@@ -499,9 +354,9 @@ class EncryptedSpoolArtifactStore(FileArtifactStore):
 
 
 def build_artifact_store(config: PagedMemoryConfig):
-    if config.artifact_store_type == "file":
-        return FileArtifactStore(config.artifact_root)
-    return S3ArtifactStore(config)
+    if config.artifact_store_type != "file":
+        raise ValueError("Only local file artifacts are supported")
+    return FileArtifactStore(config.artifact_root)
 
 
 def build_encrypted_spool(config: PagedMemoryConfig):

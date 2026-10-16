@@ -5,6 +5,8 @@ from __future__ import annotations
 import base64
 import json
 from typing import Any
+from types import FunctionType
+from weakref import WeakSet, WeakKeyDictionary
 
 from minicode.runtime_protocol import ReplayPolicy, ToolEffect
 from minicode.tooling import (
@@ -14,13 +16,38 @@ from minicode.tooling import (
     ToolResult,
 )
 
-from .models import MemoryRecord
+from .models import MemoryMode, MemoryRecord
+from .handoff import (HandoffNotes, HandoffNoteInputError, NOTE_FIELDS, NOTE_REASONS,
+                      NOTE_MAX_ITEMS, NOTE_MAX_TEXT_CHARS, validate_note_update)
+from .rotation import ContextRotation, ROTATION_REASONS, validate_rotation
+from .history_journal import HistoryIntegrityError
+
+
+_STATE_TOOL_RUNNERS: WeakSet = WeakSet()
+_PAGED_TOOL_RUNNERS: WeakKeyDictionary = WeakKeyDictionary()
+
+
+def is_native_paged_tool(tool: ToolDefinition) -> bool:
+    """Match an installed scoped memory handler, never its advertised name."""
+    return (isinstance(tool.run, FunctionType)
+        and _PAGED_TOOL_RUNNERS.get(tool.run) == (tool.name, tool.effect))
+
+
+def is_native_paged_state_tool(tool: ToolDefinition) -> bool:
+    """Recognize installed owner-bound handlers, never a tool name/metadata claim."""
+    return (tool.name in {"memory_note_update", "context_rotate"}
+            and isinstance(tool.run, FunctionType) and tool.run in _STATE_TOOL_RUNNERS)
 
 
 def _integer(value: Any, *, name: str, default: int, minimum: int = 0) -> int:
-    parsed = default if value in (None, "") else int(value)
+    from minicode.tools._validation import InputContractError
+    parsed = default if value is None else value
+    if type(parsed) is not int:
+        raise InputContractError(f"{name} must be an integer; do not coerce the value", path=[name],
+                                 expected="integer", actual=type(parsed).__name__)
     if parsed < minimum:
-        raise ValueError(f"{name} must be >= {minimum}")
+        raise InputContractError(f"{name} must be >= {minimum}", path=[name],
+                                 expected=f"minimum={minimum}", actual=str(parsed))
     return parsed
 
 
@@ -49,6 +76,9 @@ def _memory_card(record: MemoryRecord, *, preview_limit: int = 800) -> dict[str,
         "source_range": record.source_range.to_dict(),
         "content_hash": record.content_hash,
         "facets": record.facets,
+        "run_id": record.run_id,
+        "step_id": record.step_id,
+        "created_at": record.created_at,
     }
 
 
@@ -75,6 +105,11 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
         unit: str,
         source_end: int | None,
     ) -> tuple[bytes, int, bool]:
+        if source_end is not None and start > source_end:
+            from minicode.tools._validation import InputContractError
+            raise InputContractError(f"start {start} exceeds this source view's exclusive end {source_end}; "
+                "use its own next_start, or start=0 for a new filtered view", path=["start"],
+                expected="within the current source view; use its next_start or 0 after changing filters", actual=str(start))
         if source_end is not None and start >= source_end:
             return b"", start, False
         target_end = (
@@ -162,7 +197,9 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
                     "memories": cards,
                     "guidance": (
                         "Reuse these cards. Do not repeat an equivalent memory_search; "
-                        "use memory_get only for a source range that is not already present."
+                        "use memory_get only for a source range that is not already present. "
+                        "These cards describe historical observations. run_id/step_id locate their records; "
+                        "created_at is the card creation time, not proof of current file or requirement state."
                     ),
                 },
                 ensure_ascii=False,
@@ -283,6 +320,7 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
                             if record is not None
                             else "EVENT_RELATIVE"
                         ),
+                        "source_end": source_end,
                         "requested_end": value["requested_end"],
                         "max_page_tokens": max_page_tokens,
                         "request_clamped": request_clamped,
@@ -303,10 +341,13 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
         )
 
     def validate_artifact_read(value: dict[str, Any]) -> dict[str, Any]:
+        from minicode.tools._validation import InputContractError, validate_contract
+        validate_contract(value, artifact_read_input)
         artifact_id = str(value.get("artifact_id", "")).strip()
         if not artifact_id:
             raise ValueError("artifact_id is required")
-        unit = str(value.get("unit", "BYTE")).upper()
+        filtered = bool(value.get("query") or value.get("log_level"))
+        unit = str(value.get("unit", "CHAR" if filtered else "BYTE")).upper()
         if unit not in {"BYTE", "CHAR", "LINE", "PAGE"}:
             raise ValueError("unit must be BYTE, CHAR, LINE, or PAGE")
         start = _integer(value.get("start"), name="start", default=0)
@@ -314,10 +355,11 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
             max_text_units if unit in {"BYTE", "CHAR"} else max_structured_units
         )
         end = _integer(
-            value.get("end"), name="end", default=start + default_span, minimum=start
+            value.get("end"), name="end", default=start + default_span
         )
-        if end == start:
-            raise ValueError("end must be greater than start")
+        if end <= start:
+            raise InputContractError("end must be greater than start", path=["end"],
+                                     expected="greater than start", actual=str(end))
         return {
             "artifact_id": artifact_id,
             "start": start,
@@ -374,6 +416,8 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
                         "start": value["start"],
                         "end": page_end,
                         "unit": value["unit"],
+                        "coordinate_system": "FILTERED_ARTIFACT_RELATIVE" if value["query"] or value["log_level"] else "ARTIFACT_RELATIVE",
+                        "source_end": source_end,
                         "requested_end": value["end"],
                         "max_page_tokens": max_page_tokens,
                         "request_clamped": request_clamped,
@@ -383,6 +427,13 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
                     "encoding": encoding,
                     "truncated_to_page_budget": False,
                     "content": content,
+                    "filters": {"query": value["query"], "log_level": value["log_level"]},
+                    "guidance": (
+                        "Offsets address this stored tool result, including any headers, not the original file. "
+                        "Filters create a new coordinate system: start at 0 when changing them. "
+                        "Continue from next_start only while has_more is true; reaching this result's end "
+                        "does not prove the original file was read completely."
+                    ),
                 },
                 ensure_ascii=False,
                 sort_keys=True,
@@ -420,7 +471,23 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
         "end": {"type": "integer", "minimum": 0},
         "unit": {"type": "string", "enum": ["BYTE", "CHAR", "LINE", "PAGE"]},
     }
-    return [
+    artifact_read_input = {
+        "type": "object", "additionalProperties": False, "required": ["artifact_id"],
+        "properties": {
+            "artifact_id": {"type": "string", "minLength": 1, "description":
+                "Exact saved-tool-result ID (artifact_...). Runtime report/dependency IDs (artifact-...) use runtime_artifact_read."},
+            **range_properties,
+            "unit": {**range_properties["unit"], "description":
+                "Omit for CHAR when query/log_level filters are present, otherwise BYTE. Explicit BYTE cannot be combined with filters."},
+            "query": {"type": "string"}, "log_level": {"type": "string"},
+        },
+        "allOf": [{"if": {"anyOf": [
+            {"required": [name], "properties": {name: {"type": "string", "minLength": 1}}}
+            for name in ("query", "log_level")]},
+            "then": {"properties": {"unit": {"enum": ["CHAR", "LINE", "PAGE"], "description":
+                "Filtered artifact views require CHAR, LINE or PAGE; BYTE addresses the unfiltered bytes."}}}}],
+    }
+    definitions = [
         ToolDefinition(
             name="memory_search",
             description=(
@@ -467,17 +534,13 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
         ),
         ToolDefinition(
             name="artifact_read",
-            description="Read a bounded byte/character/line/page range from a current-task Artifact.",
-            input_schema={
-                "type": "object",
-                "properties": {
-                    "artifact_id": {"type": "string"},
-                    **range_properties,
-                    "query": {"type": "string"},
-                    "log_level": {"type": "string"},
-                },
-                "required": ["artifact_id"],
-            },
+            description=("Read a bounded range of a stored tool result in the current task, including earlier runs. "
+                          "Stored tool-result IDs use artifact_...; Runtime dependency/message/report IDs "
+                          "use runtime_artifact_read. This reads the saved result, not the original file. "
+                         "Use its next_start to page; offsets include tool headers. Query/log_level filter first "
+                         "and then page the filtered view from 0 in CHAR/LINE/PAGE units (omitted unit defaults to CHAR for filters, BYTE otherwise). "
+                         "Never reuse original-file offsets for a filtered Artifact."),
+            input_schema=artifact_read_input,
             validator=validate_artifact_read,
             run=run_artifact_read,
             metadata=_read_metadata("artifact_read", "Scoped Artifact range read"),
@@ -500,6 +563,133 @@ def create_paged_memory_tools(runtime: Any) -> list[ToolDefinition]:
             ),
         ),
     ]
+    from .history_search import create_history_search_tool
+    definitions.append(create_history_search_tool(runtime, _read_metadata("history_search", "Search original task history")))
+    notes = getattr(runtime, "handoff_notes", None)
+    # Read-only Workers may maintain their OWN advisory context. These native
+    # handlers only write owner-scoped memory, never candidate/project files.
+    allowed = getattr(runtime, "context_tool_effects", None)
+    readonly_context = allowed == frozenset({ToolEffect.READ_ONLY})
+    if notes is not None and notes.enabled and runtime.current_mode != MemoryMode.INLINE:
+        definitions.append(create_handoff_note_tool(notes, readonly_context=readonly_context))
+    rotation = getattr(runtime, "context_rotation", None)
+    if rotation is not None and rotation.enabled and runtime.current_mode != MemoryMode.INLINE:
+        definitions.append(create_context_rotation_tool(rotation, readonly_context=readonly_context))
+    scoped = [tool for tool in definitions if allowed is None or tool.effect in allowed]
+    for tool in scoped:
+        _PAGED_TOOL_RUNNERS[tool.run] = (tool.name, tool.effect)
+    return scoped
+
+
+def create_handoff_note_tool(notes: Any, *, readonly_context: bool = False) -> ToolDefinition:
+    def update(value: dict[str, Any], _context: Any) -> ToolResult:
+        # Validation and CAS failures are actionable tool feedback, not an
+        # invitation to silently retry an update based on an obsolete context.
+        try:
+            result = notes.update(value)
+        except HandoffNoteInputError as exc:
+            return ToolResult(ok=False, output=str(exc), failureKind="invalid_input", inputValidationFailed=True)
+        except HistoryIntegrityError as exc:
+            return ToolResult(ok=False, output=str(exc), failureKind="context_blocked", inputRejected=True)
+        except (ValueError, KeyError) as exc:
+            return ToolResult(ok=False, output=str(exc))
+        return ToolResult(ok=True, output=json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+    if type(notes) is HandoffNotes:
+        _STATE_TOOL_RUNNERS.add(update)
+    text_item = {"type": "string", "minLength": 1, "maxLength": NOTE_MAX_TEXT_CHARS}
+    finding = {
+        "type": "object", "additionalProperties": False,
+        "properties": {
+            "text": {**text_item, "description": "One concise finding with its supporting reason and conditions. For a ruled-out approach, say why and when to reconsider it."},
+            "source_event_ids": {"type": "array", "minItems": 1, "maxItems": 4,
+                                 "description": "Original current-task source_event_id values, not memory IDs, tool-call IDs or navigation receipts.",
+                                 "items": {"type": "string", "minLength": 1, "maxLength": 200}},
+        },
+        "required": ["text", "source_event_ids"],
+    }
+    description = (
+        "Replace your bounded working handoff note in the current task. Use the expected_revision "
+        "shown in Handoff note status. Findings and ruled-out approaches need source Event IDs; "
+        "notes are advisory and cannot change user requirements. Save at meaningful stage/pause "
+        "boundaries or budget pressure, not every turn. Supply all four arrays; use [] when empty. "
+        f"Each array allows at most {NOTE_MAX_ITEMS} items; each text at most {NOTE_MAX_TEXT_CHARS} characters. "
+        "Prefer 3-5 short findings/actions with file paths instead of copying full interfaces or code. "
+        "Keep unverified claims in open_questions; source integrity does not prove a claim. "
+        "For check results, retain the command, observed outcome, checked revision when available and "
+        "any later changes in text, citing the original check event. Do not invent fields or revision IDs. "
+        "Make next_steps executable with a file, symbol or source pointer when useful. "
+        "Each finding has only text and source_event_ids; never add text_2 or other fields. "
+        "The entire note must fit the token_budget in Handoff note status, even when each entry "
+        "meets its character limit. After a rejection, correct the reported fields before resubmitting; "
+        "after a conflict, refresh context first."
+    )
+    return ToolDefinition(
+        name="memory_note_update", description=description,
+        input_schema={
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "expected_revision": {"type": "integer", "minimum": 0},
+                "reason": {"type": "string", "enum": list(NOTE_REASONS)},
+                **{key: {"type": "array", "maxItems": NOTE_MAX_ITEMS,
+                         "items": finding if key in {"confirmed_findings", "ruled_out"} else text_item}
+                   for key in NOTE_FIELDS},
+            },
+            "required": ["expected_revision", *NOTE_FIELDS],
+        },
+        validator=validate_note_update, run=update,
+        metadata=ToolMetadata(
+            name="memory_note_update", description=description,
+            capabilities={ToolCapability.CONCURRENCY_SAFE},
+            effect=ToolEffect.READ_ONLY if readonly_context and type(notes) is HandoffNotes else ToolEffect.WORKSPACE_WRITE,
+            replay_policy=ReplayPolicy.NEVER_AUTO_RETRY,
+            tags=["memory", "paged", "handoff", "state"],
+        ),
+    )
+
+
+def create_context_rotation_tool(rotation: Any, *, readonly_context: bool = False) -> ToolDefinition:
+    def rotate(value: dict[str, Any], _context: Any) -> ToolResult:
+        try:
+            result = rotation.rotate(value)
+        except HistoryIntegrityError as exc:
+            return ToolResult(ok=False, output=str(exc), failureKind="context_blocked", inputRejected=True)
+        except (ValueError, KeyError) as exc:
+            return ToolResult(ok=False, output=str(exc))
+        return ToolResult(ok=True, output=json.dumps(result, ensure_ascii=False, sort_keys=True))
+
+    if type(rotation) is ContextRotation:
+        _STATE_TOOL_RUNNERS.add(rotate)
+    description = (
+        "Start the next working context within this task after saving a fresh verified handoff note "
+        "with next_steps. Use the context epoch from status and note revision from the saved receipt. "
+        "The next request omits completed optional history; sources remain in SQLite for memory_get/search. "
+        "Current tool calls, user instructions and required evidence are preserved. "
+        "Check active rotation status first: native pressure recovery may already have applied the saved "
+        "note_revision, in which case no repeat call or replacement note is needed. "
+        "Repeated requests confirm the durable receipt without another commit. Revision races are "
+        "reconciled against verified state with at most 3 commit attempts. Later results remain verbatim "
+        "outside the note's covered boundary; they are not summarized or discarded by this tool. "
+        "Use at meaningful stage boundaries or budget pressure, not every turn."
+    )
+    return ToolDefinition(
+        name="context_rotate", description=description,
+        input_schema={
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "expected_epoch": {"type": "integer", "minimum": 0},
+                "expected_note_revision": {"type": "integer", "minimum": 1},
+                "reason": {"type": "string", "enum": list(ROTATION_REASONS)},
+            },
+            "required": ["expected_epoch", "expected_note_revision"],
+        },
+        validator=validate_rotation, run=rotate,
+        metadata=ToolMetadata(
+            name="context_rotate", description=description,
+            effect=ToolEffect.READ_ONLY if readonly_context and type(rotation) is ContextRotation else ToolEffect.WORKSPACE_WRITE,
+            replay_policy=ReplayPolicy.NEVER_AUTO_RETRY, tags=["memory", "paged", "context", "state"],
+        ),
+    )
 
 
 __all__ = ["create_paged_memory_tools"]

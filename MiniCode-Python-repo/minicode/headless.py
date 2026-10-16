@@ -23,6 +23,11 @@ import sys
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 
+from minicode.headless_runtime import (
+    HeadlessRuntimeOptions, headless_response, load_headless_runtime,
+    response_exit_code, runtime_preview,
+)
+
 
 def _headless_response_exit_code(response: str) -> int:
     normalized = " ".join(str(response or "").lower().split())
@@ -37,7 +42,11 @@ def _headless_response_exit_code(response: str) -> int:
     )
     if any(normalized.startswith(prefix) for prefix in failure_prefixes):
         return 1
-    if "empty response" in normalized:
+    terminal_empty_response_prefixes = (
+        "model returned an empty response and the turn was stopped.",
+        "model returned an empty response after tool execution and the turn was stopped.",
+    )
+    if any(normalized.startswith(prefix) for prefix in terminal_empty_response_prefixes):
         return 1
     return 0
 
@@ -54,15 +63,18 @@ def _write_headless_messages_trace(
 ) -> None:
     if not trace_path:
         return
+    response = headless_response(response_text or error_text or "", runtime, error=error_text is not None)
     readiness_report = _headless_readiness_snapshot(cwd, runtime)
     payload = {
         "cwd": cwd,
         "prompt": prompt,
         "model": (runtime or {}).get("model"),
-        "exit_code": _headless_response_exit_code(response_text or error_text or ""),
+        "exit_code": response.exit_code,
+        "exit_code_source": response.exit_code_source,
         "readiness_report": readiness_report,
         "repair_plan": readiness_report.get("repair_plan", []),
         "runtime_trace": (runtime or {}).get("lastRuntimeTrace"),
+        "task_file": (runtime or {}).get("_headlessTaskFile"),
         "messages": result_messages or [],
         "assistant_response": response_text,
         "error": error_text,
@@ -151,6 +163,11 @@ def run_headless(
     prompt: str | None = None,
     allow_edits: bool = False,
     profile: str | None = None,
+    *,
+    orchestration: str | None = None,
+    max_tokens: int | None = None,
+    deadline_seconds: float | None = None,
+    task_file: str | None = None,
 ) -> str:
     """Run a single agent turn in headless mode and return the response.
 
@@ -162,10 +179,12 @@ def run_headless(
             approval).
 
     Returns:
-        The assistant's response text.
+        The assistant's response text (str-compatible, with Runtime exit metadata).
+        Routing/budget overrides apply only to this invocation; primary requires
+        a finite Token cap and a future deadline. Permissions are unchanged.
     """
+    options = HeadlessRuntimeOptions(profile, orchestration, max_tokens, deadline_seconds, task_file)
     from minicode.unified_runtime import run_runtime_turn as run_agent_turn
-    from minicode.config import load_runtime_config
     from minicode.memory import MemoryManager
     from minicode.model_registry import create_model_adapter
     from minicode.permissions import PermissionManager
@@ -197,7 +216,7 @@ def run_headless(
 
     # Load config
     try:
-        runtime = load_runtime_config(cwd)
+        runtime = load_headless_runtime(cwd, options)
     except Exception as exc:  # noqa: BLE001
         # Persist the failure to the log file (issue #5), not just stderr.
         logger.error("Config load failed: %s", exc, exc_info=True)
@@ -213,8 +232,17 @@ def run_headless(
         print(f"Config error: {exc}", file=sys.stderr)
         sys.exit(1)
 
-    if profile is not None:
-        runtime["executionProfile"] = profile
+    from minicode.extension_commands import expand_extension_command
+    from minicode.skill_runtime import user_skill_request
+
+    try:
+        prompt = user_skill_request(prompt, runtime)
+    except ValueError as error:
+        print(str(error), file=sys.stderr)
+        sys.exit(1)
+    extension_command = expand_extension_command(cwd, prompt)
+    if extension_command is not None:
+        prompt = extension_command.prompt
 
     bounded_provider_smoke = os.environ.get(
         "MINICODE_BOUNDED_PROVIDER_SMOKE",
@@ -260,7 +288,8 @@ def run_headless(
                 {
                     "skills": tools.get_skills(),
                     "mcpServers": tools.get_mcp_servers(),
-                    "memory_context": memory_mgr.get_relevant_context(),
+                    "memory_context": memory_mgr.get_relevant_context(query=prompt),
+                    "runtime": runtime,
                 },
             ),
         },
@@ -293,7 +322,7 @@ def run_headless(
             result_messages=result_messages,
             response_text=response_text,
         )
-        return response_text
+        return headless_response(response_text, runtime)
 
     except Exception as exc:  # noqa: BLE001
         logger.error("Headless error: %s", exc)
@@ -307,7 +336,7 @@ def run_headless(
             response_text=response_text,
             error_text=str(exc),
         )
-        return response_text
+        return headless_response(response_text, runtime, error=True)
     finally:
         try:
             tools.dispose()
@@ -327,9 +356,29 @@ def _build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--profile",
-        choices=["standard", "ultra"],
+        choices=["standard", "deep", "ultra"],
         default=None,
         help="Unified Runtime execution profile (default: standard)",
+    )
+    parser.add_argument(
+        "--runtime", dest="orchestration", choices=["legacy", "primary"], default=None,
+        help="Only this run: primary enables durable consultation; legacy selects the old unified route. Does not grant permissions.",
+    )
+    parser.add_argument(
+        "--max-tokens", type=int, default=None,
+        help="Total Runtime Token cap for this run, not per model request.",
+    )
+    parser.add_argument(
+        "--deadline-seconds", type=float, default=None,
+        help="Runtime deadline measured from this run's configuration load (0 < seconds <= 86400).",
+    )
+    parser.add_argument(
+        "--preflight", action="store_true",
+        help="Print non-secret effective run settings and exit; no model, tools or memory are started, and no prompt is needed.",
+    )
+    parser.add_argument(
+        "--task-file", default=None,
+        help="Explicit trusted JSON acceptance contract. A real run executes its verification commands; preflight only validates it. Does not grant Agent tool permissions.",
     )
     parser.add_argument(
         "prompt",
@@ -343,17 +392,21 @@ def main(argv: list[str] | None = None) -> int:
     """CLI entry point for headless mode."""
     parser = _build_argument_parser()
     parsed = parser.parse_args(list(sys.argv[1:] if argv is None else argv))
+    try:
+        options = HeadlessRuntimeOptions(parsed.profile, parsed.orchestration, parsed.max_tokens, parsed.deadline_seconds, parsed.task_file)
+        if parsed.preflight:
+            runtime = load_headless_runtime(str(Path.cwd()), options)
+            print(json.dumps(runtime_preview(runtime, allow_edits=_allow_edits_requested(parsed.allow_edits)), ensure_ascii=False))
+            return 0
+    except ValueError as error:
+        parser.error(str(error))
+    except Exception as error:  # Configuration load failed before any execution.
+        print(f"Config error: {error}", file=sys.stderr)
+        return 1
     prompt = " ".join(parsed.prompt) if parsed.prompt else None
-    if parsed.profile is None:
-        response = run_headless(prompt, allow_edits=parsed.allow_edits)
-    else:
-        response = run_headless(
-            prompt,
-            allow_edits=parsed.allow_edits,
-            profile=parsed.profile,
-        )
+    response = run_headless(prompt, allow_edits=parsed.allow_edits, **options.kwargs())
     print(response)
-    return _headless_response_exit_code(response)
+    return response_exit_code(response)
 
 
 if __name__ == "__main__":

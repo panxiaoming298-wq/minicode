@@ -47,10 +47,16 @@ from minicode.memory_injector import (
 )
 from minicode.model_registry import ModelSelectionController, ModelSelectionSignal
 from minicode.predictive_controller import PredictiveController
-from minicode.progress_controller import ProgressAction, ProgressController, ProgressSignal
+from minicode.progress_controller import (
+    ProgressAction,
+    ProgressController,
+    ProgressSignal,
+)
+from minicode.provider_usage import current_usage_observation
 from minicode.self_healing_engine import SelfHealingEngine
 from minicode.stability_monitor import MetricSnapshot, StabilityMonitor
 from minicode.state_observer import MeasurementVector, StateObserver
+from minicode.turn_telemetry import current_telemetry
 
 logger = get_logger("cybernetic_orchestrator")
 
@@ -190,13 +196,13 @@ class CyberneticOrchestrator:
         if self.state_observer:
             measurement = MeasurementVector(
                 timestamp=time.time(),
-                response_time=step * 2.0,
+                response_time=current_telemetry().average("model") if current_telemetry() else 0.0,
                 success_rate=1.0 - (tool_error_count / max(step, 1)),
                 context_length=(
                     context_manager.get_stats().total_tokens if context_manager else 0
                 ),
                 error_count=tool_error_count,
-                tool_calls=0,
+                tool_calls=current_telemetry().calls.get("tool", 0) if current_telemetry() else 0,
             )
             observed = self.state_observer.update(measurement)
             if observed.confidence > 0.4 and observed.system_degradation > 0.4:
@@ -225,7 +231,8 @@ class CyberneticOrchestrator:
         step: int,
         tool_error_count: int,
         saw_tool_result: bool,
-        max_steps: int,
+        max_steps: int | None,
+        progress_signal: ProgressSignal | None = None,
     ) -> dict[str, Any]:
         """Called at end of step (finally block). Returns a summary dict."""
         summary: dict[str, Any] = {}
@@ -242,7 +249,7 @@ class CyberneticOrchestrator:
             snapshot = MetricSnapshot(
                 timestamp=time.time(),
                 error_rate=float(tool_error_count) / max(step, 1),
-                avg_latency=step * 2.0,
+                avg_latency=current_telemetry().average("model") if current_telemetry() else 0.0,
                 context_usage=(
                     context_manager.get_stats().usage_percentage
                     if context_manager else 0.0
@@ -255,17 +262,17 @@ class CyberneticOrchestrator:
 
         # Progress controller
         if self.progress:
-            progress_signal = ProgressSignal(
-                total_steps=max_steps,
-                completed_steps=step - tool_error_count,
-                failed_steps=tool_error_count,
-                tool_calls=step,
+            progress_signal = progress_signal or ProgressSignal(
+                total_steps=step,
+                completed_steps=None,
+                tool_calls=current_telemetry().calls.get("tool", 0) if current_telemetry() else 0,
                 tool_errors=tool_error_count,
-                output_changed=saw_tool_result,
-                elapsed_seconds=step * 2.0,
+                output_changed=False,
+                elapsed_seconds=current_telemetry().elapsed_seconds if current_telemetry() else 0.0,
                 max_steps=max_steps,
             )
             decision = self.progress.decide(progress_signal)
+            summary["progress_decision"] = decision.to_dict()
             if decision.action in (ProgressAction.STOP, ProgressAction.REQUEST_CONFIRMATION):
                 logger.warning(
                     "ProgressController: action=%s health=%.2f stall=%.2f",
@@ -429,8 +436,8 @@ class CyberneticOrchestrator:
         try:
             signal = ModelSelectionSignal(
                 task_complexity=task_complexity,
-                budget_pressure=0.3,
-                latency_pressure=0.3,
+                budget_pressure=current_usage_observation()["budget_pressure"],
+                latency_pressure=min(1.0, current_telemetry().average("model") / 60.0) if current_telemetry() else 0.0,
                 current_model=current_model,
             )
             decision = self.model_ctrl.decide(signal)
@@ -448,11 +455,13 @@ class CyberneticOrchestrator:
         if not self.cost_control:
             return
         try:
-            est_cost = total_tokens * 0.000015
+            usage = current_usage_observation()
+            if usage["cost"] is None:
+                return
             adj = self.cost_control.run(
-                cost_usd=est_cost,
-                total_tokens=total_tokens,
-                total_calls=total_calls,
+                cost_usd=usage["cost"],
+                total_tokens=usage["tokens"],
+                total_calls=usage["model_calls"],
             )
             if self.context_compactor and hasattr(self.context_compactor, '_tool_budget') and self.context_compactor._tool_budget:
                 self.cost_control.apply_to_budget_manager(self.context_compactor._tool_budget)

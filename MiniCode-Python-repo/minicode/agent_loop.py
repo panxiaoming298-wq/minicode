@@ -1,75 +1,94 @@
 from __future__ import annotations
 
 import concurrent.futures
-import inspect
+import json
 import re
 import threading
 import time
+import uuid
+from copy import deepcopy
+from contextvars import copy_context
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
-from minicode.config import describe_fallback_guidance, describe_provider_channel
-from minicode.context_manager import ContextManager, estimate_message_tokens
-from minicode.logging_config import get_logger
-from minicode.model_registry import detect_provider
-from minicode.permissions import PermissionManager
-from minicode.state import Store, AppState, increment_tool_calls, set_busy, set_idle
-from minicode.tooling import ToolContext, ToolRegistry, ToolResult
-from minicode.runtime_protocol import ToolEffect
-from minicode.types import (
-    AgentStep,
-    ChatMessage,
-    ModelAdapter,
-    RuntimeEvent,
-    RuntimeEventCategory,
+from minicode.agent_intelligence import ErrorClassifier, NudgeGenerator, ToolScheduler
+from minicode.runtime_messages import is_user_input, runtime_message, runtime_context_kind, runtime_context_message
+from minicode.runtime_feedback import (
+    NUDGE_CONTINUE, NUDGE_AFTER_TOOL_RESULT, NUDGE_AFTER_EMPTY_RESPONSE,
+    NUDGE_AFTER_EMPTY_NO_TOOLS, RESUME_AFTER_PAUSE, RESUME_AFTER_MAX_TOKENS,
+    runtime_feedback_message,
 )
-
-# Hooks integration
-from minicode.hooks import HookEvent, fire_hook_sync
 
 # Intelligence integration
 from minicode.agent_metrics import AgentMetricsCollector
-from minicode.agent_intelligence import ErrorClassifier, NudgeGenerator, ToolScheduler
-from minicode.working_memory import get_working_memory, protect_context
+from minicode.capability_registry import CapabilityDomain, get_registry
+from minicode.circuit_breaker import CompactionCircuitBreaker
+from minicode.config import describe_fallback_guidance, describe_provider_channel
 
-# Work chain integration
-from minicode.intent_parser import parse_intent
-from minicode.task_object import build_task, TaskObject, TaskState
-from minicode.task_graph import TaskGraph, TaskState as GraphTaskState
-from minicode.capability_registry import get_registry, CapabilityDomain
-from minicode.layered_context import ContextBuilder, LayeredContext
-from minicode.decision_audit import get_auditor, DecisionOutcome
-from minicode.runtime_profiles import resolve_runtime_profile
+# 上下文管理集成 (Claude Code-style + Engineering Cybernetics)
+from minicode.context_compactor import (
+    AutoCompactConfig,
+    ContextCompactor,
+)
+from minicode.context_cybernetics import ContextCyberneticsOrchestrator
+from minicode.context_manager import ContextManager, estimate_message_tokens
+from minicode.cost_control import CostControlLoop
 
 # 工程控制论集成
 from minicode.cybernetic_orchestrator import CyberneticOrchestrator
 from minicode.cybernetic_supervisor import save_supervisor_report
+from minicode.decision_audit import DecisionOutcome, get_auditor
 from minicode.feedforward_controller import FeedforwardController
 
-# 高级控制论模块
-from minicode.state_observer import MeasurementVector
-from minicode.self_healing_engine import SelfHealingEngine
+# Hooks integration
+from minicode.hooks import HookEvent, fire_hook_sync
 
-# 任务进度控制
-from minicode.progress_controller import ProgressSignal, ProgressAction
+# Work chain integration
+from minicode.logging_config import get_logger
+from minicode.memory import MemoryManager
 
 # 记忆注入和模型选择控制
 from minicode.memory_injector import MemoryInjectionSignal, MemoryInjector
-from minicode.model_registry import ModelSelectionSignal
+from minicode.micro_compact import MicroCompactor
+from minicode.model_execution import _model_next
+from minicode.provider_errors import ProviderStreamError
+from minicode.model_registry import ModelSelectionSignal, detect_provider
+from minicode.permissions import PermissionManager
+
+# 任务进度控制
+from minicode.progress_controller import ProgressAction
+from minicode.execution_progress import CONTEXT_KIND as EXECUTION_PROGRESS_CONTEXT, ExecutionProgress
+from minicode.provider_usage import current_usage_observation, observe_request_context, observe_request_tool_result, observe_request_tool_message, runtime_result_is_preview
+from minicode.worker_audit import record_worker_audit
+from minicode.runtime_profiles import resolve_runtime_profile
+from minicode.runtime_protocol import ReplayPolicy, ToolEffect
+from minicode.self_healing_engine import SelfHealingEngine
 
 # 智能路由与自省 (Phase 3 导入)
 from minicode.smart_router import TaskOutcome
+from minicode.state import AppState, Store, increment_tool_calls, set_busy, set_idle
 
-# 上下文管理集成 (Claude Code-style + Engineering Cybernetics)
-from minicode.context_compactor import (
-    ContextCompactor,
-    AutoCompactConfig,
+# 高级控制论模块
+from minicode.state_observer import MeasurementVector
+from minicode.task_graph import TaskGraph
+from minicode.task_graph import TaskState as GraphTaskState
+from minicode.task_object import TaskState
+from minicode.tool_execution import (
+    ToolRetryGuard,
+    _execute_single_tool,
+    _LinkedCancellationEvent,  # noqa: F401 - compatibility export.
 )
-from minicode.context_cybernetics import ContextCyberneticsOrchestrator
-from minicode.cost_control import CostControlLoop
-from minicode.micro_compact import MicroCompactor
-from minicode.circuit_breaker import CompactionCircuitBreaker
-from minicode.memory import MemoryManager
+from minicode.tooling import ToolContext, ToolRegistry, ToolResult
+from minicode.tool_input_recovery import ToolInputRecovery, request_contracts
+from minicode.tool_recovery import ToolRecoveryTracker, terminal_timeout
+from minicode.task_checks import TaskCheckEvidence
+from minicode.turn_context import (
+    _build_layered_context,
+    _build_work_chain_task,
+    _extract_task_description,  # noqa: F401 - compatibility export.
+)
+from minicode.turn_control import _apply_control_signal
+from minicode.turn_events import AgentTurnCallbacks, AgentTurnEventSink, TurnEvent
 from minicode.turn_kernel import (
     TurnPreludeState,
     TurnRecurrentState,
@@ -77,78 +96,26 @@ from minicode.turn_kernel import (
     build_stable_task_pack,
     build_turn_coda_summary,
     build_widening_transition_nudge,
-    decide_tool_turn,
     decide_assistant_turn,
+    decide_truncated_model_output,
+    decide_tool_turn,
     derive_turn_step_policy,
     finalize_work_chain_task,
     render_turn_policy_message,
 )
-from minicode.turn_events import AgentTurnCallbacks, AgentTurnEventSink, TurnEvent
-
-
-class _LinkedCancellationEvent:
-    """A per-call cancellation signal that also observes parent cancellation."""
-
-    def __init__(self, parent: Any | None = None) -> None:
-        self._parent = parent
-        self._local = threading.Event()
-
-    def set(self) -> None:
-        self._local.set()
-
-    def is_set(self) -> bool:
-        parent_is_set = getattr(self._parent, "is_set", None)
-        return self._local.is_set() or (
-            callable(parent_is_set) and bool(parent_is_set())
-        )
-
-    def wait(self, timeout: float | None = None) -> bool:
-        deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
-        while not self.is_set():
-            remaining = None if deadline is None else deadline - time.monotonic()
-            if remaining is not None and remaining <= 0:
-                return False
-            self._local.wait(0.05 if remaining is None else min(0.05, remaining))
-        return True
-
+from minicode.turn_telemetry import current_telemetry, measured_turn
+from minicode.types import (
+    AgentStep,
+    ChatMessage,
+    ModelAdapter,
+    RuntimeEvent,
+    RuntimeEventCategory,
+)
+from minicode.usage_ledger import BudgetUnavailable, ConsultationBudgetLimited, ModelUsageUnreconciled
+from minicode.context_borrowing import bind_context_borrowing
+from minicode.working_memory import get_working_memory, protect_context
 
 logger = get_logger("agent_loop")
-
-# 甯搁噺锛氶伩鍏嶉噸澶嶇殑鎻愮ず鏂囨湰
-NUDGE_CONTINUE = (
-    "Continue immediately from your <progress> update with concrete tool calls, "
-    "code changes, or an explicit <final> answer only if the task is complete. "
-    "Prefer taking the next concrete action over explaining what you plan to do."
-)
-
-NUDGE_AFTER_TOOL_RESULT = (
-    "You have received tool results. Review them briefly, then take the next "
-    "concrete action: call another tool, edit code, or give an explicit <final> "
-    "answer only if the task is truly complete. Do not restate what you just saw."
-)
-
-NUDGE_AFTER_EMPTY_RESPONSE = (
-    "Your last response was empty. This often happens after tool errors or when "
-    "the model is uncertain. Pick the most likely next action and try it — you can "
-    "adjust based on results. Call a tool, edit code, or give <final> if done."
-)
-
-NUDGE_AFTER_EMPTY_NO_TOOLS = (
-    "Your last response was empty but you have not used any tools yet. Start by "
-    "inspecting the relevant files (read_file, grep_files, list_files) to understand "
-    "the codebase before making changes."
-)
-
-RESUME_AFTER_PAUSE = (
-    "Resume from the previous pause. Continue with the next concrete tool call, "
-    "code change, or <final> answer."
-)
-
-RESUME_AFTER_MAX_TOKENS = (
-    "Your previous response was cut short by the token limit. Resume immediately "
-    "with the next concrete action — pick up where you left off."
-)
-
 
 STABLE_TASK_STATE_MARKER = "[Stable task state]"
 _NETWORK_RESEARCH_TOOL_NAMES = frozenset({"web_search", "web_fetch"})
@@ -237,7 +204,7 @@ _MODEL_FALLBACK_ERROR_HINTS = (
 
 def _latest_user_request(messages: list[ChatMessage]) -> str:
     for message in reversed(messages):
-        if message.get("role") == "user":
+        if is_user_input(message):
             return str(message.get("content", "") or "").strip()
     return ""
 
@@ -262,7 +229,9 @@ def _network_research_policy(
         except (TypeError, ValueError):
             pass
     if simple_current_lookup:
-        return 3, True
+        # Three query attempts plus source reading/recovery, rather than three
+        # searches consuming every opportunity to verify the original pages.
+        return 6, True
     return (12 if profile_name == "single-deep" else 8), False
 
 
@@ -303,6 +272,120 @@ def _with_reasoning_content(
     return message
 
 
+def _final_answer_message(content: str, runtime: dict[str, Any]) -> dict[str, Any]:
+    """Bind public answer prose to the attempt that produced it, not the handoff summary."""
+    message: dict[str, Any] = {"role": "assistant", "content": content}
+    if runtime.get("_runtimeActiveRunId"):
+        message["phase"] = "final_answer"
+        message.update({key: runtime[source] for key, source in (
+            ("executionId", "_runtimeActiveRunId"),
+            ("nodeId", "_runtimeNodeId"),
+            ("attemptId", "_runtimeAttemptId"),
+        ) if runtime.get(source)})
+    return message
+
+
+def _assistant_retry_messages(
+    *, content: str, reasoning_content: str, user_content: str | None,
+    feedback_kind: Literal["continuation"] | None = None,
+) -> list[dict[str, Any]]:
+    """Keep an empty or partial completion before the retry instruction.
+
+    This is protocol history, not visible progress or a successful answer. The
+    kernel still owns retry credits and the provider ledger owns admission.
+    """
+    messages: list[dict[str, Any]] = []
+    if content or reasoning_content:
+        messages.append(_with_reasoning_content(
+            {"role": "assistant", "content": content}, reasoning_content,
+        ))
+    if user_content:
+        messages.append(runtime_feedback_message(user_content, kind=feedback_kind))
+    return messages
+
+
+def _tool_call_message(call: dict[str, Any], reasoning_content: str) -> dict[str, Any]:
+    """Preserve rejected raw arguments without treating them as executable input."""
+    return _with_reasoning_content({"role": "assistant_tool_call", "toolUseId": call["id"],
+        "toolName": call["toolName"], "input": call["input"],
+        **({key: call[key] for key in ("inputError", "rawArguments") if key in call}
+           if call.get("inputError") else {})}, reasoning_content)
+
+
+def _incomplete_tool_batch_reason(model_step: AgentStep) -> str | None:
+    """The native reason this batch may not execute, or ``None`` when it is fine.
+
+    Two independently verifiable situations are incomplete: the provider said it
+    truncated (its own length/max_tokens termination), or the response the Runtime
+    received is not provably whole (missing terminal marker, an event that could
+    not be decoded, or a call that could not be assembled). Everything else is a
+    complete proposal and must not enter the non-executing rejection path.
+    """
+    diagnostics = model_step.diagnostics
+    if diagnostics is None:
+        return None
+    if diagnostics.stopReason in _INCOMPLETE_FINISH_REASONS:
+        return "model_output_truncated"
+    if (diagnostics.transportComplete is False or diagnostics.networkComplete is False
+            or diagnostics.parseComplete is False or diagnostics.assemblyComplete is False):
+        return "response_parse_incomplete" if diagnostics.lostEventCount else "transport_incomplete"
+    return None
+
+
+def _rejected_truncated_tool_messages(
+    model_step: AgentStep, *, on_event: Callable[[TurnEvent], None] | None = None, step: int | None = None,
+    reason: str = "model_output_truncated", detail: str = "provider truncated this tool batch",
+) -> list[dict[str, Any]]:
+    """Journal an incomplete proposal without invoking tools, hooks or approval.
+
+    Keep raw arguments/IDs, including malformed ones, as failed evidence. This
+    batch is terminal and is never sent back as an automatically resumed call.
+    It accepts only a provider-declared truncation or a response whose own
+    transport/parse/assembly evidence says it is not whole: both mean "we do not
+    have the whole proposal". A complete proposal is refused here rather than
+    being silently turned into a non-executed batch.
+    """
+    if model_step.type != "tool_calls":
+        raise ValueError("only provider-truncated or incomplete tool responses can enter this rejection path")
+    if _incomplete_tool_batch_reason(model_step) is None:
+        raise ValueError(
+            "only a provider-truncated or transport/parse-incomplete tool response may enter this "
+            "rejection path; a complete proposal must follow the normal execution protocol")
+    return _refused_model_tool_messages(model_step, on_event=on_event, step=step, reason=reason, detail=detail)
+
+
+def _refused_model_tool_messages(
+    model_step: AgentStep, *, on_event=None, step=None, reason: str, detail: str,
+) -> list[dict[str, Any]]:
+    """Pair an unexecuted proposal with receipts; preserve its true refusal reason."""
+    if model_step.type != "tool_calls":
+        raise ValueError("only tool proposals have unexecuted call receipts")
+    messages = _assistant_retry_messages(content=model_step.content,
+        reasoning_content=model_step.reasoningContent, user_content=None)
+    messages.extend(_tool_call_message(call, "") for call in model_step.calls)
+    for call in model_step.calls:
+        output = f"NotExecuted: {detail}; no call in the batch was executed or submitted"
+        recovery = ({"status": "interrupted", "kind": "human_steering", "step": step}
+                    if reason == "human_steered" else None)
+        messages.append({"role": "tool_result", "toolUseId": call["id"], "toolName": call["toolName"],
+                         "content": output, "isError": True,
+                         **({"toolRecovery": recovery} if recovery else {})})
+        if on_event is not None:
+            try:
+                event = TurnEvent.tool_rejected(step=step, tool_name=call["toolName"], tool_input=call["input"],
+                    output=output, tool_call_id=call["id"], reason=reason)
+                if recovery:
+                    from dataclasses import replace
+                    event = replace(event, tool_recovery=recovery)
+                on_event(event)
+            except Exception:
+                logger.debug("Tool refusal observer failed", exc_info=True)
+    return messages
+
+
+# Provider terminations that mean "the provider stopped early", verbatim.
+_INCOMPLETE_FINISH_REASONS = frozenset({"length", "max_tokens"})
+
 _MODEL_FALLBACK_BLOCK_HINTS = (
     "unauthorized",
     "forbidden",
@@ -320,20 +403,19 @@ def _upsert_stable_task_state_message(
     messages: list[ChatMessage],
     stable_text: str,
 ) -> list[ChatMessage]:
+    from minicode.runtime_messages import runtime_context_kind, runtime_context_message
+
     filtered = [
         message
         for message in messages
         if not (
-            message.get("role") == "system"
-            and str(message.get("content", "")).startswith(STABLE_TASK_STATE_MARKER)
+            runtime_context_kind(message) == "task_state"
+            or (message.get("role") == "system"
+                and str(message.get("content", "")).startswith(STABLE_TASK_STATE_MARKER))
         )
     ]
-    filtered.append(
-        {
-            "role": "system",
-            "content": f"{STABLE_TASK_STATE_MARKER}\n{stable_text}",
-        }
-    )
+    filtered.append(runtime_context_message(
+        f"{STABLE_TASK_STATE_MARKER}\n{stable_text}", kind="task_state"))
     return filtered
 
 
@@ -372,6 +454,11 @@ def _summarize_model_api_failure(
     runtime: dict[str, Any] | None = None,
 ) -> str:
     fallback_errors = fallback_errors or []
+    from minicode.candidate_ownership import CandidateConflict
+    from minicode.workspace_provider import WorkspaceConflict
+
+    if isinstance(error, (CandidateConflict, WorkspaceConflict)):
+        return f"Local workspace error ({error_type}): {error}"
     if fallback_errors:
         combined = " ".join(fallback_errors)
         if "no viable fallback models were available" in combined.lower() and any(
@@ -434,73 +521,6 @@ def _is_empty_assistant_response(content: str) -> bool:
     return len(content.strip()) == 0
 
 
-def _extract_task_description(messages: list[ChatMessage]) -> str:
-    """Extract the original task description from messages."""
-    for msg in messages:
-        if msg.get("role") == "user" and msg.get("content"):
-            content = str(msg["content"])
-            if not content.startswith("Continue") and not content.startswith(
-                "Your last"
-            ):
-                return content[:500]
-    return "Unknown task"
-
-
-def _build_work_chain_task(
-    messages: list[ChatMessage],
-) -> tuple[TaskObject | None, dict]:
-    """Build TaskObject from conversation messages and return it with metadata."""
-    raw_input = _extract_task_description(messages)
-    if raw_input == "Unknown task":
-        return None, {}
-    intent = parse_intent(raw_input)
-    task = build_task(intent, raw_input)
-    metadata = {
-        "intent_type": intent.intent_type.value,
-        "action_type": intent.action_type.value,
-        "confidence": intent.confidence,
-        "entities": intent.entities,
-        "complexity": intent.complexity_hint,
-    }
-    logger.info(
-        "Work chain: intent=%s action=%s confidence=%.2f complexity=%s",
-        intent.intent_type.value,
-        intent.action_type.value,
-        intent.confidence,
-        intent.complexity_hint,
-    )
-    return task, metadata
-
-
-def _build_layered_context(
-    messages: list[ChatMessage],
-    system_prompt: str = "",
-    project_context: str = "",
-    task: TaskObject | None = None,
-) -> tuple[LayeredContext, ContextBuilder]:
-    """Build layered context from conversation and task."""
-    context = LayeredContext()
-    builder = ContextBuilder(context)
-    if system_prompt:
-        builder.set_system_prompt(system_prompt)
-    if project_context:
-        builder.add_project_memory(project_context)
-    for msg in messages:
-        role = msg.get("role", "unknown")
-        content = msg.get("content", "")
-        if content:
-            builder.add_session_message(role, content)
-    if task:
-        scratchpad = (
-            f"Task: {task.title}\n"
-            f"Goal: {task.goal}\n"
-            f"Constraints: {len(task.constraints)}\n"
-            f"Expected outputs: {len(task.expected_outputs)}"
-        )
-        builder.add_scratchpad(scratchpad)
-    return context, builder
-
-
 def _register_tool_capabilities(tools: ToolRegistry) -> None:
     """Register existing tools as capabilities in the registry."""
     registry = get_registry()
@@ -553,187 +573,6 @@ def _register_tool_capabilities(tools: ToolRegistry) -> None:
             logger.debug("Failed to register tool %s as capability: %s", tool_name, e)
 
 
-def _execute_single_tool(
-    call: dict,
-    tools: ToolRegistry,
-    cwd: str,
-    permissions: Any | None,
-    session: Any | None,
-    runtime: dict | None,
-    store: Any | None,
-    step: int,
-    on_tool_start: Callable[[str, dict], None] | None,
-    on_tool_result: Callable[[str, str, bool], None] | None,
-    tool_scheduler: Any | None = None,
-    memory_preflight: Callable[[dict, ToolEffect], str | None] | None = None,
-    memory_result_observer: Callable[[dict, ToolResult], ToolResult | None]
-    | None = None,
-) -> ToolResult:
-    """Execute a single tool call with hooks, state updates, and crash protection.
-
-    Used both for serial execution and as a worker function for concurrent execution.
-    When running concurrently (store/on_tool_start/on_tool_result are None),
-    hooks and UI callbacks are deferred to the result processing phase.
-
-    Includes a global exception safety net: any unexpected crash in the tool
-    execution pipeline (hooks, state updates, etc.) is caught and converted
-    to an error ToolResult, preventing the entire agent loop from crashing.
-    """
-    tool_name = call["toolName"]
-    tool_input = call["input"]
-
-    runtime_context = (runtime or {}).get("_runtimeContext")
-    raw_allowed_effects = (runtime or {}).get("_allowedToolEffects")
-    allowed_effects = None
-    if raw_allowed_effects is not None:
-        allowed_effects = frozenset(
-            item if isinstance(item, ToolEffect) else ToolEffect(str(item))
-            for item in raw_allowed_effects
-        )
-    cancellation_event = _LinkedCancellationEvent(
-        (runtime or {}).get("_cancellationEvent")
-    )
-    tool_context = ToolContext(
-        cwd=cwd,
-        permissions=permissions,
-        session=session,
-        _runtime=runtime,
-        runtime_context=runtime_context,
-        allowed_effects=allowed_effects,
-        cancellation_event=cancellation_event,
-        node_id=(runtime or {}).get("_runtimeNodeId"),
-        attempt_id=(runtime or {}).get("_runtimeAttemptId"),
-        idempotency_key=(runtime or {}).get("_runtimeIdempotencyKey"),
-        run_id=(runtime or {}).get("_runtimeActiveRunId"),
-        tool_call_id=str(
-            call.get("id") or call.get("toolCallId") or f"step-{step}:{tool_name}"
-        ),
-        base_revision=(runtime or {}).get("_runtimeBaseRevision"),
-        raw_result_observer=(
-            (lambda _tool_name, result: memory_result_observer(call, result))
-            if memory_result_observer is not None
-            else None
-        ),
-    )
-
-    try:
-        if memory_preflight is not None:
-            tool_definition = tools.find(tool_name)
-            effect = (
-                tool_definition.effect
-                if tool_definition is not None
-                else ToolEffect.PRIVILEGED
-            )
-            blocked_reason = memory_preflight(call, effect)
-            if blocked_reason:
-                return ToolResult(ok=False, output=blocked_reason)
-
-        # Pre-tool hooks and UI (only for serial execution)
-        if on_tool_start:
-            on_tool_start(tool_name, tool_input)
-
-        if store:
-            store.set_state(set_busy(tool_name))
-
-        # Execute the tool with a bounded wait.  A timed-out call receives its
-        # own cancellation signal, while parent Runtime cancellation remains
-        # visible through the linked event.
-        import os
-
-        try:
-            _base_timeout = max(
-                0.0,
-                float(os.environ.get("MINICODE_TOOL_TIMEOUT", "120")),
-            )
-        except ValueError:
-            _base_timeout = 120.0
-        TOOL_TIMEOUT = (
-            max(
-                0.0,
-                float(getattr(tool_scheduler, "_force_tool_timeout", _base_timeout)),
-            )
-            if tool_scheduler and hasattr(tool_scheduler, "_force_tool_timeout")
-            else _base_timeout
-        )
-        completed = threading.Event()
-        outcome: dict[str, Any] = {}
-
-        def execute_tool() -> None:
-            try:
-                outcome["result"] = tools.execute(
-                    tool_name,
-                    tool_input,
-                    tool_context,
-                )
-            except BaseException as error:
-                outcome["error"] = error
-            finally:
-                completed.set()
-
-        tool_thread = threading.Thread(
-            target=execute_tool,
-            name=f"minicode-tool-{tool_name}",
-            daemon=True,
-        )
-        tool_thread.start()
-        if not completed.wait(TOOL_TIMEOUT):
-            cancellation_event.set()
-            result = ToolResult(
-                ok=False,
-                output=f"Tool '{tool_name}' timed out after {TOOL_TIMEOUT:g}s",
-            )
-        elif "error" in outcome:
-            error = outcome["error"]
-            if isinstance(error, (KeyboardInterrupt, SystemExit)):
-                raise error
-            result = ToolResult(
-                ok=False,
-                output=f"Tool '{tool_name}' crashed ({type(error).__name__}): {error}",
-            )
-        else:
-            result = outcome["result"]
-
-        # Post-tool state updates (only for serial execution)
-        if store:
-            store.set_state(increment_tool_calls())
-            store.set_state(set_idle())
-
-        if on_tool_result:
-            on_tool_result(tool_name, result.output, not result.ok)
-
-        return result
-
-    except (KeyboardInterrupt, SystemExit):
-        # Always propagate these
-        raise
-    except Exception as exc:  # noqa: BLE001
-        # Global safety net: catch ANY unexpected error in the tool execution
-        # pipeline (hooks, state updates, permission checks, etc.) and convert
-        # it to an error result. This prevents a single tool crash from
-        # cascading into a full session failure.
-        import traceback
-
-        tb_excerpt = "".join(
-            traceback.format_exception(type(exc), exc, exc.__traceback__)[-3:]
-        ).strip()
-        error_type = type(exc).__name__
-
-        logger.error("Tool execution pipeline crashed (%s): %s", error_type, exc)
-
-        # Ensure state is reset even on crash
-        if store:
-            try:
-                store.set_state(set_idle())
-            except Exception:
-                pass
-
-        return ToolResult(
-            ok=False,
-            output=f"[{error_type}] Tool execution pipeline crashed: {exc}\n"
-            f"Traceback:\n{tb_excerpt}",
-        )
-
-
 def _format_diagnostics(
     stop_reason: str | None,
     block_types: list[str] | None,
@@ -763,7 +602,8 @@ def _should_treat_assistant_as_progress(
     *, kind: str | None, content: str, saw_tool_result: bool
 ) -> bool:
     if kind == "progress":
-        return True
+        from minicode.provider_usage import native_verifier_has_terminal_decision
+        return not native_verifier_has_terminal_decision(content)
     if kind == "final":
         return False
     if not saw_tool_result:
@@ -837,191 +677,7 @@ def _try_compact_with_breaker(
         return current_messages, False
 
 
-def _model_next(
-    model: ModelAdapter,
-    messages: list[ChatMessage],
-    *,
-    on_stream_chunk: Callable[[str], None] | None,
-    on_thinking_chunk: Callable[[str], None] | None = None,
-    store: Store[AppState] | None,
-) -> AgentStep:
-    """Call provider adapters with store/thinking support while preserving test doubles."""
-    kwargs: dict[str, Any] = {"on_stream_chunk": on_stream_chunk}
-
-    try:
-        sig = inspect.signature(model.next)
-        param_names = set(sig.parameters.keys())
-        has_kwargs = any(
-            p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
-        )
-        if has_kwargs or "on_thinking_delta" in param_names:
-            kwargs["on_thinking_delta"] = on_thinking_chunk
-        if has_kwargs or "store" in param_names:
-            kwargs["store"] = store
-    except (TypeError, ValueError):
-        # Can't inspect signature (e.g. some mock objects) — be conservative
-        pass
-
-    return model.next(messages, **kwargs)
-
-
-def _apply_control_signal(
-    *,
-    control_signal: Any,
-    system_state: Any,
-    max_steps: int | None,
-    tool_scheduler: ToolScheduler,
-    context_compactor: ContextCompactor | None,
-    model_switcher: Any | None,
-    feedback_controller: Any | None = None,
-) -> int | None:
-    """Apply FeedbackController output to live runtime knobs."""
-    if not control_signal or control_signal.confidence <= 0.6:
-        return max_steps
-
-    if (
-        control_signal.limit_max_steps
-        and max_steps is not None
-        and control_signal.limit_max_steps < max_steps
-    ):
-        logger.info(
-            "FeedbackController: limiting max_steps %d -> %d",
-            max_steps,
-            control_signal.limit_max_steps,
-        )
-        max_steps = control_signal.limit_max_steps
-
-    if control_signal.adjust_token_budget != 1.0:
-        if (
-            context_compactor
-            and hasattr(context_compactor, "_tool_budget")
-            and context_compactor._tool_budget
-        ):
-            tb = context_compactor._tool_budget
-            new_budget = max(
-                1000,
-                int(
-                    getattr(tb, "budget_per_message", 2000)
-                    * control_signal.adjust_token_budget
-                ),
-            )
-            if hasattr(tb, "budget_per_message"):
-                tb.budget_per_message = new_budget
-            logger.info(
-                "FeedbackController: token budget adjusted to %d (mult=%.2f)",
-                new_budget,
-                control_signal.adjust_token_budget,
-            )
-
-    if control_signal.reduce_parallelism:
-        if hasattr(tool_scheduler, "_force_max_workers"):
-            tool_scheduler._force_max_workers = min(
-                getattr(tool_scheduler, "_force_max_workers", 2) or 2,
-                2,
-            )
-        logger.info(
-            "FeedbackController: reduce_parallelism -> max_workers=2 "
-            "(oscillation=%.2f)",
-            control_signal.oscillation_index,
-        )
-
-    if control_signal.adjust_concurrency != 0:
-        cap = max(1, 4 + control_signal.adjust_concurrency)
-        if hasattr(tool_scheduler, "_force_max_workers"):
-            tool_scheduler._force_max_workers = cap
-        logger.info(
-            "FeedbackController: adjust_concurrency=%+d -> max_workers=%d",
-            control_signal.adjust_concurrency,
-            cap,
-        )
-
-    if control_signal.increase_model_level:
-        logger.info(
-            "FeedbackController: model upgrade recommended (errors=%.2f perf=%.2f)",
-            system_state.error_frequency,
-            system_state.performance_score(),
-        )
-        if model_switcher:
-            if hasattr(model_switcher, "_pending_upgrade"):
-                model_switcher._pending_upgrade = True  # type: ignore[attr-defined]
-
-    if control_signal.decrease_model_level:
-        logger.info(
-            "FeedbackController: model downgrade recommended (efficiency=%.2f)",
-            system_state.token_efficiency,
-        )
-
-    if control_signal.suggest_memory_persistence:
-        logger.info("FeedbackController: persisting working memory")
-        if context_compactor and hasattr(context_compactor, "_tool_budget"):
-            try:
-                if hasattr(context_compactor._tool_budget, "flush"):
-                    context_compactor._tool_budget.flush()
-            except Exception:
-                pass
-
-    if control_signal.recommend_skill_update:
-        logger.info(
-            "FeedbackController: skill update recommended (pattern=%.2f)",
-            system_state.pattern_reuse_rate,
-        )
-        # Queue skill update for next maintenance cycle
-        if not hasattr(tool_scheduler, "_pending_skill_update"):
-            tool_scheduler._pending_skill_update = True  # type: ignore[attr-defined]
-        logger.info(
-            "FeedbackController: skill update queued for next maintenance cycle"
-        )
-
-    if control_signal.reduce_tool_timeout:
-        new_timeout = max(5.0, control_signal.reduce_tool_timeout)
-        if hasattr(tool_scheduler, "_force_tool_timeout"):
-            tool_scheduler._force_tool_timeout = new_timeout  # type: ignore[attr-defined]
-        logger.info(
-            "FeedbackController: tool timeout reduced to %.1fs (high error rate)",
-            new_timeout,
-        )
-    elif hasattr(tool_scheduler, "_force_tool_timeout"):
-        # Reset timeout when signal no longer active
-        if hasattr(tool_scheduler, "_force_tool_timeout"):
-            del tool_scheduler._force_tool_timeout
-
-    if control_signal.increase_nudge_frequency:
-        tool_scheduler._force_nudge_frequency = True  # type: ignore[attr-defined]
-        logger.info(
-            "FeedbackController: nudge frequency increased (stability=%.2f)",
-            system_state.stability_score(),
-        )
-    elif hasattr(tool_scheduler, "_force_nudge_frequency"):
-        if hasattr(tool_scheduler, "_force_nudge_frequency"):
-            del tool_scheduler._force_nudge_frequency
-
-    if control_signal.promote_pattern:
-        if feedback_controller:
-            feedback_controller.record_pattern_effectiveness(
-                control_signal.promote_pattern, True
-            )
-            logger.info(
-                "FeedbackController: pattern promoted '%s'",
-                control_signal.promote_pattern,
-            )
-
-    if control_signal.force_compaction and context_compactor:
-        try:
-            compacted = (
-                context_compactor.compact_messages()
-                if hasattr(context_compactor, "compact_messages")
-                else False
-            )
-            logger.info(
-                "FeedbackController: forced compaction completed (%d messages)",
-                len(compacted) if compacted else 0,
-            )
-        except Exception as exc:
-            logger.warning("FeedbackController: forced compaction failed: %s", exc)
-
-    return max_steps
-
-
+@measured_turn
 def run_agent_turn(
     *,
     model: ModelAdapter,
@@ -1048,9 +704,13 @@ def run_agent_turn(
     enable_work_chain: bool = True,
     callbacks: AgentTurnCallbacks | AgentTurnEventSink | None = None,
     paged_memory_runtime: Any | None = None,
+    recover_submission_input: Callable[[dict, str], str] | None = None,
 ) -> list[ChatMessage]:
     # Prelude: prepare per-turn state before we enter the recurrent think/act loop.
     current_messages = list(messages)
+    task_check_evidence = TaskCheckEvidence()
+    native_submission_reminded = False
+    telemetry = current_telemetry()
     runtime = runtime or {}
     configured_runtime_model = (
         str(runtime.get("configuredModel", "")).strip()
@@ -1071,11 +731,22 @@ def run_agent_turn(
             requires_explicit_final=runtime_profile.strict_step_verification,
         ),
     )
+    tool_retry_guard = ToolRetryGuard()
+    execution_progress = ExecutionProgress(cwd=cwd)
+    input_recovery = ToolInputRecovery()
+    recovery_tracker = ToolRecoveryTracker(runtime.get("_recoveryProjectRoot") or cwd)
+    supplied_contracts = None
     max_steps = runtime_profile.max_steps
+    from minicode.skill_runtime import SkillRuntime, bind_skill_runtime
+    skill_runtime = SkillRuntime(cwd=cwd, runtime=runtime, session=session, permissions=permissions, tools=tools,
+                                 task_query=_latest_user_request(current_messages))
+    runtime["_skillRuntime"] = skill_runtime
     from minicode.paged_memory.service import (
         ArtifactPersistenceRequired,
         ContextBudgetExceeded,
     )
+    from minicode.paged_memory.context_utilization import ContextRecoveryRequired
+    from minicode.paged_memory.history_journal import HistoryIntegrityError
 
     owns_paged_memory_runtime = False
     active_paged_memory = paged_memory_runtime
@@ -1083,16 +754,11 @@ def run_agent_turn(
     if active_paged_memory is None:
         from minicode.paged_memory.service import PagedMemoryRuntime
 
-        raw_context_limit = (
-            getattr(context_manager, "context_window", 0)
-            or runtime.get("contextWindow", 0)
-            or runtime.get("maxContextTokens", 0)
-            or 128_000
-        )
-        try:
-            memory_context_limit = int(raw_context_limit)
-        except (TypeError, ValueError):
-            memory_context_limit = 128_000
+        from minicode.context_manager import resolve_context_limit
+
+        memory_context_limit = resolve_context_limit(configured_runtime_model, runtime)
+        if context_manager is not None:
+            memory_context_limit = min(memory_context_limit, context_manager.context_window)
         active_paged_memory = PagedMemoryRuntime.from_runtime(
             runtime=runtime,
             cwd=cwd,
@@ -1102,6 +768,10 @@ def run_agent_turn(
             model_context_limit=memory_context_limit,
         )
         owns_paged_memory_runtime = active_paged_memory is not None
+
+    if active_paged_memory is not None:
+        # Reusing a memory owner in another activation never reuses a loan.
+        active_paged_memory.context_borrowing.stop()
 
     def run_paged_memory_operation(
         operation: str, *args: Any, **kwargs: Any
@@ -1125,15 +795,23 @@ def run_agent_turn(
 
     if paged_memory_runtime is not None:
         run_paged_memory_operation("record_initial_messages", current_messages)
+        run_paged_memory_operation("configure_task_contract", runtime or {}, current_messages)
     legacy_context_management_allowed = not (
         active_paged_memory is not None and active_paged_memory.controls_context
     )
+    from minicode.runtime_memory import primary_memory_owned
+
+    coordinator_owns_memory = primary_memory_owned(runtime)
 
     paged_tool_receipts: dict[str, tuple[Any, str]] = {}
     paged_tool_receipts_lock = threading.Lock()
 
     def observe_raw_tool_result(call: dict, result: ToolResult) -> ToolResult | None:
         """Persist exact bytes before ToolRegistry's legacy prompt truncation."""
+        history_observer = (runtime or {}).get("_sessionRawToolResult")
+        if callable(history_observer):
+            history_observer(call, result, node_id=str((runtime or {}).get("_runtimeNodeId", "")),
+                             attempt_id=str((runtime or {}).get("_runtimeAttemptId", "")))
         if active_paged_memory is None or paged_memory_shadow_disabled:
             return None
         try:
@@ -1142,9 +820,16 @@ def run_agent_turn(
                 call=call,
                 output=result.output or "",
                 ok=result.ok,
+                read_sha256=result.contextReadSha256 or "",
             )
         except ArtifactPersistenceRequired as error:
-            replacement = ToolResult(ok=False, output=str(error), awaitUser=True)
+            replacement = ToolResult(
+                ok=False,
+                output=str(error),
+                awaitUser=True,
+                waitKind="input",
+                waitReason="artifact persistence requires user intervention",
+            )
             captured = run_paged_memory_operation(
                 "capture_tool_result",
                 call=call,
@@ -1157,6 +842,7 @@ def run_agent_turn(
                     paged_tool_receipts[str(call.get("id", ""))] = captured
             return replacement
         if captured is not None:
+            active_paged_memory.context_utilization.observe_result(call, captured[1])
             with paged_tool_receipts_lock:
                 paged_tool_receipts[str(call.get("id", ""))] = captured
         return None
@@ -1164,12 +850,19 @@ def run_agent_turn(
     def run_memory_preflight(call: dict, effect: ToolEffect) -> str | None:
         if active_paged_memory is None or paged_memory_shadow_disabled:
             return None
+        pressure_block = active_paged_memory.context_utilization.block_tool(call)
+        if pressure_block:
+            return pressure_block
         high_risk = effect is not ToolEffect.READ_ONLY
         audit = run_paged_memory_operation(
             "preflight",
             step_id=active_paged_memory.current_step_id,
             high_risk=high_risk,
             idempotency_key=str(call.get("id", "")) if high_risk else "",
+            expected_contract_hash=(
+                active_paged_memory.last_packet.debug_metadata.get("required_contract_hash")
+                if active_paged_memory.last_packet is not None else None
+            ),
         )
         if audit is None:
             return None
@@ -1189,7 +882,12 @@ def run_agent_turn(
         runtime,
         profile_name=runtime_profile.name,
     )
-    network_tool_count = 0
+    from minicode.network_research import NetworkResearchBudget
+
+    network_budget = NetworkResearchBudget(
+        network_tool_limit,
+        reserve_fetches=stop_network_when_evidence_ready and tools.find("web_fetch") is not None,
+    )
     relevant_search_succeeded = False
     strong_relevant_search_succeeded = False
     search_headline_evidence_ready = False
@@ -1197,10 +895,31 @@ def run_agent_turn(
     evidence_network_fetches = 0
     strong_search_result_urls: set[str] = set()
     network_guard_active = False
+    network_evidence_notified = False
+    network_search_guard_active = False
     adapter_tool_restorations: list[tuple[Any, Any]] = []
     switcher_tools_original: Any | None = None
     memory_tools_added = False
+    rerank_fallback_reported = False
     memory_tool_names: frozenset[str] = frozenset()
+
+    def bind_native_memory_tools(definitions):
+        context = (runtime or {}).get("_runtimeContext")
+        gateway = getattr(context, "delegation_gateway", context)
+        binder = getattr(gateway, "bind_coordinator_memory_tools", None)
+        if callable(binder):
+            binder((runtime or {}).get("_runtimeNodeId"),
+                (runtime or {}).get("_runtimeAttemptId"), definitions)
+
+    tool_discovery = None
+    # Presentation is independent of orchestration: the default full catalog
+    # must stay discoverable without flooding legacy requests with schemas.
+    if (tools.list()
+            and ToolEffect.READ_ONLY.value in (runtime or {}).get("_allowedToolEffects", [ToolEffect.READ_ONLY.value])):
+        from minicode.tool_discovery import ToolDiscovery
+
+        tool_discovery = ToolDiscovery()
+        tools = tools.with_additional_tools([tool_discovery.tool()])
 
     def replace_adapter_tools(adapter: Any, replacement: ToolRegistry) -> None:
         if not hasattr(adapter, "tools"):
@@ -1273,44 +992,84 @@ def run_agent_turn(
                 exc_info=True,
             )
 
+    # Tool callbacks run on each invocation's executor thread. Keep a stack
+    # per thread so parallel same-name calls (and nested calls) cannot collide.
+    tool_event_context = threading.local()
+    live_concurrent_events = bool(getattr(callbacks, "thread_safe_tool_events", False))
+
+    def execute_call(call, registry, call_cwd, call_permissions, call_session, call_runtime, *args, **kwargs):
+        # Preserve the provider's call identity across live events and saved
+        # messages. The thread-local binding also covers nested/concurrent calls.
+        previous = getattr(tool_event_context, "next_call_id", "")
+        tool_event_context.next_call_id = call["id"]
+        try:
+            invocation_step = turn_state.step
+            execution_runtime = {**call_runtime, "_taskCheckEvidence": task_check_evidence, "_networkResearchAdmission":
+                lambda name, call_id: network_budget.admit(name, f"{invocation_step}:{call_id}")}
+            return _execute_single_tool(call, registry, call_cwd, call_permissions, call_session,
+                execution_runtime, *args, **kwargs, supplied_contracts=supplied_contracts,
+                on_tool_recovery=lambda metadata: publish_turn_event(TurnEvent(
+                    kind="tool_recovery", step=turn_state.step, tool_name=call["toolName"],
+                    tool_call_id=call["id"], tool_recovery={**metadata, "step": turn_state.step})),
+                on_tool_images=lambda images: publish_turn_event(TurnEvent(
+                    kind="tool_images", step=invocation_step, tool_name=call["toolName"],
+                    tool_call_id=call["id"], images=tuple(images))))
+        finally:
+            tool_event_context.next_call_id = previous
+
     def on_tool_start(tool_name: str, tool_input: dict) -> None:
+        calls = getattr(tool_event_context, "calls", [])
+        call_id = getattr(tool_event_context, "next_call_id", "") or uuid.uuid4().hex
+        tool_event_context.next_call_id = ""
+        calls.append(call_id)
+        tool_event_context.calls = calls
         publish_turn_event(
             TurnEvent.tool_started(
                 step=turn_state.step or None,
                 tool_name=tool_name,
                 tool_input=tool_input,
+                tool_call_id=call_id,
             )
         )
         if legacy_on_tool_start:
             legacy_on_tool_start(tool_name, tool_input)
 
     def on_tool_result(tool_name: str, output: str, is_error: bool) -> None:
+        calls = getattr(tool_event_context, "calls", [])
+        call_id = calls.pop() if calls else uuid.uuid4().hex
         publish_turn_event(
             TurnEvent.tool_finished(
                 step=turn_state.step or None,
                 tool_name=tool_name,
                 output=output,
                 is_error=is_error,
+                tool_call_id=call_id,
             )
         )
         if legacy_on_tool_result:
             legacy_on_tool_result(tool_name, output, is_error)
 
-    def on_assistant_message(content: str) -> None:
+    def on_assistant_message(content: str, *, public: bool = False) -> None:
         publish_turn_event(
             TurnEvent.assistant_message(
                 step=turn_state.step or None,
                 content=content,
+                public=public,
             )
         )
         if legacy_on_assistant_message:
             legacy_on_assistant_message(content)
 
-    def on_progress_message(content: str) -> None:
+    def on_progress_message(
+        content: str, *, public: bool = False,
+        progress_status: Literal["running", "complete", "failed", "stopped"] | None = None,
+    ) -> None:
         publish_turn_event(
             TurnEvent.progress_message(
                 step=turn_state.step or None,
                 content=content,
+                public=public,
+                progress_status=progress_status,
             )
         )
         if legacy_on_progress_message:
@@ -1400,6 +1159,23 @@ def run_agent_turn(
             on_runtime_event(event)
         if emit_progress and on_progress_message:
             on_progress_message(message)
+
+    def on_provider_recovery(diagnostic: dict[str, Any]) -> None:
+        record_worker_audit("provider_stream_recovery", step=turn_state.step, **diagnostic)
+        status = diagnostic["status"]
+        if status != "recovered":
+            publish_turn_event(TurnEvent(kind="model_status", step=turn_state.step, content="interrupted"))
+        if status == "retrying":
+            message = (f"上游模型输出中断，正在重试（{diagnostic['retry']}/{diagnostic['max_retries']}）。"
+                       "已完成的工具结果已保留。")
+        elif status == "recovered":
+            message = "模型请求已恢复，继续执行任务。"
+        else:
+            return  # The typed terminal error below supplies the stop notice.
+        emit_runtime_event(category="recovery", message=message,
+                           evidence_summary=json.dumps(diagnostic, ensure_ascii=False))
+        if status == "retrying":
+            publish_turn_event(TurnEvent(kind="model_status", step=turn_state.step, content="waiting"))
 
     tool_scheduler = ToolScheduler(metrics_collector=metrics_collector)
 
@@ -1518,14 +1294,11 @@ def run_agent_turn(
                 risk_assessment.risk_level,
             )
             # Apply feedforward preemptive config to execution parameters
-            if preemptive_config.confidence > 0.6:
-                if turn_state.max_steps is None:
-                    turn_state.max_steps = preemptive_config.max_turn_steps
-                else:
-                    turn_state.max_steps = min(
-                        turn_state.max_steps,
-                        preemptive_config.max_turn_steps,
-                    )
+            if preemptive_config.confidence > 0.6 and turn_state.max_steps is not None:
+                turn_state.max_steps = min(
+                    turn_state.max_steps,
+                    preemptive_config.max_turn_steps,
+                )
                 max_steps = turn_state.max_steps
                 logger.info(
                     "Feedforward: max_steps=%d model=%s timeout=%.1fs",
@@ -1548,8 +1321,8 @@ def run_agent_turn(
                     task_complexity=getattr(prelude.task, "complexity", "moderate")
                     if hasattr(prelude.task, "complexity")
                     else "moderate",
-                    budget_pressure=0.3,
-                    latency_pressure=0.3,
+                    budget_pressure=current_usage_observation()["budget_pressure"],
+                    latency_pressure=min(1.0, telemetry.average("model") / 60.0),
                     recent_failures=0,
                     current_model=model.model_id if hasattr(model, "model_id") else "",
                 )
@@ -1577,6 +1350,9 @@ def run_agent_turn(
                 if memory_manager is not None
                 else MemoryManager(project_root=cwd)
             )
+            if session is not None:
+                memory_mgr.source_session_id = session.session_id
+                memory_mgr.source_turn_id = str((runtime or {}).get("_webTurnId") or memory_mgr.source_turn_id)
             # 将 memory_mgr 注入 ReflectionEngine，使自省经验持久化
             if reflection_engine:
                 reflection_engine.memory = memory_mgr
@@ -1595,7 +1371,7 @@ def run_agent_turn(
                 controller=memory_injection_ctrl,
                 reranker=memory_reranker,
             )
-            if orch:
+            if orch and not coordinator_owns_memory:
                 orch._last_model = model
                 orch._workspace = cwd
                 orch.wire_memory(memory_mgr)
@@ -1758,12 +1534,13 @@ def run_agent_turn(
 
         # 运行控制论闭环优化管线 (Sense → Predict → Control → Act → Learn)
         if context_cybernetics:
-            if cost_control:
-                est_cost = stats.total_tokens * 0.000015
+            usage_observation = current_usage_observation()
+            if cost_control and usage_observation["cost"] is not None:
+                measured_cost = usage_observation["cost"]
                 adj = cost_control.run(
-                    cost_usd=est_cost,
-                    total_tokens=stats.total_tokens,
-                    total_calls=max(turn_state.step, 1),
+                    cost_usd=measured_cost,
+                    total_tokens=usage_observation["tokens"],
+                    total_calls=usage_observation["model_calls"],
                 )
                 if (
                     context_compactor
@@ -1787,7 +1564,7 @@ def run_agent_turn(
                             / max(turn_state.step, 1)
                             if turn_state.step > 0
                             else 0.0,
-                            avg_latency=turn_state.step * 2.0,
+                            avg_latency=telemetry.average("model"),
                             turn_id=turn_state.step,
                         )
                     )
@@ -1851,10 +1628,47 @@ def run_agent_turn(
 
     try:
         # Recurrent kernel: repeated think/act/observe iterations over one turn.
+        explicit_skill = runtime.pop("_userSkillInvocation", None)
+        if explicit_skill is not None:
+            call_id = "skill-user-" + uuid.uuid4().hex
+            current_messages.append({"role": "assistant_tool_call", "toolUseId": call_id,
+                "toolName": "load_skill", "input": explicit_skill})
+            allowed = runtime.get("_allowedToolEffects")
+            result = tools.execute("load_skill", explicit_skill, ToolContext(cwd=cwd,
+                permissions=permissions, session=session, _runtime=runtime,
+                allowed_effects=frozenset(ToolEffect(value) for value in allowed) if allowed is not None else None,
+                node_id=runtime.get("_runtimeNodeId"), attempt_id=runtime.get("_runtimeAttemptId"),
+                run_id=runtime.get("_runtimeActiveRunId"), tool_call_id=call_id, skill_user_invocation=True))
+            current_messages.append({"role": "tool_result", "toolUseId": call_id,
+                "toolName": "load_skill", "content": result.output, "isError": not result.ok})
+            if not result.ok:
+                turn_state.set_stop_reason("blocked")
+                current_messages.append({"role": "assistant", "content": result.output})
+                return current_messages
         while turn_state.has_remaining_steps():
+            parent_cancellation = (runtime or {}).get("_cancellationEvent")
+            if callable(getattr(parent_cancellation, "is_set", None)) and (
+                parent_cancellation.is_set()
+            ):
+                turn_state.set_stop_reason("canceled")
+                emit_runtime_event(
+                    category="stop",
+                    message="Parent Runtime cancellation requested",
+                    emit_progress=False,
+                    stop_reason="canceled",
+                )
+                return current_messages
+            agent_boundary = runtime.get("_agentBoundary")
+            if callable(agent_boundary):
+                agent_boundary(current_messages, context_manager=context_manager)
+            user_boundary = runtime.get("_userBoundary")
+            if callable(user_boundary):
+                user_boundary(current_messages, context_manager=context_manager)
             step = turn_state.begin_step()
             previous_policy = turn_state.step_policy
-            current_policy = derive_turn_step_policy(turn_state)
+            current_policy = derive_turn_step_policy(
+                turn_state, read_only=runtime.get("_allowedToolEffects") == ["read_only"],
+            )
             policy_message = render_turn_policy_message(
                 previous_policy=previous_policy,
                 current_policy=current_policy,
@@ -1904,8 +1718,19 @@ def run_agent_turn(
                 verification_state=turn_state.verification_state,
                 budget_signals=turn_state.budget_signals,
             )
-            if turn_state.stable_task_pack:
-                stable_text = turn_state.stable_task_pack.to_protected_text()
+            # A native paged Worker already carries its typed task state,
+            # required contract and original sources. Do not add the legacy
+            # intent classifier's "unknown/evidence-ready" summary as a second
+            # system-level task authority. Preserve its path whenever protected
+            # working context could contain additional requirements.
+            native_worker_state = (
+                active_paged_memory is not None and active_paged_memory.controls_context
+                and active_paged_memory.current_mode.value != "INLINE"
+                and isinstance(runtime.get("_memoryWorkerContract"), dict)
+                and not protected_context
+            )
+            if turn_state.stable_task_pack and not native_worker_state:
+                stable_text = turn_state.stable_task_pack.to_protected_text(result_is_preview=runtime_result_is_preview())
                 current_messages = _upsert_stable_task_state_message(
                     current_messages,
                     stable_text,
@@ -1936,13 +1761,13 @@ def run_agent_turn(
                 if state_observer:
                     measurement = MeasurementVector(
                         timestamp=time.time(),
-                        response_time=step * 2.0,  # 估算响应时间
+                        response_time=telemetry.average("model"),
                         success_rate=1.0 - (turn_state.tool_error_count / max(step, 1)),
                         context_length=context_manager.get_stats().total_tokens
                         if context_manager
                         else 0,
                         error_count=turn_state.tool_error_count,
-                        tool_calls=0,
+                        tool_calls=telemetry.calls.get("tool", 0),
                     )
                     observed_state = state_observer.update(measurement)
 
@@ -2034,6 +1859,7 @@ def run_agent_turn(
                 metrics_collector.start_turn(step)
 
             next_step: AgentStep
+            context_budget = None
             try:
                 # ── Layer 0: Preemptive context guard (CC-style blocking limit)
                 # Paged memory builds a bounded source-linked request below, so
@@ -2065,8 +1891,64 @@ def run_agent_turn(
                         )
                         return current_messages
 
-                model_input_messages = current_messages
+                # An error exchange can exceed the recent-history budget.
+                # Keep only the live, bounded correction state as owned Runtime
+                # context; never rewrite the immutable failed tool receipt.
+                current_messages = [message for message in current_messages
+                                    if runtime_context_kind(message) not in {"tool_input_recovery", "tool_recovery_lessons", "shared_writer_coordination", "task_check_evidence", EXECUTION_PROGRESS_CONTEXT}]
+                runtime_context = (runtime or {}).get("_runtimeContext")
+                delegation = getattr(runtime_context, "delegation_gateway", runtime_context)
+                coordination = getattr(delegation, "shared_write_coordination", None)
+                shared_status = None
+                if callable(coordination):
+                    shared_status = coordination((runtime or {}).get("_runtimeNodeId"), (runtime or {}).get("_runtimeAttemptId"))
+                    if shared_status is not None:
+                        current_messages.append(runtime_context_message(
+                            "Current native shared writer coordination (advisory state; tool guards still apply):\n"
+                            + json.dumps(shared_status, ensure_ascii=False), kind="shared_writer_coordination"))
+                progress_context, progress_notice = execution_progress.review(
+                    step=step, read_only=runtime.get("_allowedToolEffects") == ["read_only"],
+                    shared_status=shared_status,
+                )
+                if progress_context:
+                    current_messages.append(runtime_context_message(progress_context, kind=EXECUTION_PROGRESS_CONTEXT))
+                if progress_notice:
+                    emit_runtime_event(category="progress", message=progress_notice)
+                correction_context = tool_retry_guard.recovery_context()
+                if correction_context:
+                    current_messages.append(runtime_context_message(correction_context, kind="tool_input_recovery"))
+                recovery_context = recovery_tracker.context()
+                if recovery_context:
+                    current_messages.append(runtime_context_message(recovery_context, kind="tool_recovery_lessons"))
+                check_context = task_check_evidence.context()
+                if check_context:
+                    current_messages.append(runtime_context_message(check_context, kind="task_check_evidence"))
+                if callable(runtime.get("_userContext")):
+                    runtime["_userContext"](current_messages)
+                from minicode.runtime_role_context import current_primary_instructions
+                model_input_messages = current_primary_instructions(current_messages)
+                paged_request_view = None
                 if active_paged_memory is not None:
+                    # Plan against this step's adapter/output recovery, not a
+                    # fixed 4096-token memory reserve. Include the handoff tools
+                    # before deciding whether the packet needs a handoff.
+                    context_budget = None
+                    if active_paged_memory.controls_context and callable(getattr(model, "context_request", None)):
+                        from minicode.provider_usage import ModelContextBudget
+                        from minicode.paged_memory.tools import create_paged_memory_tools
+                        planning_tools = tools if memory_tools_added else tools.with_additional_tools(
+                            create_paged_memory_tools(active_paged_memory))
+                        if tool_discovery is not None:
+                            planning_tools = tool_discovery.model_tools(planning_tools,
+                                provider_runtime=getattr(model, "runtime", runtime),
+                                parallel_closure=(runtime or {}).get("_parallelClosureReady"),
+                                required_names=skill_runtime.required_tool_names())
+                        if callable(runtime.get("_userModelTools")):
+                            planning_tools = runtime["_userModelTools"](planning_tools)
+                        context_budget = ModelContextBudget(model, planning_tools,
+                            output_recovery=turn_state.output_recovery,
+                            stream=bool(on_assistant_stream_chunk), skill_runtime=skill_runtime,
+                            config=active_paged_memory.config)
                     combined_system_context = "\n\n".join(
                         str(message.get("content", ""))
                         for message in current_messages
@@ -2078,10 +1960,53 @@ def run_agent_turn(
                         step_id=active_paged_memory.current_step_id,
                         phase_boundary=bool(policy_message),
                         system_context=combined_system_context,
+                        request_budget=context_budget,
+                        bind_history=active_paged_memory.controls_context,
                     )
                     if prepared_memory is not None:
                         model_input_messages, memory_packet = prepared_memory
+                        rerank = memory_packet.debug_metadata.get("rerank", {})
+                        if rerank.get("status") == "fallback" and not rerank_fallback_reported:
+                            rerank_fallback_reported = True
+                            emit_runtime_event(category="guard", message="记忆重排不可用，已使用本地检索结果。",
+                                               evidence_summary=json.dumps(rerank, ensure_ascii=False))
                         if active_paged_memory.controls_context:
+                            current_messages = list(active_paged_memory.context_rotation.request_messages)
+                        rotation = memory_packet.debug_metadata.get("context_rotation", {})
+                        if (active_paged_memory.controls_context and rotation.get("epoch", 0)
+                                and rotation.get("status") in {"history_mismatch", "invalid_source"}):
+                            raise HistoryIntegrityError(
+                                "saved_rotation_unverifiable: " + rotation.get("diagnostic", rotation["status"]),
+                                event_id=rotation.get("source_event_id", ""),
+                            )
+                        model_input_messages = current_primary_instructions(model_input_messages)
+                        recovered = memory_packet.debug_metadata.get("context_auto_rotation")
+                        borrowing = memory_packet.debug_metadata.get("context_borrowing", {})
+                        if borrowing.get("status") == "active" and borrowing.get("requests") == 0:
+                            record_worker_audit("context_borrowing_started", step=step, **borrowing)
+                            if on_progress_message:
+                                on_progress_message("正常上下文请求在缩减后仍无法容纳，正在临时借用额外空间保存交接笔记。业务上限保持不变。")
+                        elif borrowing.get("status") == "handoff" and borrowing.get("requests") == 0:
+                            preparing_context = borrowing.get("trigger") == "context_preparation"
+                            record_worker_audit("context_preparation_started" if preparing_context else "context_handoff_started",
+                                step=step, **borrowing)
+                            if on_progress_message:
+                                on_progress_message("继承或继续的历史较长，正在整理本轮上下文；完成后自动继续任务。"
+                                    if preparing_context else "完整业务请求无法容纳，正在原上下文上限内保存交接笔记。")
+                        if recovered:
+                            record_worker_audit("context_auto_rotation", step=step, receipt=recovered)
+                            if on_progress_message:
+                                protected = memory_packet.debug_metadata.get("context_utilization", {}).get("protection")
+                                on_progress_message("已自动整理历史上下文，最新要求和新增消息已保留。"
+                                                    + ("正在检查恢复后的上下文容量。" if borrowing.get("status") == "restoring" else
+                                                       "新增内容仍较多，正在继续恢复。" if protected else "继续执行任务。"),
+                                                    progress_status="complete")
+                        if active_paged_memory.controls_context:
+                            from minicode.paged_memory.request_view import PagedMemoryRequestView
+                            paged_request_view = PagedMemoryRequestView.build(
+                                active_paged_memory.context_builder, memory_packet,
+                                current_messages, model_input_messages,
+                            )
                             if memory_packet.memory_mode.value != "INLINE":
                                 if not memory_tools_added:
                                     from minicode.paged_memory.tools import (
@@ -2098,33 +2023,139 @@ def run_agent_turn(
                                     tools = tools.with_additional_tools(
                                         memory_tool_definitions
                                     )
+                                    bind_native_memory_tools(memory_tool_definitions)
                                     memory_tools_added = True
                             elif memory_tools_added:
                                 tools = tools.filtered_without_names(memory_tool_names)
+                                bind_native_memory_tools([])
                                 memory_tools_added = False
                             # Model switches can replace the active adapter between
                             # iterations, so refresh its non-owning tool view too.
                             replace_adapter_tools(model, tools)
                             replace_switcher_tools(tools)
-                            run_paged_memory_operation(
-                                "enforce_provider_budget",
+                # Provider schema visibility is distinct from the executor's
+                # complete scoped registry. Check the same schemas we send.
+                model_tools = (tool_discovery.model_tools(tools, provider_runtime=getattr(model, "runtime", runtime),
+                    parallel_closure=(runtime or {}).get("_parallelClosureReady"),
+                    required_names=skill_runtime.required_tool_names())
+                               if tool_discovery is not None else tools)
+                if callable(runtime.get("_userModelTools")):
+                    model_tools = runtime["_userModelTools"](model_tools)
+                if active_paged_memory is not None and active_paged_memory.context_borrowing.handoff_only:
+                    model_tools = active_paged_memory.context_borrowing.filter_tools(model_tools)
+                supplied_contracts = request_contracts(model_tools)
+                if active_paged_memory is not None and active_paged_memory.controls_context:
+                    run_paged_memory_operation(
+                        "enforce_provider_budget", model_input_messages,
+                        tool_definitions=model_tools.list(),
+                    )
+                publish_turn_event(TurnEvent(kind="model_status", step=step, content="waiting"))
+                record_worker_audit("model_input_ready", step=step, canonical_messages=current_messages,
+                    input_messages=model_input_messages)
+                model_received = False
+                try:
+                    observe_request_context(model_input_messages, tools, enabled=True,
+                        stages_enabled=not (active_paged_memory is not None and active_paged_memory.controls_context),
+                        paged_memory_view=paged_request_view, canonical_messages=current_messages)
+                    with bind_context_borrowing(active_paged_memory.context_borrowing if active_paged_memory is not None else None), bind_skill_runtime(skill_runtime):
+                        correction_started = time.monotonic()
+                        was_recovering = input_recovery.recovering
+                        correction_usage = None
+                        try:
+                            next_step = _model_next(
+                                model,
                                 model_input_messages,
-                                tool_definitions=tools.list(),
+                                on_stream_chunk=on_assistant_stream_chunk,
+                                on_thinking_chunk=on_thinking_chunk,
+                                store=store,
+                                tools=model_tools,
+                                output_recovery=turn_state.output_recovery,
+                                on_provider_recovery=on_provider_recovery,
                             )
-                next_step = _model_next(
-                    model,
-                    model_input_messages,
-                    on_stream_chunk=on_assistant_stream_chunk,
-                    on_thinking_chunk=on_thinking_chunk,
-                    store=store,
-                )
+                            model_received = True
+                            correction_usage = next_step.usage
+                            task_check_evidence.model_observed(getattr(next_step, "imageInputIds", []))
+                            for call_id, name, feedback in input_recovery.schemas_supplied(supplied_contracts, step):
+                                # Annotate only the original, scoped diagnostic.
+                                # Loading a schema never changes its execution receipt.
+                                for message in reversed(current_messages):
+                                    if (message.get("role") == "tool_result" and message.get("toolUseId") == call_id
+                                            and message.get("toolName") == name
+                                            and message.get("toolInput", {}).get("step") == feedback["step"]):
+                                        message["toolInput"] = deepcopy(feedback)
+                                        break
+                                record_worker_audit("tool_schema_loaded", step=step, tool_call_id=call_id, tool_name=name,
+                                                    schema_step=feedback["step"])
+                                publish_turn_event(TurnEvent(kind="tool_input", step=feedback["step"], tool_name=name,
+                                    tool_call_id=call_id, tool_input_status=deepcopy(feedback)))
+                        finally:
+                            input_recovery.model_observed(correction_usage,
+                                (time.monotonic() - correction_started) * 1000, was_recovering)
+                            if was_recovering:
+                                record_worker_audit("tool_input_recovery_request", step=step, **input_recovery.metrics())
+                finally:
+                    publish_turn_event(TurnEvent(kind="model_status", step=step,
+                        content="received" if model_received else "interrupted"))
                 if active_paged_memory is not None:
                     run_paged_memory_operation(
                         "record_model_step", next_step, sequence_no=step
                     )
+                    restored_borrowing = (active_paged_memory.last_packet.debug_metadata.get("context_borrowing", {})
+                        if active_paged_memory.last_packet is not None else {})
+                    if restored_borrowing.get("status") == "restored":
+                        record_worker_audit("context_borrowing_restored", step=step, **restored_borrowing)
+                        if on_progress_message:
+                            on_progress_message("上下文已准备好，完整历史和最新要求已保留，继续执行任务。"
+                                if restored_borrowing.get("trigger") == "context_preparation" else
+                                "交接已完成，额外上下文借用已结束，继续按原上下文上限执行。"
+                                if restored_borrowing.get("borrowed") else "交接已完成，继续按原上下文上限执行。",
+                                progress_status="complete")
+                    if active_paged_memory.context_borrowing.recovering and not next_step.calls:
+                        if next_step.content:
+                            current_messages.append(_with_reasoning_content(
+                                {"role": "assistant", "content": next_step.content}, next_step.reasoningContent))
+                        current_messages.append(runtime_feedback_message(
+                            "Native handoff recovery is still pending. This response cannot complete business work. "
+                            "Use memory_note_update with concise verified findings and next_steps; "
+                            "the runtime must commit rotation and restore normal context admission first.", kind="continuation"))
+                        continue
             except KeyboardInterrupt:
                 raise  # Let Ctrl-C propagate
+            except BudgetUnavailable as error:
+                if (active_paged_memory is not None
+                        and active_paged_memory.context_borrowing.recover(error, context_budget)):
+                    record_worker_audit("context_handoff_recovery", step=step,
+                        **active_paged_memory.context_borrowing.diagnostic())
+                    if on_progress_message:
+                        on_progress_message("完整请求因上下文容量不足被拦住，正在恢复交接。业务上限保持不变。")
+                    continue
+                if isinstance(error, ModelUsageUnreconciled):
+                    message = f"Runtime model usage requires reconciliation: {error}"
+                    stop_reason = "model_usage_unreconciled"
+                else:
+                    message = f"Runtime model budget stopped execution: {error}"
+                    stop_reason = "consultation_budget_limited" if isinstance(error, ConsultationBudgetLimited) else "budget_exhausted"
+                turn_state.set_stop_reason(stop_reason)
+                emit_runtime_event(category="stop", message=message, stop_reason=stop_reason)
+                current_messages.append({"role": "assistant", "content": message})
+                return current_messages
+            except (ContextRecoveryRequired, HistoryIntegrityError) as error:
+                message = str(error)
+                if isinstance(error, HistoryIntegrityError):
+                    message = ("原始历史校验未通过，已在调用模型前停止。"
+                               "需要恢复报出的原始事件或检查点，重复整理和重复执行工具不能修复它。\n" + message)
+                turn_state.set_stop_reason("blocked")
+                emit_runtime_event(category="stop", message=message, emit_progress=False, stop_reason="blocked")
+                if on_assistant_message:
+                    on_assistant_message(message)
+                current_messages.append({"role": "assistant", "content": message})
+                if metrics_collector:
+                    metrics_collector.end_turn(total_tokens=0)
+                return current_messages
             except ContextBudgetExceeded as error:
+                if (active_paged_memory is not None
+                        and active_paged_memory.context_borrowing.recover(error, context_budget)):
+                    continue
                 fallback = (
                     "Context budget exceeded before the model call "
                     f"({error.estimated_tokens} / {error.input_limit} input tokens). "
@@ -2144,6 +2175,16 @@ def run_agent_turn(
                 current_messages.append({"role": "assistant", "content": fallback})
                 if metrics_collector:
                     metrics_collector.end_turn(total_tokens=0)
+                return current_messages
+            except ProviderStreamError as error:
+                message = str(error)
+                turn_state.set_stop_reason("provider_error")
+                notice = (("上游模型输出中断，自动重试未恢复，执行已暂停。已有进度已保留。"
+                           if error.retries else "上游模型输出中断，执行已暂停。请稍后从已有进度继续。")
+                          if error.retryable else "模型服务返回错误，执行已暂停。请检查模型和服务配置。")
+                emit_runtime_event(category="stop", message=notice, stop_reason="provider_error",
+                                   evidence_summary=message)
+                current_messages.append({"role": "assistant", "content": message})
                 return current_messages
             except ConnectionError as error:
                 fallback = f"Network error (connection failed or dropped): {error}"
@@ -2179,6 +2220,18 @@ def run_agent_turn(
                 return current_messages
             except Exception as error:
                 # Catch-all for unexpected errors (rate limit, auth, server 5xx, etc.)
+                from minicode.provider_usage import ProviderBalanceUnavailable, provider_balance_blocked
+                if isinstance(error, ProviderBalanceUnavailable) or provider_balance_blocked():
+                    # The last complete tool batch was checkpointed at the loop
+                    # boundary. Do not retry, switch models or replay that batch.
+                    message = "模型账户余额不足，执行已暂停，已有修改和子代理上下文已保留。补充余额后发送继续，可核对进度并续接原子代理。"
+                    turn_state.set_stop_reason("provider_balance")
+                    emit_runtime_event(category="stop", message=message, emit_progress=False,
+                                       stop_reason="provider_balance")
+                    current_messages.append({"role": "assistant", "content": message})
+                    if on_assistant_message:
+                        on_assistant_message(message)
+                    return current_messages
                 error_type = type(error).__name__
                 active_model_id = _infer_active_model_id(model, runtime, error)
                 fallback = _summarize_model_api_failure(
@@ -2187,7 +2240,7 @@ def run_agent_turn(
                     active_model_id=active_model_id,
                     runtime=runtime,
                 )
-                logger.error("Model API error (%s): %s", error_type, error)
+                logger.error("%s", fallback)
 
                 # Reactive Compact: 控制论恢复路径
                 error_str = str(error).lower()
@@ -2291,6 +2344,70 @@ def run_agent_turn(
                     metrics_collector.end_turn(total_tokens=0)
                 return current_messages
 
+            if next_step.type == "tool_calls":
+                # Transport integrity outranks everything else: bytes we never
+                # received cannot prove a complete tool proposal, so no call in
+                # this batch may reach a tool, hook, approval or journal entry.
+                # A transport that ended on its own terminal marker but lost an
+                # event is exactly as unusable: the remainder of that event is
+                # unknown, so the assembled proposal is refused the same way.
+                if next_step.diagnostics and next_step.diagnostics.transportComplete is False:
+                    diagnostics = next_step.diagnostics
+                    current_messages.extend(_rejected_truncated_tool_messages(
+                        next_step, on_event=publish_turn_event, step=step,
+                        reason=("response_parse_incomplete" if diagnostics.lostEventCount
+                                else "transport_incomplete"),
+                        detail=(diagnostics.rawResponseIncompleteReason
+                                or "the response ended before the provider's terminal marker")))
+                    turn_state.set_stop_reason("transport_incomplete")
+                    message = ("The provider response is not provably complete"
+                               + (f" ({diagnostics.lostEventCount} event(s) could not be decoded)"
+                                  if diagnostics.lostEventCount else "")
+                               + "; no tool call from it was executed. The remainder of that "
+                                 "response is unknown.")
+                    emit_runtime_event(category="stop", message=message, emit_progress=False,
+                                       stop_reason="transport_incomplete")
+                    current_messages.append({"role": "assistant", "content": message})
+                    if on_assistant_message:
+                        on_assistant_message(message)
+                    return current_messages
+                truncated = decide_truncated_model_output(turn_state=turn_state, tool_batch=True,
+                    stop_reason=next_step.diagnostics.stopReason if next_step.diagnostics else None)
+                if truncated is not None:
+                    # This precedes paged tool capture, execution, approval and
+                    # native submission. No valid-looking prefix may escape.
+                    current_messages.extend(_rejected_truncated_tool_messages(
+                        next_step, on_event=publish_turn_event, step=step))
+                    if truncated.kind == "retry":
+                        # Continue in this activation; never restart earlier tools.
+                        message = truncated.user_content or (
+                            "Provider truncated this tool batch; no calls were executed. "
+                            "Continue once with fewer and smaller tool calls.")
+                        status = truncated.assistant_content or message
+                        emit_runtime_event(category="recovery", message=status,
+                                           stop_reason="model_output_truncated")
+                        current_messages.append(runtime_feedback_message(message, kind=truncated.feedback_kind))
+                        if on_assistant_message:
+                            on_assistant_message(status)
+                        continue
+                    turn_state.set_stop_reason("model_output_truncated")
+                    message = truncated.assistant_content or "Model tool output was truncated; no calls executed."
+                    emit_runtime_event(category="stop", message=message, emit_progress=False,
+                                       stop_reason="model_output_truncated")
+                    current_messages.append({"role": "assistant", "content": message})
+                    if on_assistant_message:
+                        on_assistant_message(message)
+                    return current_messages
+
+            # A provider response was generated from the preceding context.
+            # Refuse its unstarted calls before inserting newly arrived human
+            # context; keep every tool proposal paired with an honest refusal.
+            if callable(runtime.get("_userBoundary")):
+                boundary = runtime["_userBoundary"](current_messages, context_manager=context_manager,
+                    response=next_step, on_event=publish_turn_event, step=step)
+                if boundary["consumed"]:
+                    continue
+
             if next_step.type == "assistant":
                 is_empty = _is_empty_assistant_response(next_step.content)
                 diagnostics = next_step.diagnostics
@@ -2327,7 +2444,17 @@ def run_agent_turn(
                     nudge_after_empty_response=NUDGE_AFTER_EMPTY_RESPONSE,
                     nudge_after_empty_no_tools=NUDGE_AFTER_EMPTY_NO_TOOLS,
                     step_policy=turn_state.step_policy,
+                    transport_complete=(diagnostics is None or (
+                        diagnostics.transportComplete and diagnostics.networkComplete
+                        and diagnostics.parseComplete and diagnostics.assemblyComplete
+                        and not diagnostics.lostEventCount)),
                 )
+
+                record_worker_audit("assistant_decision", step=step, decision_kind=assistant_decision.kind,
+                    stop_reason=assistant_decision.stop_reason,
+                    runtime_event_category=assistant_decision.runtime_event_category,
+                    assistant_content=assistant_decision.assistant_content,
+                    user_content=assistant_decision.user_content)
 
                 if assistant_decision.kind == "progress":
                     if assistant_decision.assistant_content:
@@ -2344,7 +2471,7 @@ def run_agent_turn(
                                 ),
                             )
                         elif on_progress_message:
-                            on_progress_message(assistant_decision.assistant_content)
+                            on_progress_message(assistant_decision.assistant_content, public=True)
                         current_messages.append(
                             _with_reasoning_content(
                                 {
@@ -2356,21 +2483,20 @@ def run_agent_turn(
                         )
                     if assistant_decision.user_content:
                         current_messages.append(
-                            {
-                                "role": "user",
-                                "content": assistant_decision.user_content,
-                            }
+                            runtime_feedback_message(assistant_decision.user_content, kind=assistant_decision.feedback_kind)
                         )
                     continue
 
                 if assistant_decision.kind == "retry":
-                    if assistant_decision.user_content:
-                        current_messages.append(
-                            {
-                                "role": "user",
-                                "content": assistant_decision.user_content,
-                            }
-                        )
+                    if assistant_decision.runtime_event_category is not None:
+                        emit_runtime_event(category=assistant_decision.runtime_event_category,
+                            message=assistant_decision.assistant_content or "正在恢复本次不完整的输出。")
+                    current_messages.extend(_assistant_retry_messages(
+                        content=next_step.content,
+                        reasoning_content=next_step.reasoningContent,
+                        user_content=assistant_decision.user_content,
+                        feedback_kind=assistant_decision.feedback_kind,
+                    ))
                     continue
 
                 if assistant_decision.kind == "fallback":
@@ -2407,14 +2533,13 @@ def run_agent_turn(
                                 )
                             )
                             current_messages.append(
-                                {
-                                    "role": "user",
-                                    "content": build_widening_transition_nudge(
+                                runtime_message(
+                                    build_widening_transition_nudge(
                                         turn_state.latest_tool_result_summary,
                                         widening_reason=turn_state.widening_trigger_reason,
                                         widening_evidence_summary=turn_state.widening_trigger_evidence,
-                                    ),
-                                }
+                                    ), kind="feedback",
+                                )
                             )
                             continue
                     if assistant_decision.stop_reason:
@@ -2446,6 +2571,43 @@ def run_agent_turn(
                         )
                     return current_messages
 
+                if (assistant_decision.kind == "final" and not native_submission_reminded
+                    and not runtime.get("_directPrimarySubmission")
+                    and runtime.get("runtimeOrchestration") == "primary"
+                    and runtime.get("_runtimeNodeId") == "primary"
+                    and tools.find("submit_candidate") is not None):
+                    # Text is not a candidate capability. Allow one protocol
+                    # correction within the same turn/step/token/deadline limits;
+                    # no side effect is replayed or accepted by this reminder.
+                    native_submission_reminded = True
+                    current_messages.append(_with_reasoning_content(
+                        {"role": "assistant", "content": next_step.content}, next_step.reasoningContent))
+                    notice = ("Your text did not submit the candidate. Use the API native function-call channel for submit_candidate "
+                              "with a summary argument; do not write XML, Markdown, a JSON example or a tool name in assistant text. "
+                              "If the changes are ready, call submit_candidate "
+                              "to request the registered checks and controlled integration. If blocked, state the blocker "
+                              "or use an available input tool; do not claim delivery. This is the only submission-protocol "
+                              "reminder and uses the existing budget. No candidate has been accepted or integrated.")
+                    current_messages.append(runtime_message(notice))
+                    record_worker_audit("native_submission_reminder", step=step, content=notice,
+                                        grants_authority=False, maximum_per_activation=1)
+                    continue
+
+                if assistant_decision.kind == "final" and callable(runtime.get("_agentBoundary")):
+                    proposed = [*current_messages, _with_reasoning_content(
+                        {"role": "assistant", "content": assistant_decision.assistant_content or next_step.content}, next_step.reasoningContent)]
+                    boundary = runtime["_agentBoundary"](proposed, context_manager=context_manager, final=True)
+                    if boundary["consumed"]:
+                        current_messages = proposed
+                        continue
+                    if boundary.get("waiting"):
+                        current_messages = proposed
+                        turn_state.set_stop_reason("waiting_children")
+                        return current_messages
+                if assistant_decision.kind == "final" and callable(runtime.get("_userBoundary")):
+                    boundary = runtime["_userBoundary"](current_messages, context_manager=context_manager, final=True)
+                    if boundary["consumed"]:
+                        continue
                 if assistant_decision.stop_reason:
                     turn_state.set_stop_reason(assistant_decision.stop_reason)
                     emit_runtime_event(
@@ -2464,13 +2626,10 @@ def run_agent_turn(
                 if assistant_decision.assistant_content:
                     turn_state.set_progress_summary("assistant finalized the turn")
                     if on_assistant_message:
-                        on_assistant_message(assistant_decision.assistant_content)
+                        on_assistant_message(assistant_decision.assistant_content, public=True)
                     current_messages.append(
                         _with_reasoning_content(
-                            {
-                                "role": "assistant",
-                                "content": assistant_decision.assistant_content,
-                            },
+                            _final_answer_message(assistant_decision.assistant_content, runtime),
                             next_step.reasoningContent,
                         )
                     )
@@ -2495,7 +2654,7 @@ def run_agent_turn(
                 if role == "assistant_progress":
                     turn_state.set_progress_summary(next_step.content)
                     if on_progress_message:
-                        on_progress_message(next_step.content)
+                        on_progress_message(next_step.content, public=True)
                     current_messages.append(
                         _with_reasoning_content(
                             {"role": role, "content": next_step.content},
@@ -2503,18 +2662,16 @@ def run_agent_turn(
                         )
                     )
                     current_messages.append(
-                        {
-                            "role": "user",
-                            "content": NUDGE_CONTINUE,
-                        }
+                        runtime_feedback_message(NUDGE_CONTINUE, kind="continuation")
                     )
                 else:
                     turn_state.set_progress_summary(next_step.content)
                     if on_assistant_message:
-                        on_assistant_message(next_step.content)
+                        on_assistant_message(next_step.content, public=True)
                     current_messages.append(
                         _with_reasoning_content(
-                            {"role": role, "content": next_step.content},
+                            (_final_answer_message(next_step.content, runtime)
+                             if next_step.contentKind == "final" else {"role": role, "content": next_step.content}),
                             next_step.reasoningContent,
                         )
                     )
@@ -2524,6 +2681,17 @@ def run_agent_turn(
                 and next_step.content
                 and next_step.contentKind != "progress"
             ):
+                if callable(runtime.get("_agentBoundary")):
+                    boundary = runtime["_agentBoundary"](current_messages, context_manager=context_manager, final=True)
+                    if boundary["consumed"]:
+                        continue
+                    if boundary.get("waiting"):
+                        turn_state.set_stop_reason("waiting_children")
+                        return current_messages
+                if callable(runtime.get("_userBoundary")):
+                    boundary = runtime["_userBoundary"](current_messages, context_manager=context_manager, final=True)
+                    if boundary["consumed"]:
+                        continue
                 turn_state.set_stop_reason("done")
                 emit_runtime_event(
                     category="stop",
@@ -2541,16 +2709,37 @@ def run_agent_turn(
             # Classify calls into concurrent-safe (read-only) vs serial (writes/commands)
             calls = next_step.calls
             if active_paged_memory is not None:
+                active_paged_memory.context_utilization.begin_tool_batch(calls, tools)
                 for call in calls:
                     run_paged_memory_operation("record_tool_call", call)
             _results: list[tuple[dict, ToolResult]] = []
+            submission_name = next((call.get("toolName") for call in calls
+                                    if call.get("toolName") in {"submit_candidate", "submit_builder_candidate", "submit_consultation"}), None)
+            submission_batch = submission_name is not None
 
-            if len(calls) <= 1:
+            if submission_batch:
+                from minicode.candidate_submission import execute_submission_batch
+
+                def execute_ordered_call(call):
+                    if metrics_collector:
+                        metrics_collector.start_tool(call["toolName"])
+                    result = execute_call(
+                        call, tools, cwd, permissions, session, runtime, store, step,
+                        on_tool_start, on_tool_result, tool_scheduler, run_memory_preflight, observe_raw_tool_result,
+                        retry_guard=tool_retry_guard,
+                    )
+                    if metrics_collector:
+                        metrics_collector.end_tool(success=result.ok, error=result.output if not result.ok else "")
+                    return result
+
+                _results = execute_submission_batch(calls, tools, execute_ordered_call, submission_name=submission_name,
+                    on_event=publish_turn_event, step=step, recover_input=recover_submission_input)
+            elif len(calls) <= 1:
                 # Single call — no benefit from concurrency, run directly
                 call = calls[0]
                 if metrics_collector:
                     metrics_collector.start_tool(call["toolName"])
-                result = _execute_single_tool(
+                result = execute_call(
                     call,
                     tools,
                     cwd,
@@ -2564,6 +2753,7 @@ def run_agent_turn(
                     tool_scheduler,
                     run_memory_preflight,
                     observe_raw_tool_result,
+                    retry_guard=tool_retry_guard,
                 )
                 if metrics_collector:
                     metrics_collector.end_tool(
@@ -2584,7 +2774,7 @@ def run_agent_turn(
                     max_workers = tool_scheduler.get_recommended_max_workers(
                         concurrent_calls,
                         error_rate=turn_state.tool_error_count / max(step, 1),
-                        avg_latency=step * 2.0,
+                        avg_latency=telemetry.average("tool"),
                         recent_failures=turn_state.tool_error_count,
                     )
                     # Apply cybernetic concurrency cap if FeedbackController reduced parallelism
@@ -2605,7 +2795,8 @@ def run_agent_turn(
                     ) as pool:
                         future_to_call = {
                             pool.submit(
-                                _execute_single_tool,
+                                copy_context().run,
+                                execute_call,
                                 call,
                                 tools,
                                 cwd,
@@ -2614,11 +2805,15 @@ def run_agent_turn(
                                 runtime,
                                 None,
                                 step,
-                                None,
+                                (lambda name, value, call_id=call["id"]: publish_turn_event(
+                                    TurnEvent.tool_started(step=step, tool_name=name,
+                                                           tool_input=value, tool_call_id=call_id)
+                                )) if live_concurrent_events else None,
                                 None,
                                 tool_scheduler,
                                 run_memory_preflight,
                                 observe_raw_tool_result,
+                                retry_guard=tool_retry_guard,
                                 # No UI callbacks during concurrent phase
                             ): call
                             for call in concurrent_calls
@@ -2633,13 +2828,29 @@ def run_agent_turn(
                                     output=f"Concurrent execution error: {exc}",
                                 )
                             _results.append((call, result))
+                            if live_concurrent_events:
+                                publish_turn_event(TurnEvent.tool_finished(
+                                    step=step, tool_name=call["toolName"], output=result.output,
+                                    is_error=not result.ok, tool_call_id=call["id"],
+                                ))
 
                 # Phase 2: Run serial tools sequentially (in original order)
                 if serial_calls:
+                    serial_blocked = any(result.timedOut or result.ambiguousSideEffect or result.awaitUser
+                                         or result.runtimeYield or result.runtimeStopReason for _, result in _results)
                     for call in serial_calls:
+                        if serial_blocked:
+                            result = ToolResult(ok=False, inputRejected=True, output=(
+                                "NotExecuted: an earlier call in this batch timed out, has unresolved effects, "
+                                "or ended execution; inspect its receipt before proceeding."))
+                            _results.append((call, result))
+                            publish_turn_event(TurnEvent.tool_rejected(step=step, tool_name=call["toolName"],
+                                tool_input=call.get("input"), output=result.output,
+                                tool_call_id=call["id"], reason="prior_call_incomplete"))
+                            continue
                         if metrics_collector:
                             metrics_collector.start_tool(call["toolName"])
-                        result = _execute_single_tool(
+                        result = execute_call(
                             call,
                             tools,
                             cwd,
@@ -2653,6 +2864,7 @@ def run_agent_turn(
                             tool_scheduler,
                             run_memory_preflight,
                             observe_raw_tool_result,
+                            retry_guard=tool_retry_guard,
                         )
                         if metrics_collector:
                             metrics_collector.end_tool(
@@ -2660,14 +2872,17 @@ def run_agent_turn(
                                 error=result.output if not result.ok else "",
                             )
                         _results.append((call, result))
-                        # If a serial tool awaits user, return immediately
-                        if result.awaitUser:
-                            # Still need to process remaining results for messages
-                            break
+                        # A serial wait/yield/terminal result ends this batch.
+                        if (result.awaitUser or result.runtimeYield or result.runtimeStopReason
+                                or result.timedOut or result.ambiguousSideEffect):
+                            serial_blocked = True
 
             # Process all results and build messages (preserve original call order)
             call_order = {call["id"]: idx for idx, call in enumerate(calls)}
             _results.sort(key=lambda pair: call_order.get(pair[0]["id"], 999))
+            if tool_discovery is not None:
+                tool_discovery.require_schemas(call["toolName"] for call, result in _results
+                                               if result.inputSchemaRequired or result.inputValidationFailed)
 
             # Preserve the provider's parallel tool-call shape: all assistant
             # tool calls belong to one assistant turn and must precede every
@@ -2675,19 +2890,10 @@ def run_agent_turn(
             # such as DeepSeek and also lets the Anthropic adapter group the
             # tool_use blocks into a single assistant message.
             for call, _ in _results:
-                current_messages.append(
-                    _with_reasoning_content(
-                        {
-                            "role": "assistant_tool_call",
-                            "toolUseId": call["id"],
-                            "toolName": call["toolName"],
-                            "input": call["input"],
-                        },
-                        next_step.reasoningContent,
-                    )
-                )
+                current_messages.append(_tool_call_message(call, next_step.reasoningContent))
 
             paged_step_success = True
+            submission_terminal = None
             for call, result in _results:
                 paged_result_output: str | None = None
                 with paged_tool_receipts_lock:
@@ -2709,6 +2915,7 @@ def run_agent_turn(
                             call=call,
                             output=result.output,
                             ok=result.ok,
+                            read_sha256=result.contextReadSha256 or "",
                         )
                         if captured_result is not None:
                             _, persisted_result_output = captured_result
@@ -2726,6 +2933,10 @@ def run_agent_turn(
                             ok=False,
                             output=str(error),
                             awaitUser=True,
+                            waitKind="input",
+                            waitReason=(
+                                "artifact persistence requires user intervention"
+                            ),
                         )
                         captured_error = run_paged_memory_operation(
                             "capture_tool_result",
@@ -2736,17 +2947,35 @@ def run_agent_turn(
                         )
                         if captured_error is not None:
                             _, paged_result_output = captured_error
+                # Paged memory may already have captured the original receipt
+                # before the executor added its repeated-input guidance. Keep
+                # that immutable source while delivering the current guidance.
+                if (paged_result_output is not None and result.inputCorrectionHint
+                        and not paged_result_output.endswith(result.inputCorrectionHint)):
+                    paged_result_output += "\n\n" + result.inputCorrectionHint
+                if (paged_result_output is not None and result.recoveryGuidance
+                        and result.recoveryGuidance not in paged_result_output):
+                    paged_result_output += "\n\n" + result.recoveryGuidance
                 if not result.ok:
                     paged_step_success = False
+                observe_request_tool_result(call, result, tools)
                 # Fire hooks and UI callbacks for concurrent calls (deferred)
                 tool_def = tools.find(call["toolName"])
                 is_concurrent = (
-                    tool_def and tool_def.is_concurrency_safe and len(calls) > 1
+                    tool_def
+                    and tool_def.is_read_only
+                    and tool_def.is_concurrency_safe
+                    and len(calls) > 1
+                    and not submission_batch
                 )
 
                 if is_concurrent:
                     # Deferred UI callbacks for concurrent tools
-                    if on_tool_start:
+                    if live_concurrent_events:
+                        if legacy_on_tool_start:
+                            legacy_on_tool_start(call["toolName"], call["input"])
+                    elif on_tool_start:
+                        tool_event_context.next_call_id = call["id"]
                         on_tool_start(call["toolName"], call["input"])
                     if store:
                         store.set_state(set_busy(call["toolName"]))
@@ -2770,13 +2999,47 @@ def run_agent_turn(
                 )
 
                 if is_concurrent:
-                    if on_tool_result:
+                    if live_concurrent_events:
+                        if legacy_on_tool_result:
+                            legacy_on_tool_result(call["toolName"], result.output, not result.ok)
+                    elif on_tool_result:
                         on_tool_result(call["toolName"], result.output, not result.ok)
 
                 tool_summary = f"{call['toolName']}: {result.output[:200]}"
-                turn_state.record_tool_result(result.ok, summary=tool_summary)
-                if call["toolName"] in _NETWORK_RESEARCH_TOOL_NAMES:
-                    network_tool_count += 1
+                unsafe_effect = bool(
+                    tool_def is not None
+                    and tool_def.effect is not ToolEffect.READ_ONLY
+                    and tool_def.replay_policy
+                    in {
+                        ReplayPolicy.NEVER_AUTO_RETRY,
+                        ReplayPolicy.VERIFY_BEFORE_RETRY,
+                    }
+                    and not result.awaitUser
+                    and not result.inputRejected
+                    and not result.inputValidationFailed
+                )
+                prior_write_count = turn_state.successful_write_observation_count
+                turn_state.record_tool_result(
+                    result.ok,
+                    summary=tool_summary,
+                    interrupted_before_execution=bool(result.inputRejected and
+                        (result.inputSchemaRequired or result.failureKind == "human_steering")),
+                    wait_kind=result.waitKind,
+                    timed_out=terminal_timeout(result),
+                    ambiguous_side_effect=result.ambiguousSideEffect,
+                    unsafe_effect=unsafe_effect,
+                    unsettled_tool=result.unsettledTool,
+                    write_revision=result.contextWriteRevision,
+                    workspace_write=bool(tool_def is not None
+                        and tool_def.effect is ToolEffect.WORKSPACE_WRITE
+                        and not (result.awaitUser or result.inputRejected or result.runtimeYield
+                                 or result.runtimeStopReason or result.backgroundTask
+                                 or result.verificationFailed or result.failureKind)),
+                )
+                execution_progress.observe(call, result, step=step,
+                    changed=turn_state.successful_write_observation_count > prior_write_count)
+                if (call["toolName"] in _NETWORK_RESEARCH_TOOL_NAMES
+                        and not result.inputRejected and not result.inputValidationFailed):
                     if call["toolName"] == "web_search" and result.ok:
                         relevance_match = re.search(
                             r"(?m)^RELEVANCE_FILTER:\s*(strong|moderate|passed)\s*$",
@@ -2810,17 +3073,23 @@ def run_agent_turn(
                     tool_name=call["toolName"],
                     result_output=result.output,
                     await_user=result.awaitUser,
+                    runtime_stop_reason=result.runtimeStopReason,
+                    result_ok=result.ok,
+                    ambiguous_side_effect=result.ambiguousSideEffect,
                 )
+                record_worker_audit("tool_decision", step=step, tool_call_id=call["id"],
+                    decision_kind=tool_decision.kind, stop_reason=tool_decision.stop_reason,
+                    assistant_content=tool_decision.assistant_content)
                 if tool_decision.progress_summary:
                     turn_state.set_progress_summary(tool_decision.progress_summary)
-                if not result.ok:
+                if not result.ok and (not result.inputRejected or result.failureKind in {"dependency_pending", "context_blocked"}):
                     # Use ErrorClassifier for intelligent error handling
-                    classified = ErrorClassifier.classify(
-                        result.output, tool_name=call["toolName"]
+                    classified = ErrorClassifier.classify_tool_result(
+                        result, tool_name=call["toolName"],
+                        replay_policy=tool_def.replay_policy if tool_def is not None else None,
                     )
-                    nudge = NudgeGenerator.generate(
-                        classified, retry_count=turn_state.tool_error_count
-                    )
+                    # Total failures in the turn are not retries of this operation.
+                    nudge = NudgeGenerator.generate(classified)
                     # Append nudge to tool result content for model context
                     result_output = (
                         (paged_result_output or result.output)
@@ -2831,7 +3100,7 @@ def run_agent_turn(
                 else:
                     result_output = paged_result_output or result.output
                     # Increased nudge frequency: provide steering even on success
-                    if getattr(tool_scheduler, "_force_nudge_frequency", False):
+                    if result.ok and getattr(tool_scheduler, "_force_nudge_frequency", False):
                         success_nudge = (
                             f"Tool '{call['toolName']}' succeeded. "
                             "The system is under stability pressure — prefer smaller, "
@@ -2845,11 +3114,11 @@ def run_agent_turn(
                         )
 
                 # Record conflicts between concurrent tools if both failed
-                if not result.ok and len(calls) > 1:
+                if not result.ok and not result.inputSchemaRequired and result.failureKind != "human_steering" and len(calls) > 1:
                     for other_call, other_result in _results:
                         if other_call["id"] == call["id"]:
                             continue
-                        if not other_result.ok:
+                        if not other_result.ok and not other_result.inputSchemaRequired and other_result.failureKind != "human_steering":
                             tool_scheduler.record_conflict(
                                 call["toolName"], other_call["toolName"]
                             )
@@ -2881,7 +3150,52 @@ def run_agent_turn(
                         "isError": not result.ok,
                     }
                 )
-                if tool_decision.kind == "await_user":
+                input_metadata = input_recovery.observe(call, result, step, tool=tools.find(call["toolName"]))
+                evidence_tool = tools.find(call["toolName"])
+                task_check_evidence.observe_tool(call, result,
+                    effect=evidence_tool.effect if evidence_tool else ToolEffect.PRIVILEGED)
+                if result.ok and call["toolName"] == "view_image" and result.imageInputIds:
+                    current_messages[-1]["imageInputIds"] = list(result.imageInputIds)
+                recovery_metadata = recovery_tracker.observe(call, result, step, registry=tools)
+                if recovery_metadata:
+                    current_messages[-1]["toolRecovery"] = deepcopy(recovery_metadata)
+                    record_worker_audit("tool_recovery", tool_call_id=call["id"], recovery=recovery_metadata)
+                    publish_turn_event(TurnEvent(kind="tool_recovery", step=step, tool_name=call["toolName"],
+                        tool_call_id=call["id"], tool_recovery=deepcopy(recovery_metadata)))
+                record_worker_audit("tool_input_recovery", tool_call_id=call["id"], **input_metadata)
+                if input_metadata["status"] in {"invalid", "schema_required"} or input_metadata["correctsCallIds"]:
+                    # Keep full cumulative metrics in the audit, not repeated in
+                    # every model message or ordinary successful browser event.
+                    feedback = {key: value for key, value in input_metadata.items() if key != "metrics"}
+                    current_messages[-1]["toolInput"] = feedback
+                    publish_turn_event(TurnEvent(kind="tool_input", step=step, tool_name=call["toolName"],
+                        tool_call_id=call["id"], tool_input_status=deepcopy(feedback)))
+                observe_request_tool_message(current_messages[-1])
+                if len(calls) > 1 and (terminal_timeout(result) or tool_decision.kind in {"await_user", "stop"}):
+                    # Retain every NotExecuted receipt before ending the turn;
+                    # no pending call disappears behind an earlier wait/error.
+                    if submission_terminal is None:
+                        submission_terminal = (result, tool_decision)
+                    continue
+                if terminal_timeout(result):
+                    turn_state.set_stop_reason("tool_timeout")
+                    timeout_message = result.output
+                    emit_runtime_event(
+                        category="stop",
+                        message=timeout_message,
+                        emit_progress=False,
+                        stop_reason="tool_timeout",
+                        evidence_summary=turn_state.latest_tool_result_summary,
+                    )
+                    current_messages.append(
+                        {"role": "assistant", "content": timeout_message}
+                    )
+                    if metrics_collector:
+                        metrics_collector.end_turn(total_tokens=0)
+                    if active_paged_memory is not None:
+                        run_paged_memory_operation("finalize_step", success=False)
+                    return current_messages
+                if tool_decision.kind in {"await_user", "stop"}:
                     if tool_decision.stop_reason:
                         turn_state.set_stop_reason(tool_decision.stop_reason)
                         emit_runtime_event(
@@ -2908,11 +3222,29 @@ def run_agent_turn(
             if active_paged_memory is not None:
                 run_paged_memory_operation("finalize_step", success=paged_step_success)
 
+            if submission_terminal is not None:
+                result, decision = submission_terminal
+                reason = "tool_timeout" if terminal_timeout(result) else decision.stop_reason
+                content = result.output if terminal_timeout(result) else decision.assistant_content or result.output
+                turn_state.set_stop_reason(reason)
+                emit_runtime_event(category="stop", message=content, emit_progress=False,
+                                   stop_reason=reason, evidence_summary=turn_state.latest_tool_result_summary)
+                current_messages.append({"role": "assistant", "content": content})
+                if metrics_collector:
+                    metrics_collector.end_turn(total_tokens=0)
+                return current_messages
+
+            if any(result.runtimeYield for _, result in _results):
+                # All executed tool receipts are now in the checkpoint. This
+                # internal suspension is not an approval or a user question.
+                turn_state.set_stop_reason("waiting_children")
+                return current_messages
+
             network_evidence_ready = (
                 stop_network_when_evidence_ready
                 and relevant_search_succeeded
                 and (
-                    search_headline_evidence_ready
+                    (search_headline_evidence_ready and tools.find("web_fetch") is None)
                     or (
                         strong_relevant_search_succeeded
                         and evidence_network_fetches >= 1
@@ -2920,25 +3252,15 @@ def run_agent_turn(
                     or successful_network_fetches >= 2
                 )
             )
-            network_limit_reached = network_tool_count >= network_tool_limit
-            if not network_guard_active and (
-                network_evidence_ready or network_limit_reached
-            ):
-                tools = tools.filtered_without_names(_NETWORK_RESEARCH_TOOL_NAMES)
-                replace_adapter_tools(model, tools)
-                replace_switcher_tools(tools)
+            network_limit_reached = network_budget.count >= network_tool_limit
+            if not network_guard_active and network_limit_reached:
                 network_guard_active = True
-                if network_evidence_ready:
-                    guard_message = (
-                        "已取得足够的相关网页证据；停止继续搜索，正在整理为中文回答。"
-                    )
-                    guard_reason = "enough relevant sources were collected"
-                else:
-                    guard_message = (
-                        f"联网检索已达到本次任务上限（{network_tool_limit} 次）；"
-                        "停止继续搜索，正在用现有可靠结果作答。"
-                    )
-                    guard_reason = "the per-turn network research limit was reached"
+                guard_message = (
+                    f"联网检索已达到本次任务上限（{network_tool_limit} 次）；"
+                    "停止继续搜索，正在用现有可靠结果作答。"
+                )
+                guard_reason = "the per-turn network research limit was reached"
+                network_budget.stop(guard_reason)
                 turn_state.set_progress_summary(guard_message)
                 emit_runtime_event(
                     category="guard",
@@ -2957,6 +3279,40 @@ def run_agent_turn(
                         ),
                     }
                 )
+            elif not network_guard_active and network_evidence_ready and not network_evidence_notified:
+                # Search relevance and HTTP success do not prove that a page
+                # answers the request. Advise synthesis; retain the remaining
+                # budget for stale pages, login walls and source verification.
+                network_evidence_notified = True
+                emit_runtime_event(
+                    category="guard",
+                    message="已取得相关网页证据；正在核对是否足以回答，必要时继续读取原文。",
+                    emit_progress=False,
+                )
+                current_messages.append({
+                    "role": "system",
+                    "content": (
+                        "NETWORK_RESEARCH_EVIDENCE. Related sources have been collected. "
+                        "If they answer the request, synthesize a dated, sourced answer now. "
+                        "Search snippets, stale pages and login walls are not verified current evidence. "
+                        "If important facts remain unverified, web_fetch remains available within the "
+                        "remaining turn budget. Do not claim a missing tool or disabled network access."
+                    ),
+                })
+            if (not network_guard_active and not network_search_guard_active
+                    and network_budget.search_limit < network_tool_limit
+                    and network_budget.search_limit_reached):
+                network_search_guard_active = True
+                current_messages.append({
+                    "role": "system",
+                    "content": (
+                        "NETWORK_RESEARCH_VERIFY. The search allocation has been used; "
+                        "do not call web_search again. web_fetch is still available: "
+                        "read the most relevant original source URLs to verify the search snippets, "
+                        "including their actual publication dates. If a page fails, try another collected source. "
+                        "The tools remain registered and network access has not been disabled."
+                    ),
+                })
 
             # 工具执行完成后的控制论反馈
             if enable_work_chain:
@@ -2968,7 +3324,7 @@ def run_agent_turn(
                                 context_manager.get_stats().usage_percentage / 100.0
                                 if context_manager
                                 else 0.0,
-                                step * 2.0 / 60.0,
+                                telemetry.average("model") / 60.0,
                             ),
                             "context_pressure_to_errors": (
                                 context_manager.get_stats().usage_percentage / 100.0
@@ -2988,6 +3344,7 @@ def run_agent_turn(
                         tool_error_count=turn_state.tool_error_count,
                         saw_tool_result=turn_state.saw_tool_result,
                         max_steps=turn_state.max_steps,
+                        progress_signal=execution_progress.signal(step=step, max_steps=turn_state.max_steps),
                     )
                     turn_state.max_steps = _apply_control_signal(
                         control_signal=step_summary.get("control_signal"),
@@ -3022,16 +3379,7 @@ def run_agent_turn(
 
                     # 进度控制：检测任务是否卡住或完成
                     if progress_controller:
-                        progress_signal = ProgressSignal(
-                            total_steps=turn_state.max_steps,
-                            completed_steps=step - turn_state.tool_error_count,
-                            failed_steps=turn_state.tool_error_count,
-                            tool_calls=step,
-                            tool_errors=turn_state.tool_error_count,
-                            output_changed=turn_state.saw_tool_result,
-                            elapsed_seconds=step * 2.0,
-                            max_steps=turn_state.max_steps,
-                        )
+                        progress_signal = execution_progress.signal(step=step, max_steps=turn_state.max_steps)
                         progress_decision = progress_controller.decide(progress_signal)
                         if progress_decision.action in (
                             ProgressAction.STOP,
@@ -3074,6 +3422,8 @@ def run_agent_turn(
         return current_messages
     finally:
         paged_memory_finalization_error: Exception | None = None
+        if turn_state.stop_reason == "canceled":
+            skill_runtime.lifecycle.release("canceled")
         if active_paged_memory is not None:
             try:
                 if (
@@ -3082,11 +3432,7 @@ def run_agent_turn(
                 ):
                     run_paged_memory_operation(
                         "finalize_step",
-                        success=(
-                            turn_state.tool_error_count == 0
-                            and str(turn_state.stop_reason or "")
-                            not in {"blocked", "error", "max_steps"}
-                        ),
+                        success=turn_state.final_task_state is TaskState.COMPLETED,
                     )
             except Exception as error:
                 logger.error(
@@ -3096,6 +3442,7 @@ def run_agent_turn(
                 if active_paged_memory.controls_context:
                     paged_memory_finalization_error = error
             finally:
+                active_paged_memory.context_borrowing.stop()
                 if owns_paged_memory_runtime:
                     active_paged_memory.close()
         for adapter, original_tools in reversed(adapter_tool_restorations):
@@ -3117,6 +3464,12 @@ def run_agent_turn(
                 step=turn_state.step or None,
                 messages=current_messages,
                 stop_reason=str(turn_state.stop_reason or ""),
+                tool_error_count=turn_state.tool_error_count,
+                wait_kind=turn_state.wait_kind,
+                timed_out=turn_state.timed_out,
+                ambiguous_side_effect=turn_state.ambiguous_side_effect,
+                unsafe_effect_observed=turn_state.unsafe_effect_observed,
+                unsettled_tool=turn_state.unsettled_tool,
             )
         )
         # Coda: finalize metrics, work-chain bookkeeping, and control summaries.
@@ -3185,7 +3538,7 @@ def run_agent_turn(
             )
 
             # 任务后自省：提取经验教训
-            if orch and prelude.task:
+            if orch and prelude.task and not coordinator_owns_memory:
                 try:
                     execution_trace: list[dict[str, Any]] = [
                         {"type": "tool_call", "count": turn_state.step},
@@ -3210,7 +3563,7 @@ def run_agent_turn(
                     )
                 except Exception:
                     pass
-            elif reflection_engine and prelude.task:
+            elif reflection_engine and prelude.task and not coordinator_owns_memory:
                 try:
                     _trace: list[dict[str, Any]] = [
                         {"type": "tool_call", "count": turn_state.step},
@@ -3241,42 +3594,22 @@ def run_agent_turn(
                 except Exception:
                     pass
 
-            # 记忆质量反馈：任务成功→注入的记忆 usage_count+1
-            if memory_injector and hasattr(memory_injector, "_cached_result"):
+            # Persist outcome feedback for the actual injected memories.
+            if memory_injector and hasattr(memory_injector, "_cached_result") and not coordinator_owns_memory:
                 try:
-                    from minicode.memory import MemoryScope
-
-                    for mem in memory_injector._cached_result:
-                        if not hasattr(mem, "id"):
-                            continue
-                        try:
-                            _mgr = memory_mgr
-                        except NameError:
-                            continue
-                        for scope_name in ["project", "local", "user"]:
-                            try:
-                                scope = MemoryScope(scope_name)
-                                if scope in _mgr.memories:
-                                    mem_store = _mgr.memories[scope]
-                                    if hasattr(mem_store, "_id_index"):
-                                        entry = mem_store._id_index.get(mem.id)
-                                        if entry:
-                                            entry.usage_count += (
-                                                2
-                                                if turn_state.tool_error_count == 0
-                                                else -1
-                                            )
-                                            entry.last_accessed = time.time()
-                                            break
-                                        entry.last_accessed = time.time()
-                                        break
-                            except (ValueError, KeyError):
-                                continue
-                except Exception:
-                    pass
+                    injected_ids = [
+                        mem.id for mem in memory_injector._cached_result
+                        if getattr(mem, "id", "")
+                    ]
+                    if memory_mgr and injected_ids:
+                        memory_mgr.record_access(
+                            injected_ids, usage_delta=2 if coda_summary.success else -1,
+                        )
+                except Exception as exc:
+                    logger.warning("Memory outcome feedback persistence failed: %s", exc)
 
             # 路由反馈学习：记录任务结果以优化未来路由
-            if smart_router and prelude.task:
+            if smart_router and prelude.task and current_usage_observation()["cost"] is not None:
                 try:
                     outcome = TaskOutcome(
                         task_text=(
@@ -3287,9 +3620,9 @@ def run_agent_turn(
                         assigned_model=(
                             model.model_id if hasattr(model, "model_id") else "unknown"
                         ),
-                        success=(turn_state.tool_error_count == 0),
-                        duration_ms=turn_state.step * 2000.0,
-                        cost_usd=0.0,
+                        success=coda_summary.success,
+                        duration_ms=telemetry.elapsed_seconds * 1000.0,
+                        cost_usd=current_usage_observation()["cost"],
                         tool_errors=turn_state.tool_error_count,
                         model_switches=model_switcher.switch_count()
                         if model_switcher
@@ -3303,7 +3636,7 @@ def run_agent_turn(
         if enable_work_chain and feedback_controller and prelude.task:
             pattern_id = f"{prelude.task_metadata.get('intent_type', 'unknown')}_{prelude.task.id}"
             feedback_controller.record_pattern_effectiveness(
-                pattern_id, turn_state.tool_error_count == 0
+                pattern_id, coda_summary.success
             )
 
         # 稳定性监测：记录快照
@@ -3313,7 +3646,7 @@ def run_agent_turn(
             snapshot = MetricSnapshot(
                 timestamp=time.time(),
                 error_rate=float(turn_state.tool_error_count) / max(turn_state.step, 1),
-                avg_latency=step * 2.0,  # 简化估算
+                avg_latency=telemetry.average("model"),
                 context_usage=context_manager.get_stats().usage_percentage
                 if context_manager
                 else 0.0,
@@ -3406,6 +3739,7 @@ def run_agent_turn(
             if control_signal.confidence > 0.6:
                 if (
                     control_signal.limit_max_steps
+                    and max_steps is not None
                     and control_signal.limit_max_steps < max_steps
                 ):
                     logger.info(
@@ -3566,31 +3900,34 @@ def run_agent_turn(
                     pass  # 调参失败不能拖垮主循环
 
         # 总监督层: 汇总局部控制器输出为统一风险视图
-        if cybernetic_supervisor:
-            supervisor_snapshots = []
-            if context_cybernetics:
-                supervisor_snapshots.append(
-                    cybernetic_supervisor.snapshot_from_context(
-                        context_cybernetics.get_stats()
+        try:
+            if cybernetic_supervisor:
+                supervisor_snapshots = []
+                if context_cybernetics:
+                    supervisor_snapshots.append(
+                        cybernetic_supervisor.snapshot_from_context(
+                            context_cybernetics.get_stats()
+                        )
                     )
-                )
-            if cost_control:
-                supervisor_snapshots.append(
-                    cybernetic_supervisor.snapshot_from_cost(cost_control.get_stats())
-                )
-            if tool_scheduler.last_decision:
-                supervisor_snapshots.append(
-                    cybernetic_supervisor.snapshot_from_tool_decision(
-                        tool_scheduler.last_decision.to_dict()
+                if cost_control:
+                    supervisor_snapshots.append(
+                        cybernetic_supervisor.snapshot_from_cost(cost_control.get_stats())
                     )
+                if tool_scheduler.last_decision:
+                    supervisor_snapshots.append(
+                        cybernetic_supervisor.snapshot_from_tool_decision(
+                            tool_scheduler.last_decision.to_dict()
+                        )
+                    )
+                supervisor_report = cybernetic_supervisor.report(supervisor_snapshots)
+                save_supervisor_report(supervisor_report)
+                logger.info(
+                    "CyberneticSupervisor: health=%.2f risk=%s actions=%s",
+                    supervisor_report.overall_health,
+                    supervisor_report.risk_level.value,
+                    "; ".join(supervisor_report.recommended_actions[:3]),
                 )
-            supervisor_report = cybernetic_supervisor.report(supervisor_snapshots)
-            save_supervisor_report(supervisor_report)
-            logger.info(
-                "CyberneticSupervisor: health=%.2f risk=%s actions=%s",
-                supervisor_report.overall_health,
-                supervisor_report.risk_level.value,
-                "; ".join(supervisor_report.recommended_actions[:3]),
-            )
+        except Exception as error:  # Optional diagnostics cannot replace the turn outcome.
+            logger.warning("Could not save supervisor diagnostics (%s)", type(error).__name__)
         if paged_memory_finalization_error is not None:
             raise paged_memory_finalization_error

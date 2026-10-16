@@ -5,6 +5,14 @@ import io
 import json
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
+from minicode.tools._validation import validate_fields
+
+
+def _delimiter(input_data: dict) -> str:
+    delimiter = input_data.get("delimiter", ",")
+    if len(delimiter) != 1 or delimiter in "\r\n\0\"":
+        raise ValueError("delimiter must be one character other than a newline, NUL or quote")
+    return delimiter
 
 
 # ---------------------------------------------------------------------------
@@ -12,12 +20,13 @@ from minicode.tooling import ToolDefinition, ToolContext, ToolResult
 # ---------------------------------------------------------------------------
 
 def _validate_csv_parse(input_data: dict) -> dict:
+    validate_fields(input_data, required=("content",), content=str, delimiter=str, has_header=bool)
     content = input_data.get("content", "")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("content is required and must be a non-empty string")
     return {
-        "content": content.strip(),
-        "delimiter": input_data.get("delimiter", ","),
+        "content": content,
+        "delimiter": _delimiter(input_data),
         "has_header": input_data.get("has_header", True),
     }
 
@@ -28,7 +37,7 @@ def _run_csv_parse(input_data: dict, context: ToolContext) -> ToolResult:
     has_header = input_data.get("has_header", True)
     
     try:
-        reader = csv.reader(io.StringIO(content), delimiter=delimiter)
+        reader = csv.reader(io.StringIO(content), delimiter=delimiter, strict=True)
         rows = list(reader)
         
         if not rows:
@@ -37,6 +46,10 @@ def _run_csv_parse(input_data: dict, context: ToolContext) -> ToolResult:
         if has_header:
             headers = rows[0]
             data = rows[1:]
+            if len(set(headers)) != len(headers):
+                raise ValueError("Duplicate CSV headers would discard column values")
+            if any(len(row) != len(headers) for row in data):
+                raise ValueError("Every CSV row must have the same number of fields as the header")
             # Convert to list of dicts
             result = [dict(zip(headers, row)) for row in data]
             output = json.dumps(result, indent=2, ensure_ascii=False)
@@ -45,7 +58,7 @@ def _run_csv_parse(input_data: dict, context: ToolContext) -> ToolResult:
         
         return ToolResult(ok=True, output=output)
     except Exception as e:
-        return ToolResult(ok=False, output=f"CSV parse error: {e}")
+        return ToolResult(ok=False, output=f"CSV parse error: {e}", failureKind="invalid_input")
 
 
 csv_parse_tool = ToolDefinition(
@@ -53,6 +66,7 @@ csv_parse_tool = ToolDefinition(
     description="Parse CSV data to JSON. Supports custom delimiter.",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "content": {"type": "string", "description": "CSV content"},
             "delimiter": {"type": "string", "description": "Delimiter (default: ,)"},
@@ -70,12 +84,13 @@ csv_parse_tool = ToolDefinition(
 # ---------------------------------------------------------------------------
 
 def _validate_csv_create(input_data: dict) -> dict:
+    validate_fields(input_data, required=("data",), data=str, delimiter=str, include_header=bool)
     data = input_data.get("data", "")
     if not isinstance(data, str) or not data.strip():
         raise ValueError("data is required (JSON array)")
     return {
         "data": data.strip(),
-        "delimiter": input_data.get("delimiter", ","),
+        "delimiter": _delimiter(input_data),
         "include_header": input_data.get("include_header", True),
     }
 
@@ -87,6 +102,8 @@ def _run_csv_create(input_data: dict, context: ToolContext) -> ToolResult:
     
     try:
         data = json.loads(data_str)
+        if not isinstance(data, list):
+            raise ValueError("Data must be a JSON array of objects or arrays")
         
         if not data:
             return ToolResult(ok=True, output="")
@@ -96,17 +113,16 @@ def _run_csv_create(input_data: dict, context: ToolContext) -> ToolResult:
         if isinstance(data, list) and len(data) > 0:
             if isinstance(data[0], dict):
                 # List of dicts
+                if any(not isinstance(row, dict) or set(row) - set(data[0]) for row in data):
+                    raise ValueError("Object rows must not introduce fields absent from the first row")
+                writer = csv.DictWriter(output, fieldnames=list(data[0].keys()), delimiter=delimiter)
                 if include_header:
-                    writer = csv.DictWriter(output, fieldnames=data[0].keys(), delimiter=delimiter)
                     writer.writeheader()
-                    writer.writerows(data)
-                else:
-                    writer = csv.writer(output, delimiter=delimiter)
-                    writer.writerow(list(data[0].keys()))
-                    for row in data:
-                        writer.writerow(row.values())
+                writer.writerows(data)
             else:
                 # List of lists
+                if any(not isinstance(row, list) for row in data):
+                    raise ValueError("All rows must be arrays or all rows must be objects")
                 writer = csv.writer(output, delimiter=delimiter)
                 writer.writerows(data)
         else:
@@ -114,7 +130,7 @@ def _run_csv_create(input_data: dict, context: ToolContext) -> ToolResult:
         
         return ToolResult(ok=True, output=output.getvalue())
     except Exception as e:
-        return ToolResult(ok=False, output=f"CSV create error: {e}")
+        return ToolResult(ok=False, output=f"CSV create error: {e}", failureKind="invalid_input")
 
 
 csv_create_tool = ToolDefinition(
@@ -122,6 +138,7 @@ csv_create_tool = ToolDefinition(
     description="Create CSV from JSON data.",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "data": {"type": "string", "description": "JSON array data"},
             "delimiter": {"type": "string", "description": "Delimiter (default: ,)"},

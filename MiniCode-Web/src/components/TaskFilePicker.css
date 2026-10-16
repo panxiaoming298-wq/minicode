@@ -1,0 +1,12 @@
+.task-file-picker { margin: 8px 0; border: 1px solid var(--line); border-radius: var(--radius-control); padding: 8px 12px; font-size: 12px; color: var(--text-soft); max-height: 42vh; overflow: auto; overflow-wrap: anywhere; }
+.task-file-picker summary { cursor: pointer; min-height: 24px; }
+.task-file-picker summary span { color: var(--muted); margin-left: 8px; }
+.task-file-picker p { margin: 8px 0; line-height: 1.6; }
+.task-file-picker label { display: block; }
+.task-file-picker input:not([type="checkbox"]) { display: block; width: 100%; margin: 6px 0; padding: 8px; background: var(--panel); border: 1px solid var(--line); color: var(--text); border-radius: var(--radius-control); }
+.task-file-actions { display: flex; gap: 8px; }
+.task-file-actions button { padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius-control); }
+.task-file-picker button:disabled { opacity: .5; cursor: not-allowed; }
+.task-file-picker pre { white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel); padding: 8px; }
+.task-file-picker .task-file-trust { display: flex; align-items: flex-start; gap: 8px; padding: 8px 0; }
+.task-file-picker [role="alert"] { color: var(--danger); }

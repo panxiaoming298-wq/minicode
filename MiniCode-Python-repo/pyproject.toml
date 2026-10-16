@@ -8,26 +8,26 @@ version = "0.1.0"
 description = "A lightweight terminal coding assistant for local development workflows."
 readme = "README.md"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["PyYAML>=6.0.2,<7.0.0"]
 
 [project.optional-dependencies]
 dev = [
+    "playwright>=1.51,<2.0",
     "pytest>=8.0.0",
     "hypothesis>=6.0.0",
     "httpx2>=2.0.0,<3.0.0",
     "setuptools>=68",
 ]
 web = [
+    "Pillow>=11.0.0,<13.0.0",
+    "playwright>=1.51,<2.0",
+    "tokenizers>=0.21.0,<1.0.0",
     "fastapi>=0.116.0,<1.0.0",
     "httpx>=0.28.0,<1.0.0",
     "uvicorn[standard]>=0.35.0,<1.0.0",
 ]
 memory = [
-    "boto3>=1.40.0,<2.0.0",
     "cryptography>=45.0.0,<47.0.0",
-    "fastembed==0.8.0",
-    "psycopg[binary]>=3.2.0,<4.0.0",
-    "pymilvus>=2.6.0,<2.7.0",
     "tiktoken>=0.11.0,<1.0.0",
 ]
 
@@ -42,10 +42,13 @@ minicode-memory = "minicode.paged_memory.admin:main"
 
 [tool.setuptools.package-data]
 "minicode.paged_memory" = ["sql/*.sql"]
+"Package.AgentRuntime" = ["Config/Tokenizers/*.json", "Config/Tokenizers/*.md"]
 
 [tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
 pythonpath = ["."]
-testpaths = ["tests"]
+testpaths = ["tests", "Package/AgentRuntime/Test"]
+python_files = ["test_*.py", "*.Test.py"]
 
 [tool.setuptools]
 package-dir = {"" = "."}

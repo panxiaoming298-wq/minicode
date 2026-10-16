@@ -3,31 +3,27 @@ from __future__ import annotations
 from minicode.file_review import apply_reviewed_file_change, load_existing_file
 from minicode.tooling import ToolDefinition, ToolResult
 from minicode.workspace import resolve_tool_path
+from minicode.tools._validation import normalize_aliases, validate_contract
 
 
 def _validate(input_data: dict) -> dict:
-    path = input_data.get("path")
-    replacements = input_data.get("replacements")
-    patch = input_data.get("patch")
-    if not isinstance(path, str) or not path:
-        raise ValueError("path is required")
-    if replacements is None:
-        if not isinstance(patch, str) or not patch:
-            raise ValueError("patch must be a string")
-        replacements = [{"search": patch, "replace": ""}]
-    if not isinstance(replacements, list) or not replacements:
-        raise ValueError("replacements must be a non-empty list")
+    input_data = normalize_aliases(input_data, {})
+    if "patch" in input_data:
+        if "replacements" in input_data:
+            raise ValueError("$.patch: use replacements or the legacy patch shorthand, not both")
+        patch = input_data.pop("patch")
+        input_data["replacements"] = [{"search": patch, "replace": ""}]
+    if isinstance(input_data.get("replacements"), list):
+        input_data["replacements"] = [normalize_aliases(item, {"replaceAll": "replace_all"}, path=f"$.replacements[{index}]")
+            for index, item in enumerate(input_data["replacements"])]
+    validate_contract(input_data, PATCH_FILE_INPUT)
+    path = input_data["path"]
+    replacements = input_data["replacements"]
     normalized = []
     for replacement in replacements:
-        if not isinstance(replacement, dict):
-            raise ValueError("replacement entries must be objects")
         search = replacement.get("search")
         replace = replacement.get("replace")
-        replace_all = bool(replacement.get("replaceAll", replacement.get("replace_all", False)))
-        if not isinstance(search, str) or not search:
-            raise ValueError("replacement search must be a non-empty string")
-        if not isinstance(replace, str):
-            raise ValueError("replacement replace must be a string")
+        replace_all = replacement.get("replace_all", False)
         # Normalize \r\n → \n so search/replace strings always match
         # file content (read_text uses universal newlines).
         search = search.replace("\r\n", "\n")
@@ -56,31 +52,39 @@ def _run(input_data: dict, context):
     return ToolResult(
         ok=True,
         output=f"Patched {input_data['path']} with {len(applied)} replacement(s): {', '.join(applied)}",
+        contextWriteRevision=result.contextWriteRevision,
     )
 
 
-patch_file_tool = ToolDefinition(
-    name="patch_file",
-    description="Apply multiple exact-text replacements to one file in a single operation.",
-    input_schema={
+PATCH_FILE_INPUT = {
         "type": "object",
+        "additionalProperties": False,
         "properties": {
-            "path": {"type": "string"},
+            "path": {"type": "string", "minLength": 1},
             "replacements": {
                 "type": "array",
+                "minItems": 1,
                 "items": {
                     "type": "object",
+                    "additionalProperties": False,
                     "properties": {
-                        "search": {"type": "string"},
+                        "search": {"type": "string", "minLength": 1},
                         "replace": {"type": "string"},
-                        "replaceAll": {"type": "boolean"},
+                        "replace_all": {"type": "boolean", "default": False},
                     },
                     "required": ["search", "replace"],
                 },
             },
         },
         "required": ["path", "replacements"],
-    },
+    }
+
+
+patch_file_tool = ToolDefinition(
+    name="patch_file",
+    description=("Apply multiple exact-text replacements to one file. Each replacements item has search, replace "
+                 "and optional replace_all (JSON boolean). Legacy replaceAll is accepted; conflicting aliases are rejected."),
+    input_schema=PATCH_FILE_INPUT,
     validator=_validate,
     run=_run,
 )

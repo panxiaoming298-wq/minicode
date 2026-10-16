@@ -4,12 +4,10 @@ Inspired by Learn Claude Code best practices:
 - Distinguish between session-local planning and persistent task coordination
 - Separate task definition (what) from execution slot (who is running / progress)
 - Background task slot management with timed scheduling
-- Worktree execution isolation for risky operations
 
 Provides:
 - TaskGraph: DAG of tasks with dependencies
 - TaskSlot: Named execution slot with state tracking
-- WorktreeIsolator: Temporary worktree for risky operations
 """
 
 from __future__ import annotations
@@ -300,70 +298,6 @@ class TaskGraph:
                 result=s_data.get("result"),
             )
         return graph
-
-
-# ---------------------------------------------------------------------------
-# Worktree Isolator (for risky operations)
-# ---------------------------------------------------------------------------
-
-class WorktreeIsolator:
-    """Creates temporary git worktrees for risky task execution.
-
-    Provides isolation so that exploratory or destructive operations
-    don't affect the main working directory.
-    """
-
-    def __init__(self, base_path: Path, prefix: str = "isolated_task") -> None:
-        self.base_path = base_path
-        self.prefix = prefix
-        self.active_worktrees: list[Path] = []
-
-    def create_worktree(self, task_id: str) -> Path:
-        """Create a new worktree for the given task."""
-        import subprocess
-
-        worktree_path = self.base_path / f"{self.prefix}_{task_id}"
-        worktree_path.mkdir(parents=True, exist_ok=True)
-
-        # Create a new orphan branch for isolation
-        branch_name = f"{self.prefix}_{task_id}"
-        subprocess.run(
-            ["git", "worktree", "add", "-b", branch_name, str(worktree_path), "--detach"],
-            capture_output=True,
-            text=True,
-        )
-
-        self.active_worktrees.append(worktree_path)
-        return worktree_path
-
-    def cleanup_worktree(self, worktree_path: Path) -> None:
-        """Remove a worktree and its directory."""
-        import subprocess
-
-        try:
-            subprocess.run(
-                ["git", "worktree", "remove", "-f", str(worktree_path)],
-                capture_output=True,
-                text=True,
-            )
-        except Exception:
-            pass  # Best effort cleanup
-
-        # Remove directory if it still exists
-        if worktree_path.exists():
-            import shutil
-            try:
-                shutil.rmtree(worktree_path)
-            except Exception:
-                pass
-
-        if worktree_path in self.active_worktrees:
-            self.active_worktrees.remove(worktree_path)
-
-    def cleanup_all(self) -> None:
-        """Remove all active worktrees."""
-        for wt in list(self.active_worktrees):
-            self.cleanup_worktree(wt)
 
 
 # ---------------------------------------------------------------------------

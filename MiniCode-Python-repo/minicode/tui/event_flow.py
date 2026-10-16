@@ -189,7 +189,7 @@ def _handle_normal_mode_event(
     rerender: Callable[[], None],
     handle_input_fn: Callable[[TtyAppArgs, ScreenState, Callable[[], None], str | None], bool],
 ) -> None:
-    visible_commands = _get_visible_commands(state.input)
+    visible_commands = _get_visible_commands(state.input, args.cwd, state)
 
     if isinstance(event, KeyEvent):
         if _handle_normal_mode_key(args, state, event, visible_commands, rerender, handle_input_fn):
@@ -216,6 +216,12 @@ def _handle_normal_mode_key(
 
     if event.name == "tab" and visible_commands:
         _handle_normal_mode_tab(state, visible_commands, rerender)
+        return True
+
+    if event.name == "escape" and visible_commands:
+        state.slash_dismissed_input = state.input
+        state.skill_completion_workspace = None
+        rerender()
         return True
 
     if _handle_normal_mode_navigation(state, event, rerender):
@@ -266,7 +272,8 @@ def _handle_normal_mode_return(
     if visible_commands and 0 <= state.selected_slash_index < len(visible_commands):
         selected = visible_commands[state.selected_slash_index]
         usage = getattr(selected, "usage", str(selected))
-        state.input = usage
+        name = getattr(selected, "name", "")
+        state.input = "/skill " if name == "/skill" else name + " " if name.startswith("/skill ") else usage
         state.cursor_offset = len(state.input)
         state.selected_slash_index = 0
         rerender()
@@ -291,7 +298,8 @@ def _handle_normal_mode_tab(
 ) -> None:
     selected = visible_commands[min(state.selected_slash_index, len(visible_commands) - 1)]
     usage = getattr(selected, "usage", str(selected))
-    state.input = usage + " "
+    name = getattr(selected, "name", "")
+    state.input = "/skill " if name == "/skill" else name + " " if name.startswith("/skill ") else usage + " "
     state.cursor_offset = len(state.input)
     state.selected_slash_index = 0
     rerender()

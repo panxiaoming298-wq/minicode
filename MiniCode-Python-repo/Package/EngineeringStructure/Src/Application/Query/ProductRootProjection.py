@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -67,6 +69,29 @@ def _stable_id(prefix: str, parts: list[str] | tuple[str, ...]) -> str:
     joined = "/".join(parts)
     digest = hashlib.sha1(joined.encode("utf-8")).hexdigest()[:12]
     return f"{prefix}{digest}"
+
+
+def filesystem_root(root: str | Path) -> Path:
+    """Use Windows' extended namespace without changing logical report paths."""
+    supplied = Path(root).absolute()
+    if is_alias(supplied):
+        raise ValueError(f"scan root must be a real directory: {root}")
+    path = supplied.resolve()
+    if os.name == "nt":
+        value = str(path)
+        if not value.startswith("\\\\?\\"):
+            value = "\\\\?\\UNC\\" + value[2:] if value.startswith("\\\\") else "\\\\?\\" + value
+        return Path(value)
+    return path
+
+
+def is_alias(path) -> bool:
+    """Reject POSIX links and Windows junctions without following either."""
+    try:
+        metadata = path.stat(follow_symlinks=False) if isinstance(path, os.DirEntry) else path.lstat()
+    except FileNotFoundError:
+        return False
+    return stat.S_ISLNK(metadata.st_mode) or bool(getattr(metadata, "st_file_attributes", 0) & 0x400)
 
 
 def _state_version(root: Path, excluded: list[str]) -> str:
@@ -229,7 +254,7 @@ def _scan_role_space(
     role_path: list[str] | None = None,
 ) -> None:
     role_path = role_path or [role_name]
-    if not role_space.is_dir() or role_space.is_symlink():
+    if not role_space.is_dir() or is_alias(role_space):
         records.append(
             _finding_record(
                 root=root,
@@ -248,7 +273,7 @@ def _scan_role_space(
         path_segments = [*role_path, name]
         if (
             not child.is_dir()
-            or child.is_symlink()
+            or is_alias(child)
             or name.startswith(".")
             or not _is_structure_segment(name)
             or name in MODEL_RESERVED_NAMES
@@ -348,7 +373,7 @@ def _scan_module(
                     canonical_path_segments=path_segments,
                 )
             )
-            if not child.is_dir() or child.is_symlink():
+            if not child.is_dir() or is_alias(child):
                 records.append(
                     _finding_record(
                         root=root,
@@ -590,7 +615,7 @@ def _scan_module_vendor_workspace(
     vendor_path: list[str],
     vendor_record_id: str,
 ) -> None:
-    if not vendor_root.is_dir() or vendor_root.is_symlink():
+    if not vendor_root.is_dir() or is_alias(vendor_root):
         records.append(
             _finding_record(
                 root=root,
@@ -608,7 +633,7 @@ def _scan_module_vendor_workspace(
         if _is_process_carrier(project):
             continue
         project_path = [*vendor_path, project.name]
-        if not project.is_dir() or project.is_symlink():
+        if not project.is_dir() or is_alias(project):
             records.append(
                 _finding_record(
                     root=root,
@@ -694,7 +719,7 @@ def _scan_vendor_role_space(
     role_name: str,
     role_record_id: str,
 ) -> None:
-    if not role_space.is_dir() or role_space.is_symlink():
+    if not role_space.is_dir() or is_alias(role_space):
         records.append(
             _finding_record(
                 root=root,
@@ -709,7 +734,7 @@ def _scan_vendor_role_space(
         return
     for module_root in sorted(role_space.iterdir(), key=lambda path: path.name):
         module_path = [*role_path, module_root.name]
-        if not module_root.is_dir() or module_root.is_symlink():
+        if not module_root.is_dir() or is_alias(module_root):
             records.append(
                 _finding_record(
                     root=root,
@@ -1007,7 +1032,7 @@ def _validate_embedded_workspace_carrier(
     module_id: str | None = None,
     module_role: str | None = None,
 ) -> None:
-    if not workspace_root.is_dir() or workspace_root.is_symlink():
+    if not workspace_root.is_dir() or is_alias(workspace_root):
         records.append(
             _finding_record(
                 root=root,
@@ -1048,7 +1073,7 @@ def _validate_embedded_workspace_carrier(
         child_path = [*workspace_path, child.name]
         if (
             child.is_dir()
-            and not child.is_symlink()
+            and not is_alias(child)
             and not child.name.startswith(".")
             and _is_structure_segment(child.name)
             and child.name not in MODEL_RESERVED_NAMES
@@ -1222,9 +1247,9 @@ def _validate_free_remainder_carrier(
     module_id: str | None = None,
     module_role: str | None = None,
 ) -> None:
-    if carrier.is_file() and not carrier.is_symlink():
+    if carrier.is_file() and not is_alias(carrier):
         return
-    if carrier.is_dir() and not carrier.is_symlink():
+    if carrier.is_dir() and not is_alias(carrier):
         _validate_free_remainder_directory(
             root=root,
             state_version=state_version,
@@ -1267,7 +1292,8 @@ def _validate_free_remainder_directory(
 ) -> None:
     if _is_vcs_snapshot_root(directory):
         return
-    children = sorted(directory.iterdir(), key=lambda path: path.name)
+    with os.scandir(directory) as entries:
+        children = sorted(entries, key=lambda entry: entry.name)
     if not children:
         records.append(
             _finding_record(
@@ -1286,15 +1312,15 @@ def _validate_free_remainder_directory(
         return
     for child in children:
         child_path = [*path_from_root, child.name]
-        if child.is_file() and not child.is_symlink():
+        if child.is_file(follow_symlinks=False) and not is_alias(child):
             continue
-        if child.is_dir() and not child.is_symlink():
+        if child.is_dir(follow_symlinks=False) and not is_alias(child):
             _validate_free_remainder_directory(
                 root=root,
                 state_version=state_version,
                 excluded=excluded,
                 records=records,
-                directory=child,
+                directory=Path(child.path),
                 path_from_root=child_path,
                 source_record_id=source_record_id,
                 module_id=module_id,
@@ -1336,7 +1362,8 @@ def _validate_recursive_data_carrier(
     allow_data_test: bool,
     inside_data_root: bool,
 ) -> int:
-    children = sorted(carrier_root.iterdir(), key=lambda path: path.name)
+    with os.scandir(carrier_root) as entries:
+        children = sorted(entries, key=lambda entry: entry.name)
     if not children:
         records.append(
             _finding_record(
@@ -1359,7 +1386,7 @@ def _validate_recursive_data_carrier(
         child_relative = [*relative_prefix, child.name]
         child_path = [*module_path, *child_relative]
         if allow_data_test and inside_data_root and child.name.lower() == "test":
-            if child.name != "Test" or not child.is_dir() or child.is_symlink():
+            if child.name != "Test" or not child.is_dir(follow_symlinks=False) or is_alias(child):
                 records.append(
                     _finding_record(
                         root=root,
@@ -1375,16 +1402,16 @@ def _validate_recursive_data_carrier(
                     )
                 )
                 continue
-        if child.is_file() and not child.is_symlink():
+        if child.is_file(follow_symlinks=False) and not is_alias(child):
             file_count += 1
             continue
-        if child.is_dir() and not child.is_symlink():
+        if child.is_dir(follow_symlinks=False) and not is_alias(child):
             file_count += _validate_recursive_data_carrier(
                 root=root,
                 state_version=state_version,
                 excluded=excluded,
                 records=records,
-                carrier_root=child,
+                carrier_root=Path(child.path),
                 module_path=module_path,
                 relative_prefix=child_relative,
                 module_id=module_id,
@@ -1441,7 +1468,7 @@ def _validate_bin_carrier(
         )
         return
     for child in children:
-        if child.is_file() and not child.is_symlink():
+        if child.is_file() and not is_alias(child):
             continue
         records.append(
             _finding_record(
@@ -1590,7 +1617,7 @@ def _scan_src(
             continue
         name = child.name
         path_segments = [*module_path, "Src", name]
-        if name not in SRC_AREA_NAMES or not child.is_dir() or child.is_symlink():
+        if name not in SRC_AREA_NAMES or not child.is_dir() or is_alias(child):
             records.append(
                 _finding_record(
                     root=root,
@@ -1728,7 +1755,7 @@ def _scan_import_files(
         if _is_process_carrier(child):
             continue
         path_segments = [*module_path, "Src", "Import", child.name]
-        if child.is_dir() or child.is_symlink() or not child.is_file():
+        if child.is_dir() or is_alias(child) or not child.is_file():
             records.append(
                 _finding_record(
                     root=root,
@@ -1802,7 +1829,7 @@ def _scan_source_tree(
             continue
         relative_path = [*relative_prefix, child.name]
         path_segments = [*module_path, "Src", *relative_path]
-        if child.is_dir() and not child.is_symlink():
+        if child.is_dir() and not is_alias(child):
             if not _is_structure_segment(child.name):
                 records.append(
                     _finding_record(
@@ -1871,7 +1898,7 @@ def _scan_source_tree(
             source_files.extend(directory_files)
             continue
 
-        if child.is_file() and not child.is_symlink():
+        if child.is_file() and not is_alias(child):
             if child.suffix == "" or not _is_structure_segment(child.stem):
                 records.append(
                     _finding_record(
@@ -1944,7 +1971,7 @@ def _scan_test(
             continue
         name = child.name
         path_segments = [*module_path, "Test", name]
-        if name not in SRC_AREA_NAMES or not child.is_dir() or child.is_symlink():
+        if name not in SRC_AREA_NAMES or not child.is_dir() or is_alias(child):
             records.append(
                 _finding_record(
                     root=root,
@@ -2018,7 +2045,7 @@ def _scan_test_tree(
             continue
         relative_path = [*relative_prefix, child.name]
         path_segments = [*module_path, "Test", *relative_path]
-        if child.is_dir() and not child.is_symlink():
+        if child.is_dir() and not is_alias(child):
             directory_record_id = _stable_id("record", ("testDirectory", *path_segments))
             test_directories.append(relative_path)
             records.append(
@@ -2053,7 +2080,7 @@ def _scan_test_tree(
                 test_directories=test_directories,
             )
             continue
-        if child.is_file() and not child.is_symlink():
+        if child.is_file() and not is_alias(child):
             test_files.append(relative_path)
             records.append(
                 _base_record(
@@ -2114,7 +2141,7 @@ def _check_test_mirrors(
         for index in range(1, len(expected_relative)):
             expected_directories.add(tuple(expected_relative[:index]))
         expected_path = module_root / "Test" / Path(*expected_relative)
-        if expected_path.is_file() and not expected_path.is_symlink():
+        if expected_path.is_file() and not is_alias(expected_path):
             continue
         records.append(
             _finding_record(
@@ -2217,8 +2244,8 @@ def _is_valid_test_file_name(file_name: str, module_suffix: str | None) -> bool:
 
 def scan_product_project_root(root: str | Path) -> list[dict[str, Any]]:
     """Project a repository root using the AGENTS product-root profile."""
-    root_path = Path(root).resolve()
-    if not root_path.exists() or not root_path.is_dir() or root_path.is_symlink():
+    root_path = filesystem_root(root)
+    if not root_path.exists() or not root_path.is_dir() or is_alias(root_path):
         raise ValueError(f"scan root must be a real directory: {root}")
 
     excluded = sorted(name for name in ROOT_EXCLUSIONS if (root_path / name).exists())

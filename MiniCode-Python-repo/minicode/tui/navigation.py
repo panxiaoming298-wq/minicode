@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from typing import Any
+import re
 
-from minicode.cli_commands import SLASH_COMMANDS, find_matching_slash_commands
+from minicode.cli_commands import SLASH_COMMANDS
 from minicode.tui.chrome import _cached_terminal_size
 from minicode.tui.state import ScreenState, TtyAppArgs
 from minicode.tui.chrome import get_permission_prompt_max_scroll_offset
@@ -110,10 +111,40 @@ def _history_down(state: ScreenState) -> bool:
     return True
 
 
-def _get_visible_commands(input_text: str) -> list[Any]:
+def _get_visible_commands(input_text: str, cwd: str | None = None, state: ScreenState | None = None) -> list[Any]:
     if not input_text.startswith("/"):
+        if state is not None:
+            state.skill_completion_workspace = None
+            state.slash_dismissed_input = None
         return []
-    if input_text == "/":
-        return SLASH_COMMANDS
-    matches = find_matching_slash_commands(input_text)
-    return [cmd for cmd in SLASH_COMMANDS if getattr(cmd, "usage", str(cmd)) in matches]
+    if state is not None and state.slash_dismissed_input == input_text:
+        return []
+    # Once arguments start, leave cursor editing and Enter to the normal input flow.
+    explicit = re.fullmatch(r"/skill[ \t]+([^\s]*)", input_text, re.IGNORECASE)
+    if re.match(r"/skill\s", input_text, re.IGNORECASE) and explicit is None:
+        if state is not None:
+            state.skill_completion_workspace = None
+        return []
+    shorthand = re.fullmatch(r"/([^\s]*)", input_text)
+    query = explicit.group(1) if explicit else ("" if input_text == "/skill" else shorthand.group(1) if shorthand else None)
+    skills = []
+    if cwd and query is not None:
+        if state is not None and state.skill_completion_workspace == cwd:
+            skills = state.skill_completion_commands
+        else:
+            from Main.MinicodeFrontline.Src.Application.Entry.LocalCommandSurface import SlashCommand
+            from minicode.skills import discover_skills
+            skills = [SlashCommand(f"/skill {s.name}", f"/skill {s.name}", s.description or "使用此技能处理任务")
+                      for s in discover_skills(cwd) if s.user_invocable and not s.error
+                      and re.fullmatch(r"[^\s/\\]+", s.name)]
+            if state is not None:
+                state.skill_completion_workspace = cwd
+                state.skill_completion_commands = skills
+        needle = query.casefold()
+        skills = [s for s in skills if needle in s.name.removeprefix("/skill ").casefold()]
+        skills.sort(key=lambda s: (not s.name.removeprefix("/skill ").casefold().startswith(needle), s.name.casefold()))
+    if explicit:
+        return skills
+    commands = [cmd for cmd in SLASH_COMMANDS if cmd.usage.casefold().startswith(input_text.casefold())]
+    exact = [cmd for cmd in commands if cmd.name == input_text]
+    return exact + skills + [cmd for cmd in commands if cmd not in exact]

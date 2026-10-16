@@ -14,22 +14,76 @@ Search uses TF-IDF relevance scoring for intelligent retrieval.
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import logging
 import math
 import os
 import re
+import threading
 import time
 import uuid
 from collections import Counter
+from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 from typing import Any
 
 from minicode.config import MINI_CODE_DIR
+from minicode.memory_lifecycle import decay_schedule, validate_decay_factor
 
 logger = logging.getLogger(__name__)
+
+_SCOPE_LOCK_GUARD = threading.Lock()
+_SCOPE_LOCKS: dict[str, threading.RLock] = {}
+
+
+def _serialize_memory_mutation(method):
+    @functools.wraps(method)
+    def serialized(self, *args, **kwargs):
+        with self._mutation_lock:
+            return method(self, *args, **kwargs)
+    return serialized
+
+
+@contextmanager
+def _memory_write_lock(path: Path):
+    """Serialize the read/merge/write transaction across threads and processes."""
+    key = os.path.normcase(str(path.resolve()))
+    with _SCOPE_LOCK_GUARD:
+        lock = _SCOPE_LOCKS.setdefault(key, threading.RLock())
+    with lock, path.open("a+b") as handle:
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                handle.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"memory write lock timed out: {path}")
+                time.sleep(0.02)
+        try:
+            yield
+        finally:
+            handle.seek(0)
+            if os.name == "nt":
+                import msvcrt
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +183,23 @@ def _validate_entry(entry: Any, index: int) -> tuple[bool, list[str]]:
         val = entry["usage_count"]
         if not isinstance(val, int):
             errors.append(f"{prefix} field 'usage_count' must be an integer")
+
+    if "source_versions" in entry:
+        val = entry["source_versions"]
+        if (not isinstance(val, dict) or len(val) > 5
+                or any(not isinstance(key, str) or not isinstance(value, str)
+                       or re.fullmatch(r"[0-9a-f]{64}", value) is None for key, value in val.items())):
+            errors.append(f"{prefix} invalid evidence versions")
+    if "review_after" in entry:
+        val = entry["review_after"]
+        if type(val) not in (int, float) or not math.isfinite(val) or val < 0:
+            errors.append(f"{prefix} invalid review deadline")
+    if "retention_reason" in entry and not isinstance(entry["retention_reason"], str):
+        errors.append(f"{prefix} invalid retention reason")
+    if "confirmed_version" in entry:
+        val = entry["confirmed_version"]
+        if not isinstance(val, str) or val and not re.fullmatch(r"[0-9a-f]{64}", val):
+            errors.append(f"{prefix} invalid confirmed memory version")
 
     return len(errors) == 0, errors
 
@@ -809,7 +880,14 @@ class MemoryEntry:
     # Multi-tier memory architecture
     tier: MemoryTier = MemoryTier.SHORT_TERM
     last_accessed: float = field(default_factory=time.time)
+    last_decay_at: float = 0.0
     related_to: list[str] = field(default_factory=list)  # Related memory IDs
+    origin: str = "unknown"
+    sources: list[str] = field(default_factory=list)
+    source_versions: dict[str, str] = field(default_factory=dict)
+    confirmed_version: str = ""
+    review_after: float = 0.0
+    retention_reason: str = ""
     _cached_tokens: list[str] | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
@@ -851,7 +929,14 @@ class MemoryEntry:
             "domains": self.domains,
             "tier": self.tier.value,
             "last_accessed": self.last_accessed,
+            "last_decay_at": self.last_decay_at,
             "related_to": self.related_to,
+            "origin": self.origin,
+            "sources": list(self.sources),
+            "source_versions": dict(self.source_versions),
+            "confirmed_version": self.confirmed_version,
+            "review_after": self.review_after,
+            "retention_reason": self.retention_reason,
         }
     
     @classmethod
@@ -868,8 +953,16 @@ class MemoryEntry:
             usage_count=data.get("usage_count", 0),
             domains=data.get("domains", []),
             tier=MemoryTier(data.get("tier", "short_term")),
-            last_accessed=data.get("last_accessed", time.time()),
+            last_accessed=data.get("last_accessed", data.get("updated_at", data.get("created_at", 0.0))),
+            last_decay_at=float(data.get("last_decay_at", 0.0)),
             related_to=data.get("related_to", []),
+            origin=str(data.get("origin") or "unknown"),
+            sources=[str(item) for item in data.get("sources", []) if isinstance(item, str)]
+                if isinstance(data.get("sources"), list) else [],
+            source_versions=dict(data.get("source_versions", {})),
+            confirmed_version=str(data.get("confirmed_version", "")),
+            review_after=float(data.get("review_after", 0.0)),
+            retention_reason=str(data.get("retention_reason", "")),
         )
 
 
@@ -1002,6 +1095,9 @@ class MemoryFile:
             return False
         entry.content = content
         entry.updated_at = time.time()
+        entry.last_accessed = entry.updated_at
+        entry.last_decay_at = 0.0
+        entry.tier = MemoryTier.SHORT_TERM
         entry.invalidate_tokens()
         self._tokens_cache[entry.id] = entry.get_tokens()
         self._invalidate_search_cache()
@@ -1075,6 +1171,7 @@ class MemoryFile:
         active_domains: list[str] | None = None,
         *,
         record_usage: bool = True,
+        include_archived: bool = False,
     ) -> list[MemoryEntry]:
         """Search entries by keyword with BM25 + domain relevance scoring.
 
@@ -1091,7 +1188,12 @@ class MemoryFile:
         # indices between the two loops below (was: "list index out of range"
         # when another thread appended between building entry_tokens and the
         # scoring loop).
-        entries = list(self.entries)
+        entries = [
+            entry for entry in self.entries
+            if include_archived or entry.tier != MemoryTier.ARCHIVAL
+        ]
+        if not entries:
+            return []
 
         search_stopwords = _SEARCH_STOPWORDS
         if (
@@ -1173,7 +1275,9 @@ class MemoryFile:
         # default, while benchmarks can opt out explicitly.
         if record_usage:
             for _, entry in scored[:10]:
-                entry.usage_count += 1
+                if entry.tier != MemoryTier.ARCHIVAL:
+                    entry.usage_count += 1
+                    entry.last_accessed = time.time()
         return [entry for _, entry in scored]
     
     def _enforce_limits(self) -> None:
@@ -1205,8 +1309,16 @@ class MemoryFile:
             }
             lines.append(f"# {scope_names[self.scope]}")
             lines.append("")
-            lines.append(f"*Last updated: {time.strftime('%Y-%m-%d %H:%M')}*")
-            lines.append("")
+            updates = [entry.updated_at for entry in self.entries
+                       if type(entry.updated_at) in (int, float) and math.isfinite(entry.updated_at)]
+            if updates:
+                try:
+                    updated = time.strftime('%Y-%m-%d %H:%M', time.localtime(max(updates)))
+                except (ValueError, OverflowError, OSError):
+                    pass  # Unknown/corrupt history is not the current read time.
+                else:
+                    lines.append(f"*Last updated: {updated}*")
+                    lines.append("")
         
         # Group by category
         categories: dict[str, list[MemoryEntry]] = {}
@@ -1257,6 +1369,8 @@ class MemoryManager:
         workspace: str | Path | None = None,
         *,
         project_root: str | Path | None = None,
+        source_session_id: str = "",
+        source_turn_id: str = "",
     ):
         # Backward compatibility: older call sites pass `project_root=...`.
         resolved_workspace = workspace if workspace is not None else project_root
@@ -1264,18 +1378,25 @@ class MemoryManager:
             resolved_workspace = Path.cwd()
 
         self.workspace = str(resolved_workspace)
+        self.source_session_id = source_session_id
+        self.source_turn_id = source_turn_id
         self.paths = MemoryPaths.for_workspace(self.workspace)
         self.memories: dict[MemoryScope, MemoryFile] = {
             MemoryScope.USER: MemoryFile(scope=MemoryScope.USER),
             MemoryScope.PROJECT: MemoryFile(scope=MemoryScope.PROJECT),
             MemoryScope.LOCAL: MemoryFile(scope=MemoryScope.LOCAL),
         }
+        self._persisted_entries: dict[MemoryScope, dict[str, dict[str, Any]]] = {}
+        self._mutation_lock = threading.RLock()
         self._load_all()
     
     def _load_all(self) -> None:
         """Load all memory files."""
         for scope in MemoryScope:
             self._load_scope(scope)
+            self._persisted_entries[scope] = {
+                entry.id: deepcopy(entry.to_dict()) for entry in self.memories[scope].entries
+            }
             self._auto_recover_scope(scope)
     
     def _auto_recover_scope(self, scope: MemoryScope) -> None:
@@ -1407,6 +1528,9 @@ class MemoryManager:
     
     def _parse_memory_md(self, content: str, scope: MemoryScope) -> None:
         """Parse MEMORY.md file into entries."""
+        from minicode.paged_memory.markdown_export import is_generated_export
+        if is_generated_export(content):
+            return
         lines = content.split("\n")
         current_category = "general"
         entry_counter = 0
@@ -1440,6 +1564,8 @@ class MemoryManager:
                     category=current_category,
                     content=entry_content,
                     tags=tags,
+                    origin="file_import",
+                    sources=[str(self._get_scope_path(scope) / "MEMORY.md")],
                 )
                 self.memories[scope].entries.append(entry)
         # Rebuild indices after Markdown-based loading
@@ -1460,12 +1586,16 @@ class MemoryManager:
         path = self._get_scope_path(scope)
         path.mkdir(parents=True, exist_ok=True)
     
+    @_serialize_memory_mutation
     def add_entry(
         self,
         scope: MemoryScope,
         category: str = "auto",
         content: str = "",
         tags: list[str] | None = None,
+        *,
+        origin: str = "unknown",
+        sources: list[str] | None = None,
     ) -> MemoryEntry:
         """Add a new memory entry.
 
@@ -1502,12 +1632,105 @@ class MemoryManager:
             category=final_category,
             content=content,
             tags=final_tags,
+            origin=origin,
+            sources=self._entry_sources(final_category, sources),
         )
 
         self.memories[scope].add_entry(entry)
         self._save_scope(scope)
         return entry
+
+    def _entry_sources(self, category: str, sources: list[str] | None) -> list[str]:
+        from minicode.session_contract import _valid_session_id
+        from minicode.task_history import TASK_CATEGORIES
+        values = list(sources or [])
+        if category in TASK_CATEGORIES and _valid_session_id(self.source_session_id):
+            values.append("session:" + self.source_session_id)
+            if self.source_turn_id:
+                values.append("turn:" + self.source_turn_id)
+        return list(dict.fromkeys(values))
+
+    def context_eligible_entries(self, entries, query: str):
+        """Apply history ownership to every automatic retrieval route."""
+        from minicode.task_history import HistoryPolicy
+        from minicode.memory_learning import LearningPolicy
+        policy = HistoryPolicy(self.workspace)
+        entries = list(entries)
+        learning = LearningPolicy(self) if any(e.origin == "agent_consolidated" for e in entries) else None
+        if learning is not None:
+            refreshed = []
+            for entry in entries:
+                current = learning.entries.get(entry.id)
+                if current is None and entry.origin == "agent_consolidated":
+                    continue
+                if current is not None:
+                    # Restoration and pinning may leave text/origin/tier equal
+                    # to the old object while changing its retention metadata.
+                    entry = current
+                refreshed.append(entry)
+            entries = refreshed
+        return [entry for entry in entries
+                if entry.tier != MemoryTier.ARCHIVAL and policy.allows(entry, query)
+                and (learning is None or learning.state(entry) == "eligible")]
     
+    @_serialize_memory_mutation
+    def remember_once(
+        self, scope: MemoryScope, *, key: str, content: str,
+        category: str = "runtime_outcome", tags: list[str] | None = None,
+    ) -> tuple[MemoryEntry, bool]:
+        """Insert a bounded historical record once, without replacing knowledge.
+
+        The extra lock serializes this idempotent operation across processes;
+        _save_scope still owns the ordinary latest-disk merge. Replays do not
+        update timestamps, usage or content. A user-edited record wins.
+        """
+        if not isinstance(key, str) or not key.strip() or len(key) > 2048:
+            raise ValueError("memory idempotency key must be a bounded nonblank string")
+        if not isinstance(content, str) or not content.strip() or len(content.encode("utf-8")) > 6000:
+            raise ValueError("historical memory content must be nonblank and at most 6000 UTF-8 bytes")
+        from minicode.path_safety import is_unsafe_stored_path
+
+        path = self._get_scope_path(scope)
+        boundary = Path(self.workspace).resolve() if scope != MemoryScope.USER else self.paths.user_memory.parent
+        for name in ("memory.json", "MEMORY.md", ".memory.lock", ".remember.lock"):
+            if is_unsafe_stored_path(path / name, boundary=boundary, reject_hardlinks=True):
+                raise ValueError("historical memory path must not follow filesystem aliases")
+        self._ensure_scope_path(scope)
+        entry_id = f"{scope.value}-runtime-{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+        with _memory_write_lock(path / ".remember.lock"):
+            memory_json = path / "memory.json"
+            if memory_json.exists():
+                data = json.loads(memory_json.read_text(encoding="utf-8"))
+                valid, errors = _validate_memory_data(data)
+                if not valid:
+                    raise ValueError("cannot add historical memory to an invalid store")
+                for raw in data["entries"]:
+                    if raw["id"] == entry_id:
+                        entry = MemoryEntry.from_dict(raw)
+                        if entry.content != content or entry.category != category:
+                            raise ValueError("historical memory already exists with different content; not overwritten")
+                        # The other process may have published since this manager loaded.
+                        if entry_id not in self.memories[scope]._id_index:
+                            self.memories[scope].entries.append(entry)
+                            self.memories[scope]._rebuild_indices()
+                            self._persisted_entries.setdefault(scope, {})[entry_id] = entry.to_dict()
+                        return entry, False
+            before = deepcopy(self.memories[scope])
+            baseline = deepcopy(self._persisted_entries.get(scope, {}))
+            entry = MemoryEntry(id=entry_id, scope=scope, category=category, content=content, tags=list(tags or ()),
+                                origin="agent_runtime", sources=self._entry_sources(category, [key]))
+            # Do not evict old entries in add_entry before the locked capacity check.
+            self.memories[scope].entries.append(entry)
+            self.memories[scope]._rebuild_indices()
+            try:
+                self._save_scope(scope, preserve_existing=True)
+            except Exception:
+                self.memories[scope] = before
+                self._persisted_entries[scope] = baseline
+                raise
+            return self.memories[scope]._id_index[entry_id], True
+
+    @_serialize_memory_mutation
     def update_entry(self, scope: MemoryScope, entry_id: str, content: str) -> bool:
         """Update an existing entry."""
         if self.memories[scope].update_entry(entry_id, content):
@@ -1515,6 +1738,7 @@ class MemoryManager:
             return True
         return False
     
+    @_serialize_memory_mutation
     def delete_entry(self, scope: MemoryScope, entry_id: str) -> bool:
         """Delete an entry."""
         if self.memories[scope].delete_entry(entry_id):
@@ -1522,6 +1746,21 @@ class MemoryManager:
             return True
         return False
 
+    @_serialize_memory_mutation
+    def record_access(self, entry_ids: list[str], *, usage_delta: int = 0) -> None:
+        """Persist actual use/feedback without refreshing content freshness."""
+        selected = set(entry_ids)
+        for scope, memory in self.memories.items():
+            changed = False
+            for entry in memory.entries:
+                if entry.id in selected and entry.tier != MemoryTier.ARCHIVAL:
+                    entry.usage_count = max(0, entry.usage_count + usage_delta)
+                    entry.last_accessed = time.time()
+                    changed = True
+            if changed:
+                self._save_scope(scope)
+
+    @_serialize_memory_mutation
     def add_tag(self, scope: MemoryScope, entry_id: str, tag: str) -> bool:
         """Add a tag to an entry."""
         memory = self.memories[scope]
@@ -1531,6 +1770,7 @@ class MemoryManager:
             self._save_scope(scope)
         return changed
 
+    @_serialize_memory_mutation
     def remove_tag(self, scope: MemoryScope, entry_id: str, tag: str) -> bool:
         """Remove a tag from an entry."""
         memory = self.memories[scope]
@@ -1572,6 +1812,7 @@ class MemoryManager:
         active_domains: list[str] | None = None,
         *,
         record_usage: bool = True,
+        include_archived: bool = False,
     ) -> list[MemoryEntry]:
         """Search across memory scopes with TF-IDF + domain relevance.
 
@@ -1600,6 +1841,8 @@ class MemoryManager:
                 for current_scope in scopes_to_search
                 for entry in self.memories[current_scope].entries
             ]
+            if not include_archived:
+                aggregate_entries = self.context_eligible_entries(aggregate_entries, query)
             if aggregate_entries:
                 aggregate_memory = MemoryFile(
                     scope=MemoryScope.PROJECT,
@@ -1609,13 +1852,20 @@ class MemoryManager:
                     query,
                     active_domains=active_domains,
                     record_usage=record_usage,
+                    include_archived=include_archived,
                 )
         else:
+            scope_memory = self.memories[scope]
+            if not include_archived:
+                eligible = self.context_eligible_entries(scope_memory.entries, query)
+                if len(eligible) != len(scope_memory.entries):
+                    scope_memory = MemoryFile(scope=scope, entries=eligible)
             results.extend(
-                self.memories[scope].search(
+                scope_memory.search(
                     query,
                     active_domains=active_domains,
                     record_usage=record_usage,
+                    include_archived=include_archived,
                 )
             )
 
@@ -1696,6 +1946,12 @@ class MemoryManager:
         """
         from minicode.context_manager import estimate_tokens
 
+        self.context_sources: list[dict[str, str]] = []
+        def remember(entries):
+            self.context_sources.extend({"id": entry.id, "scope": entry.scope.value, "content": entry.content,
+                                         "category": entry.category}
+                                        for entry in entries)
+
         query = (query or "").strip()
         if query:
             scoped_parts = []
@@ -1721,6 +1977,7 @@ class MemoryManager:
                     continue
                 formatted = MemoryFile(scope=scope, entries=accepted_entries).format_as_markdown(include_header=True)
                 scoped_parts.append(formatted)
+                remember(accepted_entries)
                 total_tokens += estimate_tokens(formatted)
             if scoped_parts:
                 return "\n\n".join(scoped_parts)
@@ -1731,7 +1988,9 @@ class MemoryManager:
         
         # Priority order: LOCAL > PROJECT > USER
         for scope in [MemoryScope.LOCAL, MemoryScope.PROJECT, MemoryScope.USER]:
-            memory = self.memories[scope]
+            memory = MemoryFile(scope=scope, entries=[
+                entry for entry in self.context_eligible_entries(self.memories[scope].entries, "")
+            ])
             if not memory.entries:
                 continue
             
@@ -1740,6 +1999,7 @@ class MemoryManager:
             
             if total_tokens + tokens <= max_tokens:
                 parts.append(formatted)
+                remember(memory.entries)
                 total_tokens += tokens
             else:
                 # Partial: include only recent entries
@@ -1750,6 +2010,7 @@ class MemoryManager:
                 
                 if estimate_tokens(formatted) <= remaining_tokens:
                     parts.append(formatted)
+                    remember(partial_entries)
                 break
         
         if not parts:
@@ -1757,30 +2018,135 @@ class MemoryManager:
         
         return "\n\n".join(parts)
     
-    def _save_scope(self, scope: MemoryScope) -> None:
-        """Save memory to disk (atomic write to prevent corruption)."""
+    @_serialize_memory_mutation
+    def _save_scope(
+        self, scope: MemoryScope, *, decay_at: float | None = None,
+        decay_period: float = 30 * 86400.0, decay_factor: float = 0.5,
+        maintenance: bool = False,
+        preserve_existing: bool = False,
+    ) -> int:
+        """Merge this instance's changes into the latest locked disk snapshot."""
         path = self._get_scope_path(scope)
         self._ensure_scope_path(scope)
-        
-        # Save JSON metadata (atomic: write to temp, then replace)
-        memory_json = path / "memory.json"
-        data = {
-            "scope": scope.value,
-            "last_updated": time.time(),
-            "entries": [e.to_dict() for e in self.memories[scope].entries],
-        }
-        self._atomic_write(memory_json, json.dumps(data, indent=2, ensure_ascii=False))
-        
-        # Also update MEMORY.md for human readability (atomic)
-        memory_md = path / "MEMORY.md"
-        self._atomic_write(memory_md, self.memories[scope].format_as_markdown())
+        with _memory_write_lock(path / ".memory.lock"):
+            memory_json = path / "memory.json"
+            baseline = self._persisted_entries.get(scope, {})
+            if maintenance or preserve_existing:
+                # Recheck under the write lock: a previously valid index can be
+                # removed/corrupted after the curator's read-only snapshot.
+                # Maintenance must not silently repair it from stale objects.
+                if memory_json.exists():
+                    from minicode.context_sources import _read_memory
+                    _read_memory(memory_json, scope.value)
+                elif baseline or (path / "MEMORY.md").exists():
+                    raise ValueError("memory index unavailable; maintenance did not replace it")
+            local = {entry.id: entry.to_dict() for entry in self.memories[scope].entries}
+            merged: dict[str, dict[str, Any]] = deepcopy(baseline)
+            if memory_json.exists():
+                try:
+                    disk = json.loads(memory_json.read_text(encoding="utf-8"))
+                    merged = {}
+                except json.JSONDecodeError:
+                    # Loading/recovery already handles corrupt source files.
+                    disk = {}
+                for index, raw in enumerate(disk.get("entries", []) if isinstance(disk, dict) else []):
+                    if _validate_entry(raw, index)[0]:
+                        merged[raw["id"]] = MemoryEntry.from_dict(raw).to_dict()
+            for entry_id in baseline.keys() - local.keys():
+                merged.pop(entry_id, None)
+            for entry_id, values in local.items():
+                old = baseline.get(entry_id)
+                if old is None:
+                    if maintenance and values.get("origin") == "agent_consolidated" and entry_id in merged:
+                        continue
+                    merged[entry_id] = deepcopy(values)
+                    continue
+                current = merged.get(entry_id)
+                if current is None:
+                    # Another instance deleted this record; stale snapshots
+                    # must not resurrect it while saving an unrelated change.
+                    continue
+                maintenance_conflict = maintenance and (
+                    current.get("content") != old.get("content")
+                    or current.get("updated_at", 0) > old.get("updated_at", 0)
+                    or current.get("last_accessed", 0) > old.get("last_accessed", 0)
+                )
+                for name, value in values.items():
+                    if value == old.get(name):
+                        continue
+                    if maintenance_conflict and name in {"content", "tier", "retention_reason", "review_after", "source_versions", "confirmed_version"}:
+                        # A newer edit/use wins over a stale maintenance decision.
+                        continue
+                    if name == "usage_count":
+                        current[name] = max(0, current.get(name, 0) + value - old.get(name, 0))
+                    elif name in {"tags", "domains", "related_to"}:
+                        removed = set(old.get(name, [])) - set(value)
+                        added = [item for item in value if item not in old.get(name, [])]
+                        current[name] = list(dict.fromkeys(
+                            [item for item in current.get(name, []) if item not in removed] + added
+                        ))
+                    elif name in {"updated_at", "last_accessed", "last_decay_at"}:
+                        current[name] = max(current.get(name, 0), value)
+                    else:
+                        current[name] = deepcopy(value)
+            # Age the latest merged snapshot under the cross-process file lock.
+            # Applying a stale instance's usage delta here would decay twice.
+            decayed = 0
+            if decay_at is not None:
+                for values in merged.values():
+                    if values.get("tier") == MemoryTier.ARCHIVAL.value:
+                        continue
+                    if (values.get("origin") in {"user_explicit", "user_corrected"}
+                        or set(values.get("tags", ())) & {"pinned", "permanent"}):
+                        continue
+                    periods, boundary = decay_schedule(
+                        now=decay_at,
+                        last_activity=max(values["updated_at"], values["last_accessed"]),
+                        last_decay=values.get("last_decay_at", 0.0),
+                        period_seconds=decay_period,
+                    )
+                    if periods:
+                        previous = values["usage_count"]
+                        values["usage_count"] = max(0, int(previous * decay_factor ** periods))
+                        values["last_decay_at"] = boundary
+                        decayed += values["usage_count"] != previous
+            memory = self.memories[scope]
+            candidate = MemoryFile(
+                scope=scope,
+                entries=[MemoryEntry.from_dict(values) for values in merged.values()],
+                max_entries=memory.max_entries,
+                max_size_bytes=memory.max_size_bytes,
+            )
+            candidate._rebuild_indices()
+            candidate._enforce_limits()
+            if preserve_existing and (
+                {entry.id for entry in candidate.entries} != set(merged)
+                or sum(len(entry.content.encode("utf-8")) for entry in candidate.entries) > memory.max_size_bytes
+            ):
+                raise ValueError("memory capacity reached; existing knowledge was not evicted")
+            serialized = [entry.to_dict() for entry in candidate.entries]
+            data = {"scope": scope.value, "last_updated": time.time(), "entries": serialized}
+            self._atomic_write(memory_json, json.dumps(data, indent=2, ensure_ascii=False))
+            objects = {entry.id: entry for entry in memory.entries}
+            entries = []
+            for entry in candidate.entries:
+                if entry.id in objects:
+                    existing = objects[entry.id]
+                    existing.__dict__.update(entry.__dict__)
+                    entry = existing
+                entries.append(entry)
+            memory.entries = entries
+            memory._rebuild_indices()
+            self._persisted_entries[scope] = {entry["id"]: deepcopy(entry) for entry in serialized}
+            self._atomic_write(path / "MEMORY.md", memory.format_as_markdown())
+            return decayed
     
     @staticmethod
     def _atomic_write(target: Path, content: str) -> None:
         """Write content atomically: write to temp file, then os.replace().
         
-        This prevents data corruption if the process is killed mid-write
-        or if multiple instances write to the same file concurrently.
+        This prevents partial files if the process is killed mid-write.
+        Cross-instance consistency is provided by the locked merge in _save_scope.
         """
         import tempfile
         tmp_fd, tmp_path = tempfile.mkstemp(
@@ -1861,6 +2227,7 @@ class MemoryManager:
 
         return "\n".join(lines)
     
+    @_serialize_memory_mutation
     def clear_scope(self, scope: MemoryScope) -> None:
         """Clear all entries in a scope."""
         self.memories[scope] = MemoryFile(scope=scope)
@@ -1899,7 +2266,8 @@ class MemoryManager:
         if not content:
             return "Usage: # <memory> or /memory add [user|project|local:] <memory>"
 
-        entry = self.add_entry(scope, category, content, tags=["chat"])
+        entry = self.add_entry(scope, category, content, tags=["chat"],
+                               origin="user_explicit", sources=["user:explicit-memory"])
         return f"Saved memory ({entry.scope.value}): {entry.content}"
 
     def check_integrity(self, scope: MemoryScope) -> dict[str, Any]:
@@ -1953,30 +2321,33 @@ class MemoryManager:
     def compress_scope(
         self, scope: MemoryScope, similarity_threshold: float = 0.8
     ) -> dict[str, int]:
-        """Compress memory entries by merging similar content.
+        """Remove exact duplicates with the same category, origin and evidence.
 
-        Merges entries with content similarity above the threshold.
-        Removes duplicate entries (exact content matches).
-        Updates timestamps and preserves usage counts.
+        Similarity alone cannot prove equivalence: negations, numbers and user
+        corrections must survive. Protected and learned entries stay intact.
 
         Args:
             scope: Memory scope to compress
-            similarity_threshold: Jaccard similarity threshold for merging
-                (default 0.8 = 80%)
+            similarity_threshold: Legacy compatibility argument; never grants
+                permission to merge different text.
 
         Returns:
             Stats dictionary with {merged_count, removed_count, remaining_count}
         """
+        from minicode.memory_learning import protected
         entries = self.memories[scope].entries
         if len(entries) <= 1:
             return {"merged_count": 0, "removed_count": 0, "remaining_count": len(entries)}
 
-        seen_content: dict[str, int] = {}
+        seen_content: dict[tuple, int] = {}
         duplicates_removed = 0
 
         unique_entries = []
         for entry in entries:
-            content_key = entry.content.strip().lower()
+            if protected(entry) or entry.origin == "agent_consolidated" or entry.tier == MemoryTier.ARCHIVAL:
+                unique_entries.append(entry)
+                continue
+            content_key = (entry.content.strip(), entry.category, entry.origin, tuple(sorted(entry.sources)))
             if content_key in seen_content:
                 master_idx = seen_content[content_key]
                 master = unique_entries[master_idx]
@@ -2003,6 +2374,15 @@ class MemoryManager:
 
             for j, entry_b in enumerate(unique_entries):
                 if i == j or j in merged_indices:
+                    continue
+
+                # Word overlap cannot establish equivalence: a negation,
+                # changed port or code identifier can reverse the meaning.
+                if (entry_a.content.strip() != entry_b.content.strip()
+                        or protected(entry_a) or protected(entry_b)
+                        or entry_a.category != entry_b.category or entry_a.origin != entry_b.origin
+                        or entry_a.sources != entry_b.sources or entry_a.tier != entry_b.tier
+                        or entry_a.origin == "agent_consolidated" or entry_a.tier == MemoryTier.ARCHIVAL):
                     continue
 
                 similarity = self._jaccard_similarity(
@@ -2120,28 +2500,26 @@ class MemoryManager:
         conflicts.sort(key=lambda x: x[1], reverse=True)
         return conflicts
 
-    def decay_memories(self, max_age_days: float = 30.0, decay_factor: float = 0.5) -> int:
-        """Apply time-based decay to memory usage_count.
+    @_serialize_memory_mutation
+    def decay_memories(
+        self, max_age_days: float = 30.0, decay_factor: float = 0.5,
+        *, now: float | None = None,
+    ) -> int:
+        """Decay once per inactive period, atomically across instances/restarts."""
+        now = time.time() if now is None else now
+        period = max_age_days * 86400.0
+        validate_decay_factor(decay_factor)
+        decay_schedule(now=now, last_activity=now, last_decay=0, period_seconds=period)
+        return sum(
+            self._save_scope(scope, decay_at=now, decay_period=period, decay_factor=decay_factor)
+            for scope in MemoryScope
+            if scope in self.memories and (
+                self.memories[scope].entries
+                or (self._get_scope_path(scope) / "memory.json").exists()
+            )
+        )
 
-        Entries older than max_age_days have their usage_count halved
-        (multiplied by decay_factor), reducing their search ranking.
-        Returns number of entries decayed.
-        """
-        now = time.time()
-        decayed = 0
-        for scope in MemoryScope:
-            if scope not in self.memories:
-                continue
-            for entry in self.memories[scope].entries:
-                age_days = (now - entry.updated_at) / 86400.0
-                if age_days > max_age_days and entry.usage_count > 0:
-                    entry.usage_count = max(0, int(entry.usage_count * decay_factor))
-                    decayed += 1
-        if decayed:
-            for scope in MemoryScope:
-                self._save_scope(scope)
-        return decayed
-
+    @_serialize_memory_mutation
     def promote_memories(self) -> dict[str, int]:
         """Promote/demote memories across tiers based on usage and age.
 
@@ -2155,37 +2533,28 @@ class MemoryManager:
             if scope not in self.memories:
                 continue
             for entry in self.memories[scope].entries:
+                if set(entry.tags) & {"pinned", "permanent"} or entry.origin in {"user_explicit", "user_corrected"}:
+                    continue
                 age_days = (now - entry.updated_at) / 86400.0
                 accessed_days = (now - entry.last_accessed) / 86400.0
                 if entry.tier == MemoryTier.SHORT_TERM and entry.usage_count >= 5 and age_days > 7:
                     entry.tier = MemoryTier.LONG_TERM
+                    changed_scopes.add(scope)
                     stats["promoted_to_long"] += 1
-                if entry.tier == MemoryTier.LONG_TERM and accessed_days > 30:
+                if (
+                    (entry.tier == MemoryTier.LONG_TERM and accessed_days > 30)
+                    or (entry.tier == MemoryTier.SHORT_TERM and accessed_days > 90)
+                ):
                     entry.tier = MemoryTier.ARCHIVAL
-                    entry.content = self._summarize_content(entry.content)
-                    entry.invalidate_tokens()
                     changed_scopes.add(scope)
                     stats["demoted_to_archival"] += 1
-                # A newly archived entry has a recent ``last_accessed`` value
-                # because that field defaults to creation time.  Reactivating
-                # every such entry immediately made archival and stale-memory
-                # cleanup ineffective.  Require actual prior use and keep
-                # curator-marked deprecated memories archived.
-                is_deprecated = entry.content.startswith("[DEPRECATED:")
-                if (
-                    entry.tier in (MemoryTier.LONG_TERM, MemoryTier.ARCHIVAL)
-                    and accessed_days < 7
-                    and entry.usage_count > 0
-                    and not is_deprecated
-                ):
-                    entry.tier = MemoryTier.SHORT_TERM
-                    changed_scopes.add(scope)
-                    stats["reactivated"] += 1
+                # History reads do not reactivate obsolete knowledge. An
+                # explicit update_entry restores an archived entry instead.
         if any(stats.values()):
             for scope in MemoryScope:
                 if scope in changed_scopes:
                     self.memories[scope]._rebuild_indices()
-                self._save_scope(scope)
+                self._save_scope(scope, maintenance=True)
         return stats
 
     def link_memories(self, similarity_threshold: float = 0.4) -> int:

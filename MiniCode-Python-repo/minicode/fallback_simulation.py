@@ -12,6 +12,7 @@ ALLOWED_PATCH_ROOTS = {
     "anthropicFallbackModels",
     "openaiFallbackModels",
     "deepseekFallbackModels",
+    "bailianFallbackModels",
     "openrouterFallbackModels",
     "customFallbackModels",
     "env",
@@ -24,6 +25,10 @@ ENV_RUNTIME_KEYS = {
     "OPENAI_BASE_URL": "openaiBaseUrl",
     "DEEPSEEK_API_KEY": "deepseekApiKey",
     "DEEPSEEK_BASE_URL": "deepseekBaseUrl",
+    "DASHSCOPE_API_KEY": "bailianApiKey",
+    "DASHSCOPE_BASE_URL": "bailianBaseUrl",
+    "BAILIAN_API_KEY": "bailianApiKey",
+    "BAILIAN_BASE_URL": "bailianBaseUrl",
     "OPENROUTER_API_KEY": "openrouterApiKey",
     "OPENROUTER_BASE_URL": "openrouterBaseUrl",
     "CUSTOM_API_KEY": "customApiKey",
@@ -36,6 +41,7 @@ _FALLBACK_ROOTS = (
     "anthropicFallbackModels",
     "openaiFallbackModels",
     "deepseekFallbackModels",
+    "bailianFallbackModels",
     "openrouterFallbackModels",
     "customFallbackModels",
 )
@@ -44,6 +50,7 @@ _CREDENTIAL_RUNTIME_KEYS = {
     "authToken",
     "openaiApiKey",
     "deepseekApiKey",
+    "bailianApiKey",
     "openrouterApiKey",
     "customApiKey",
 }
@@ -191,6 +198,7 @@ def _candidate_validation_errors(runtime: dict[str, Any], candidate: str) -> lis
         Provider.ANTHROPIC.value: (("apiKey", "authToken"), "baseUrl"),
         Provider.OPENAI.value: (("openaiApiKey",), "openaiBaseUrl"),
         Provider.DEEPSEEK.value: (("deepseekApiKey",), "deepseekBaseUrl"),
+        Provider.BAILIAN.value: (("bailianApiKey",), "bailianBaseUrl"),
         Provider.OPENROUTER.value: (("openrouterApiKey",), "openrouterBaseUrl"),
         Provider.CUSTOM.value: (("customApiKey",), "customBaseUrl"),
     }
@@ -217,6 +225,8 @@ def _credential_state(runtime: dict[str, Any], candidates: list[str]) -> str:
             credential_keys.add("openaiApiKey")
         elif provider == "deepseek":
             credential_keys.add("deepseekApiKey")
+        elif provider == "bailian":
+            credential_keys.add("bailianApiKey")
         elif provider == "openrouter":
             credential_keys.add("openrouterApiKey")
         elif provider == "custom":
@@ -237,6 +247,7 @@ def _effective_config(runtime: dict[str, Any], candidates: list[str]) -> dict[st
             "anthropic": _safe_origin(runtime.get("baseUrl")),
             "openai": _safe_origin(runtime.get("openaiBaseUrl")),
             "deepseek": _safe_origin(runtime.get("deepseekBaseUrl")),
+            "bailian": _safe_origin(runtime.get("bailianBaseUrl")),
             "openrouter": _safe_origin(runtime.get("openrouterBaseUrl")),
             "custom": _safe_origin(runtime.get("customBaseUrl")),
         },
@@ -244,6 +255,7 @@ def _effective_config(runtime: dict[str, Any], candidates: list[str]) -> dict[st
             "anthropic": any(_is_real_credential(runtime.get(key)) for key in ("apiKey", "authToken")),
             "openai": _is_real_credential(runtime.get("openaiApiKey")),
             "deepseek": _is_real_credential(runtime.get("deepseekApiKey")),
+            "bailian": _is_real_credential(runtime.get("bailianApiKey")),
             "openrouter": _is_real_credential(runtime.get("openrouterApiKey")),
             "custom": _is_real_credential(runtime.get("customApiKey")),
         },

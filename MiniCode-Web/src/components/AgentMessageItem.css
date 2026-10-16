@@ -1,0 +1,19 @@
+.agent-message-item { min-width: 0; margin: 4px 0; color: var(--muted); }
+.agent-message-item > summary { display: flex; min-height: 36px; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 7px; list-style: none; font-size: 13px; line-height: 1.6; cursor: pointer; }
+.agent-message-item > summary::-webkit-details-marker { display: none; }
+.agent-message-item > summary > svg { flex-shrink: 0; }
+.agent-message-item > summary > span { min-width: 0; overflow-wrap: anywhere; }
+.agent-message-item > summary:hover { background: var(--panel); color: var(--text); }
+.agent-message-item > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.agent-message-chevron { margin-left: auto; }
+.agent-message-item[open] > summary .agent-message-chevron { transform: rotate(90deg); }
+.agent-message-detail { margin: 4px 8px 12px 16px; padding: 6px 0 4px 17px; border-left: 1px solid var(--line); }
+.agent-message-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; font-size: 11px; }
+.agent-message-body { margin: 10px 0; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--text); font-size: 13px; line-height: 1.75; }
+.agent-message-delivery, .agent-message-reason { margin: 6px 0 0; font-size: 11px; line-height: 1.6; overflow-wrap: anywhere; white-space: pre-wrap; }
+.agent-message-report > summary { display: flex; align-items: center; gap: 6px; min-height: 36px; cursor: pointer; list-style: none; font-size: 12px; }
+.agent-message-report > summary::-webkit-details-marker { display: none; }
+.agent-message-report[open] > summary > svg { transform: rotate(90deg); }
+.agent-message-item.is-failed > summary, .agent-message-item.is-rejected > summary, .agent-message-reason { color: var(--danger); }
+.agent-message-item.is-unknown > summary, .agent-message-item.is-warning > summary { color: var(--warning); }
+@media (max-width: 720px) { .agent-message-item > summary, .agent-message-report > summary { min-height: 44px; } }

@@ -8,6 +8,7 @@ act on the combined control state.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any
@@ -244,13 +245,16 @@ class CyberneticSupervisor:
         return out
 
 
-def save_supervisor_report(report: SupervisorReport) -> None:
-    """Persist the latest supervisor report for slash-command diagnostics."""
-    SUPERVISOR_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    SUPERVISOR_STATE_PATH.write_text(
-        json.dumps(report.to_dict(), indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
+def save_supervisor_report(report: SupervisorReport) -> bool:
+    """Best-effort diagnostic projection; never the authority for completion."""
+    try:
+        SUPERVISOR_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        SUPERVISOR_STATE_PATH.write_text(
+            json.dumps(report.to_dict(), indent=2, ensure_ascii=False), encoding="utf-8")
+        return True
+    except OSError as error:
+        logging.getLogger(__name__).warning("Supervisor report unavailable (%s)", type(error).__name__)
+        return False
 
 
 def load_supervisor_report() -> SupervisorReport | None:

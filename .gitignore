@@ -1,0 +1,62 @@
+# Local material and publication/audit work files
+/面/
+/.temp/
+/.agents/
+/.claude/
+
+# Local credentials and private application state
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+.mcp.json
+.mini-code*/
+.trae/
+.workbuddy/
+.worktrees/
+
+# Runtime data, caches, dependencies and generated artifacts
+**/Data/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+node_modules/
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.hypothesis/
+.coverage
+htmlcov/
+playwright-report/
+test-results/
+artifacts/
+.finesse/
+*.tsbuildinfo
+*.log
+*.tmp
+*.bak
+*.sqlite
+*.sqlite3
+*.db
+*.db-wal
+*.db-shm
+
+# Local experiments and historical output
+/MiniCode-Python-repo/experiments/
+/MiniCode-Python-repo/outputs/
+
+# New test material is kept locally for this source-only publication
+/MiniCode-Python-repo/tests/
+**/Test/
+*.Test.py
+/MiniCode-Web/tests/
+*.test.ts
+*.test.tsx
+*.spec.ts
+*.spec.tsx

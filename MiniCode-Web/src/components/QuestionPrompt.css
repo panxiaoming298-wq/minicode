@@ -1,0 +1,35 @@
+.question-prompt form { display: grid; gap: 16px; }
+.question-prompt header { display: flex; align-items: center; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.question-heading { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.question-progress { flex-shrink: 0; padding: 3px 8px; border-radius: 6px; background: var(--surface); color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.question-prompt h2 { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; margin: 0; }
+.question-text { margin: 0; font-size: 14px; line-height: 1.7; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-options { display: grid; gap: 8px; border: 0; margin: 0; padding: 0; min-width: 0; }
+.question-options legend { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.question-options label { display: flex; align-items: baseline; gap: 10px; padding: 10px 12px; border: 1px solid transparent; border-radius: 10px; background: var(--surface); font-size: 14px; line-height: 1.6; cursor: pointer; overflow-wrap: anywhere; transition: border-color .12s ease; }
+.question-options label:hover { border-color: var(--line-strong); }
+.question-options label.is-selected { border-color: var(--text-soft, #64748b); }
+.question-options input { flex-shrink: 0; accent-color: var(--text, #222); }
+.question-options label:has(input:focus-visible) { outline: 2px solid var(--muted, #64748b); outline-offset: 2px; }
+.question-option-label { min-width: 0; }
+.question-recommendation { display: inline-block; margin-left: 6px; padding: 1px 6px; border: 1px solid var(--line-strong); border-radius: 5px; background: var(--panel-deep); color: var(--text); font-size: 11px; font-weight: 500; line-height: 1.5; vertical-align: middle; white-space: nowrap; }
+.question-answer { display: grid; gap: 8px; font-size: 13px; }
+.question-answer textarea { resize: vertical; min-height: 90px; max-height: 30dvh; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface); color: inherit; font: inherit; line-height: 1.6; padding: 12px; }
+.question-answer textarea:focus-visible { outline: 2px solid var(--muted, #64748b); outline-offset: 2px; }
+.question-prompt footer { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.question-prompt footer > span { font-size: 12px; color: var(--muted); }
+.question-prompt footer > div { display: flex; flex-shrink: 0; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.question-error { color: var(--danger, #b42318); font-size: 13px; margin: 0; }
+.question-record { min-width: 0; width: min(720px, 90%); margin: 18px 0 22px auto; padding: 16px 20px; scroll-margin-top: 16px; border: 1px solid var(--line-strong); border-radius: 18px 18px 5px 18px; background: var(--panel-deep); color: var(--text); }
+.question-record > header { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-bottom: 14px; }
+.question-record > header > svg { color: var(--muted); flex-shrink: 0; }
+.question-record strong { font-size: 13px; font-weight: 600; }
+.question-record-status { margin-left: auto; color: var(--muted); font-size: 12px; }
+.question-record-options { margin: 12px 0 0; padding-left: 24px; color: var(--text-soft, var(--text)); font-size: 14px; line-height: 1.7; }
+.question-record-options li { padding: 3px 0 3px 4px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-record-answer { margin-top: 16px; padding-top: 14px; border-top: 1px solid var(--line-strong); }
+.question-record-answer strong { display: flex; align-items: center; gap: 6px; margin-bottom: 8px; }
+.question-record > button { margin-top: 16px; }
+.question-process-placeholder { margin: 10px 0; color: var(--muted); font-size: 12px; }
+@media (max-width: 540px) { .question-record { width: 100%; padding: 16px; } .question-record-status { flex-basis: 100%; margin-left: 0; } }
+@media (max-width: 540px) { .question-prompt footer { align-items: stretch; flex-direction: column; } .question-prompt footer > div { justify-content: flex-end; } }

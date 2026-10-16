@@ -157,8 +157,8 @@ def run_provider_smoke(
     """
 
     normalized_profile = str(profile).strip().lower()
-    if normalized_profile not in {"standard", "ultra"}:
-        raise ValueError("provider smoke profile must be 'standard' or 'ultra'")
+    if normalized_profile not in {"standard", "deep", "ultra"}:
+        raise ValueError("provider smoke profile must be 'standard', 'deep', or 'ultra'")
     timeout_seconds = _bounded_timeout(timeout)
     result = _base_result(
         timeout=timeout_seconds,
@@ -268,6 +268,8 @@ def run_provider_smoke(
             "ANTHROPIC_BASE_URL": runtime.get("baseUrl"),
             "DEEPSEEK_API_KEY": runtime.get("deepseekApiKey"),
             "DEEPSEEK_BASE_URL": runtime.get("deepseekBaseUrl"),
+            "DASHSCOPE_API_KEY": runtime.get("bailianApiKey"),
+            "DASHSCOPE_BASE_URL": runtime.get("bailianBaseUrl"),
             "OPENROUTER_API_KEY": runtime.get("openrouterApiKey"),
             "OPENROUTER_BASE_URL": runtime.get("openrouterBaseUrl"),
             "CUSTOM_API_KEY": runtime.get("customApiKey"),
@@ -419,7 +421,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument(
         "--profile",
-        choices=("standard", "ultra"),
+        choices=("standard", "deep", "ultra"),
         default="standard",
         help="Unified Runtime profile to exercise (default: standard).",
     )

@@ -26,7 +26,9 @@ class ProgressAction(str, Enum):
 @dataclass
 class ProgressSignal:
     total_steps: int = 0
-    completed_steps: int = 0
+    # None means no task milestone ledger was supplied. Successful tool calls
+    # and elapsed model steps must never be substituted for completed work.
+    completed_steps: int | None = None
     failed_steps: int = 0
     tool_calls: int = 0
     tool_errors: int = 0
@@ -34,6 +36,7 @@ class ProgressSignal:
     tests_passed: bool | None = None
     elapsed_seconds: float = 0.0
     max_steps: int | None = None
+    output_change_expected: bool = False
 
 
 @dataclass
@@ -59,7 +62,8 @@ class ProgressController:
 
     def decide(self, signal: ProgressSignal) -> ProgressDecision:
         total = max(signal.total_steps, 1)
-        completion_ratio = signal.completed_steps / total
+        completion_known = signal.completed_steps is not None
+        completion_ratio = min(1.0, max(0, signal.completed_steps or 0) / total)
         failure_ratio = signal.failed_steps / total
         tool_error_ratio = signal.tool_errors / max(signal.tool_calls, 1)
 
@@ -81,10 +85,10 @@ class ProgressController:
         reasons: list[str] = []
         suggestions: list[str] = []
 
-        if completion_ratio == 0 and signal.total_steps >= 3:
+        if completion_known and completion_ratio == 0 and signal.total_steps >= 3:
             stall += 0.30
             reasons.append("no completed steps after multiple attempts")
-        if signal.tool_calls >= 5 and not signal.output_changed:
+        if signal.output_change_expected and signal.tool_calls >= 5 and not signal.output_changed:
             stall += 0.25
             reasons.append("many tool calls without output change")
         if tool_error_ratio >= 0.5 and signal.tool_calls >= 2:
@@ -96,7 +100,7 @@ class ProgressController:
         if signal.tests_passed is False:
             stall += 0.20
             reasons.append("verification failed")
-        if signal.elapsed_seconds > 600 and completion_ratio < 0.3:
+        if completion_known and signal.elapsed_seconds > 600 and completion_ratio < 0.3:
             stall += 0.20
             reasons.append(f"slow progress: {completion_ratio:.0%} after {signal.elapsed_seconds:.0f}s")
 
@@ -158,4 +162,3 @@ class ProgressController:
             reasons or ["progress is healthy"],
             ["continue current plan"],
         )
-

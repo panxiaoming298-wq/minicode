@@ -1,438 +1,278 @@
-# MiniCode Python
+# MiniCode Python 后端
 
-<p align="center">
-  <strong>A lightweight local coding agent for developers who want durable terminal workflows, not just a chat wrapper.</strong>
-</p>
+本目录提供 MiniCode 的 Python Agent 运行时、CLI/TUI、Headless、本机 Web API 与存储管理命令。项目定位、核心设计、整体架构和前后端完整上手步骤统一维护在[根目录 README](../README.md)。本文件保留后端安装、命令、工具行为和诊断参考，同时作为 Python 包的说明文件。
 
-<p align="center">
-  <a href="./README.zh-CN.md">Chinese</a>
-  |
-  <a href="https://github.com/LiuMengxuan04/MiniCode">MiniCode Main Repo</a>
-  |
-  <a href="https://github.com/QUSETIONS/MiniCode-Python">Python Repo</a>
-</p>
+[项目总览](../README.md) · [完整安装步骤](../README.md#快速开始) · [Web 工作台](../MiniCode-Web/README.md) · [源码导航](#源码导航)
 
-<p align="center">
-  <img alt="Python" src="https://img.shields.io/badge/Python-3.11%2B-3776AB?style=flat-square&logo=python&logoColor=white">
-  <img alt="Tests" src="https://img.shields.io/badge/tests-1000%2B%20passed-brightgreen?style=flat-square">
-  <img alt="Package" src="https://img.shields.io/badge/package-minicode--py-555?style=flat-square">
-</p>
+## 后端安装与入口
 
-<p align="center">
-  <img alt="MiniCode Python static product page showing memory, session, rewind, and readiness" src="./Docs/Documentation/assets/readme/minicode-frontend-hero.png" width="100%">
-</p>
-
-<p align="center">
-  <em>This is the repository's static product image; runnable surfaces include the terminal UI and the sibling MiniCode-Web local workbench.</em>
-</p>
-
-MiniCode Python is the Python runtime in the MiniCode family. It is built for local development where the agent needs to survive long sessions, keep its state inspectable, recover from bad edits, and show what it is doing while it works.
-
-If Claude Code represents the polished terminal-agent experience, MiniCode Python is the lightweight, local-first version that leans harder into runtime transparency, durable sessions, memory-backed continuity, rewindability, and verifiable behavior.
-
-The screenshot above is still rendered from the static `ts-src/docs/index.html` product page. The actual browser UI lives in the sibling `MiniCode-Web` directory and is wired to the Python agent runtime through a local FastAPI boundary.
-
-## At a Glance
-
-MiniCode Python is for you if you want:
-
-- a terminal coding agent that behaves like a runtime, not a chat window;
-- durable sessions you can inspect, replay, resume, and summarize;
-- a memory stack that can protect working context and re-inject relevant project knowledge;
-- safe local editing with checkpoints, rewind preview, and recovery flows;
-- explicit signals for verification, widening, provider readiness, and failures.
-
-If you only remember one thing, remember this:
-
-> MiniCode Python is optimized for local trust: you should be able to inspect the work, recover the edits, and understand why the agent stopped.
-
-## Why This Repo Exists
-
-Most coding-agent READMEs lead with model access and feature lists. MiniCode Python is organized around a different promise:
-
-> the runtime should be observable, recoverable, and testable, not just clever.
-
-That changes the product priorities:
-
-| Priority | What it means here |
-| --- | --- |
-| Session-first | Sessions can be inspected, replayed, resumed, and summarized. |
-| Recovery-first | File edits are checkpointed, previewable, and rewindable. |
-| Runtime-first | Widening, verification, compaction, and stop reasons are explicit. |
-| Local-first | The agent is built around real repos, local tools, and terminal workflows. |
-
-## Why MiniCode Python
-
-| Area | What MiniCode Python emphasizes |
-| --- | --- |
-| Durable sessions | Inspect, replay, resume, and summarize live or saved sessions with local commands. |
-| Memory as a first-class system | Protect active task context, re-inject project knowledge, compact with memory awareness, and persist useful reflections over time. |
-| Safe recovery | Automatic checkpoints, rewind preview, rewind safety groups, and saved-session rewind flows. |
-| Runtime control | `single` and `single-deep` profiles, phase-aware execution, widening, verification gates, and structured stop reasons. |
-| Observable behavior | Runtime timelines, readiness reports, provider diagnostics, transcript summaries, and benchmark artifacts. |
-| Local product surface | CLI and TUI commands such as `/session`, `/session-replay`, `/memory`, `/checkpoints`, `/rewind`, and `/readiness`. |
-| Verifiable implementation | The root package is backed by an active test suite, not aspirational docs. |
-
-## What You Can Do Today
-
-With the current repository state, you can already:
-
-- run an interactive terminal agent with `minicode-py`;
-- launch the local browser workbench with `minicode-web`;
-- run a single-shot command with `minicode-headless`;
-- run a provider/runtime readiness gate with `minicode-readiness`;
-- inspect the current session with `/session`;
-- browse previous sessions with `/sessions`;
-- replay a session with `/session-replay`;
-- inspect memory state with `/memory`;
-- inspect checkpoints with `/checkpoints`;
-- preview or execute rewinds with `/rewind-preview` and `/rewind`;
-- inspect provider and fallback health with `/readiness`.
-
-## 3-Minute Demo
-
-### 0. What you need
-
-- Python 3.11+
-- a local terminal on Windows, macOS, or Linux
-- model/provider credentials if you want live model execution
-
-### 1. Install and launch
-
-```bash
-git clone https://github.com/QUSETIONS/MiniCode-Python.git
-cd MiniCode-Python
-python -m venv .venv
-# Windows PowerShell: .\.venv\Scripts\Activate.ps1
-# macOS/Linux: source .venv/bin/activate
-python -m pip install .
-python -m minicode.install
-minicode-py --validate-config
-minicode-py
-```
-
-The installer recommends DeepSeek by default and prompts for the provider,
-model, base URL, and API key. To configure it without the wizard:
-
-```bash
-export MINI_CODE_PROVIDER=deepseek
-export MINI_CODE_MODEL=deepseek-v4-pro
-export DEEPSEEK_API_KEY=sk-...
-export DEEPSEEK_BASE_URL=https://api.deepseek.com
-minicode-py --validate-config
-minicode-py
-```
-
-Optional DeepSeek settings are `DEEPSEEK_THINKING_MODE=enabled|disabled`,
-`DEEPSEEK_REASONING_EFFORT=low|high|max`, and
-`DEEPSEEK_MODEL_FALLBACKS=deepseek-v4-flash`.
-
-### 1.1 Run with Docker
-
-```bash
-cp .env.example .env
-# Edit .env and fill in DEEPSEEK_API_KEY.
-docker compose build
-docker compose run --rm cli
-docker compose run --rm headless "Explain what this repo does."
-```
-
-The container now exposes only the two modes actually implemented by this
-package: `cli` and `headless`. It does not claim to provide an HTTP gateway or
-cron service. Native Python runs do not auto-load `.env`; that file is intended
-for Docker Compose.
-
-### Local Web workbench
-
-The browser UI is a local application rather than a frontend-only static site.
-React receives agent and tool events over SSE, while FastAPI owns provider
-calls, files, Git, commands, approvals, and isolated task processes. An API key
-can be entered in the page but is persisted only by the local service. Use the
-left rail to expand multiple conversations under each project. The top-level
-new-conversation action creates a projectless conversation that cannot read
-project files. Project folders can be opened with the native directory picker
-or a manual path.
+以下命令在本目录执行，需要 Python 3.11+。文件搜索需要支持 PCRE2 的 ripgrep，Git 操作和 Worktree 需要 Git；只运行终端与 Headless 时无需构建前端。
 
 ```powershell
-# Install the optional Web backend in this repository.
-python -m pip install -e ".[web]"
-
-# Build the sibling MiniCode-Web project first with npm install and npm run build.
-minicode-web --workspace "D:\ai测试项目\MiniCode\MiniCode-Python-repo"
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -e ".[memory]"
+.\.venv\Scripts\python.exe -m minicode.install
+.\.venv\Scripts\python.exe -m minicode.main --validate-config
+.\.venv\Scripts\python.exe -m minicode.main --profile deep
 ```
 
-Open `http://127.0.0.1:8765`. This local shape does not require a vector
-database, RabbitMQ, or Redis. Future Chrome control belongs in the local service
-through Playwright/CDP or a browser extension because an ordinary page cannot
-cross the browser sandbox. See the sibling `MiniCode-Web/README.md` for the full
-setup and development workflow.
+macOS / Linux 将解释器路径换为 `.venv/bin/python`。Web 所需依赖使用 `.[web,memory]`，完整启动与数据初始化见[根目录快速开始](../README.md#快速开始)。
 
-### 2. Ask it to do a real repo task
+下文的 `minicode-*` 命令默认已激活虚拟环境：Windows PowerShell 使用 `.\.venv\Scripts\Activate.ps1`，macOS / Linux 使用 `source .venv/bin/activate`。也可以始终调用虚拟环境解释器和对应的 `python -m` 模块。
 
-```text
-Explain this repository and tell me which commands matter most for day-to-day use.
+| 命令 | 对应模块 | 用途 |
+| --- | --- | --- |
+| `minicode-py` | `minicode.main` | 交互式终端、会话查看与恢复。 |
+| `minicode-headless` | `minicode.headless` | 非交互式单次任务。 |
+| `minicode-web` | `minicode.web_api` | 本机浏览器工作台 API 与前端托管。 |
+| `minicode-memory` | `minicode.paged_memory.admin` | 本地存储配置、导出、备份与恢复。 |
+| `minicode-readiness` | `minicode.readiness` | 运行时与供应商就绪诊断。 |
+| `minicode-structure-check` | `minicode.structure_check` | 工程结构检查。 |
+| `minicode-provider-smoke` | `minicode.provider_smoke` | 供应商配置与接口冒烟检查。 |
+
+CLI / Headless 以当前目录为工作区。处理其他项目时，先切换到目标目录，再调用已安装命令或 MiniCode 虚拟环境的解释器。执行模式通过 `--profile standard|deep|ultra`、`executionProfile` 或 `MINI_CODE_EXECUTION_PROFILE` 选择，入口默认值见[执行模式与工作目录](../README.md#执行模式与工作目录)。
+
+### 模型与数据配置
+
+安装向导用于选择 Provider、模型、Base URL 和 API Key。也可以通过启动进程的环境变量配置，例如：
+
+```powershell
+$env:MINI_CODE_PROVIDER = "deepseek"
+$env:MINI_CODE_MODEL = "你的模型 ID"
+$env:DEEPSEEK_API_KEY = "你的 API Key"
+$env:DEEPSEEK_BASE_URL = "https://api.deepseek.com"
+minicode-py --validate-config
 ```
 
-You should expect the normal MiniCode loop here: inspect repo state, explain findings, then let you inspect, replay, or continue the session.
+项目支持的 DeepSeek 配置还包括 `DEEPSEEK_THINKING_MODE=enabled|disabled`、`DEEPSEEK_REASONING_EFFORT=low|high|max` 和 `DEEPSEEK_MODEL_FALLBACKS`。实际模型 ID 和参数支持情况以使用的供应商接口为准。
 
-### 3. Inspect what the runtime is doing
+阿里云百炼通过兼容接口接入时，使用 `MINI_CODE_PROVIDER=bailian`、`DASHSCOPE_API_KEY` 和 `DASHSCOPE_BASE_URL`，模型名称通过 `MINI_CODE_MODEL` 设置。配置项示例见 [.env.example](./.env.example)；原生 Python / Web 不会自动加载该文件，Docker Compose 才会读取 `.env`。
 
-```text
-/session
-/memory
-/readiness
-```
+模型与用户设置默认保存在 `~/.mini-code/settings.json`，已调整状态目录时使用对应位置。数据根通过 `memoryDataRoot` 或 `MINI_CODE_DATA_ROOT` 配置，SQLite 保存结构化状态，本地文件保存大型原文和附件。未显式指定数据根的旧安装沿用用户状态目录下的兼容位置。`configure-local` 初始化目标目录但不迁移旧数据；Markdown 导出是查看副本，恢复应使用备份。目录、初始化、导出和恢复步骤统一见[分页记忆与存储说明](./Docs/Documentation/PAGED_MEMORY.md)。
 
-### 4. Replay or recover if needed
+## 会话与恢复
 
-```text
-/session-replay
-/checkpoints
-/rewind-preview
-```
-
-### 5. Run one-shot headless mode
-
-```bash
-minicode-headless "Explain what this repo does."
-```
-
-### 6. Run a readiness gate
-
-```bash
-minicode-readiness --json --fail-on blocked
-minicode-readiness --examples-out .temp/readiness-fallback-examples.json --fail-on blocked
-minicode-readiness --doctor-out .temp/readiness-doctor.md --fail-on blocked
-minicode-readiness --repair-plan-out .temp/readiness-repair-plan.json --fail-on blocked
-minicode-readiness --patch-preview-out .temp/readiness-fallback-patch-preview.json --fail-on blocked
-minicode-readiness --bundle-out .temp/readiness-bundle --fail-on blocked
-python -m minicode.release_readiness --check-readiness-bundle .temp/readiness-bundle
-python -m minicode.release_readiness --write-artifact-manifest .temp/readiness-artifact-manifest.json --artifact fallback_examples_json=.temp/readiness-fallback-examples.json --artifact doctor_markdown=.temp/readiness-doctor.md --artifact repair_plan_json=.temp/readiness-repair-plan.json --artifact patch_preview_json=.temp/readiness-fallback-patch-preview.json
-python -m minicode.release_readiness --check-artifact-manifest .temp/readiness-artifact-manifest.json
-python -m minicode.release_readiness --check-fallback-patch-preview .temp/readiness-fallback-patch-preview.json
-python -m minicode.release_readiness --check-fallback-simulation .temp/readiness-bundle/readiness-fallback-simulations.json
-python -m minicode.release_readiness --check-fallback-switch-smoke
-python benchmarks/release_readiness.py
-minicode-provider-smoke --help
-python -m minicode.release_readiness --check-fallback-evidence benchmarks/release_readiness_results.json
-python -m minicode.release_readiness --check-release-report benchmarks/release_readiness_results.json
-python -m minicode.release_readiness --check-release-markdown benchmarks/release_readiness_results.md --release-json benchmarks/release_readiness_results.json
-```
-
-Use `--fail-on blocked` for CI environments where provider warnings should be
-reported but not fail local product gates. Use `--fail-on warning` when a release
-candidate must have a ready provider and at least one ready fallback. The
-`--examples-out` artifact is read-only guidance; it never writes credentials or
-changes your MiniCode settings. The `--doctor-out` artifact adds a human-readable
-readiness repair report for CI and release bundles, including a local preflight
-checklist for primary provider config, fallback coverage, configured/default
-fallbacks, and the still-separate live provider smoke. The `--repair-plan-out`
-artifact exports the same next steps as structured, redacted JSON so CI can keep
-the repair path auditable without writing credentials. The `--patch-preview-out`
-artifact exports redacted settings merge patch previews so the chosen fallback
-provider can be reviewed before any local settings change. The artifact manifest
-command records existence, size, and SHA-256 for readiness artifacts so CI can
-detect missing or drifting evidence. `--bundle-out` writes examples, doctor,
-repair plan, patch preview, offline fallback simulations, and manifest together
-for the lowest-friction local check.
-`--check-fallback-patch-preview` validates patch preview safety fields, apply
-notes, merge patch shape, and redaction. `--check-readiness-bundle` validates
-that bundle as one unit, including schema, manifest, and redaction.
-`--check-fallback-simulation` validates every offline fallback simulation and
-rejects any live-provider claim; it does not call a provider.
-`benchmarks/release_readiness.py` is an offline report-only gate; use
-`minicode-provider-smoke` separately when a release candidate needs a real
-provider request. The benchmark still validates the generated headless trace
-so offline/provider-configuration failures keep a machine-readable readiness
-snapshot and repair plan. `--check-release-report` validates the full
-release JSON schema and evidence links while still allowing provider `at-risk`
-when the diagnostic evidence is present. `--check-release-markdown` validates
-that the human-readable report contains the same status, smoke, provider,
-fallback, and artifact evidence as the release JSON. `--check-fallback-evidence` validates
-that provider risk is paired with fallback coverage or an auditable fallback
-repair path. Use `--fail-on at-risk` on the offline report when local release
-policy should reject any unresolved provider risk.
-
-The ordinary readiness APIs are local-only, and release benchmark child checks
-run with an isolated HOME, so credentials in the current shell or
-`~/.mini-code` cannot silently trigger a provider request there. For one
-bounded real-provider check, use both explicit gates:
-
-```bash
-MINICODE_LIVE_PROVIDER_SMOKE=1 minicode-provider-smoke --run-live --timeout 45
-```
-
-The command emits only redacted structured evidence and returns a non-zero
-status for blocked configuration, provider failure, or timeout. The runtime
-profile benchmark has the same two-gate behavior with
-`--live-provider-smoke` when live diagnostics are needed.
-
-## Typical Workflow
-
-```mermaid
-flowchart LR
-    Start["Start local task"] --> Run["Run minicode-py"]
-    Run --> Work["Agent reads, edits, tests, and reports"]
-    Work --> Inspect["Inspect with /session, /memory, or /readiness"]
-    Inspect --> Replay["Replay with /session-replay"]
-    Inspect --> Recover["Preview or use /rewind if edits go wrong"]
-    Replay --> Continue["Resume or continue the next turn"]
-    Recover --> Continue
-```
-
-The main point is simple: MiniCode Python is not trying to hide the runtime. It lets you see the work, inspect the state, and recover from mistakes without manually cleaning everything up.
-
-That same philosophy applies to memory: active task context is protected, durable project knowledge can be re-injected when it matters, and compaction is allowed to reuse memory instead of blindly dropping context.
-
-## Everyday Commands
-
-If you only use six commands at first, use these: `/session`, `/sessions`, `/session-replay`, `/memory`, `/rewind-preview`, and `/readiness`.
-
-| Command | What it does |
+| 终端内命令 | 作用 |
 | --- | --- |
-| `/session` | Show the current live session snapshot. |
-| `/sessions` | List saved sessions for the current workspace. |
-| `/session-replay` | Replay the current or a saved session with transcript and runtime context. |
-| `/memory` | Show memory system status for the current workspace. |
-| `/checkpoints` | Show checkpoint history for the current or a saved session. |
-| `/rewind-preview` | Preview what a rewind would restore before changing files. |
-| `/rewind` | Rewind the latest edit group, a step count, or a checkpoint id. |
-| `/readiness` | Inspect runtime/provider readiness, fallback coverage, and product surface status. |
+| `/session` | 查看当前会话快照。 |
+| `/sessions` | 列出当前工作区的已保存会话。 |
+| `/session-replay` | 回放会话及运行上下文。 |
+| `/memory` | 查看当前工作区的记忆状态。 |
+| `/checkpoints` | 查看文件编辑检查点。 |
+| `/rewind-preview` | 预览回退会影响的文件编辑。 |
+| `/rewind` | 按检查点、步数或编辑组执行文件回退。 |
+| `/readiness` | 查看运行时、供应商与 fallback 诊断。 |
 
-## Current Status
+也可在启动命令中直接查看或恢复已保存会话：
 
-This repository is past the prototype stage. It already behaves like a usable local product, but it is still being tightened into a more polished lightweight Claude Code style experience.
-
-The active package is the root `minicode/` package configured by `pyproject.toml` as `minicode-py`.
-
-Current cross-platform CI verification result:
-
-```text
-1311 passed, 2 skipped
+```powershell
+minicode-py --inspect-session latest
+minicode-py --replay-session latest
+minicode-py --preview-rewind latest
+minicode-py --resume latest
 ```
 
-Verification command:
+可将 `latest` 换为具体会话 ID。会话分叉、Worktree 应用、冲突与恢复见[会话分叉与工作树](./Docs/Documentation/SESSION_FORK_WORKTREE.md)。
 
-```bash
-python -m compileall -q minicode tests benchmarks Main Package
-python -m minicode.structure_check --root . --hotspots 5 --max-dependency-upstream 4 --check-material-inventory --report .temp/structure-compliance.json
-python -m minicode.release_readiness --check-structure-compliance-artifact .temp/structure-compliance.json
-python -m minicode.readiness --json --fail-on blocked
-python -m minicode.readiness --examples-out .temp/readiness-fallback-examples.json --fail-on blocked
-python -m minicode.readiness --doctor-out .temp/readiness-doctor.md --fail-on blocked
-python -m minicode.readiness --repair-plan-out .temp/readiness-repair-plan.json --fail-on blocked
-python -m minicode.readiness --patch-preview-out .temp/readiness-fallback-patch-preview.json --fail-on blocked
-python -m minicode.readiness --bundle-out .temp/readiness-bundle --fail-on blocked
-python -m minicode.release_readiness --check-readiness-bundle .temp/readiness-bundle
-python -m minicode.release_readiness --write-artifact-manifest .temp/readiness-artifact-manifest.json --artifact fallback_examples_json=.temp/readiness-fallback-examples.json --artifact doctor_markdown=.temp/readiness-doctor.md --artifact repair_plan_json=.temp/readiness-repair-plan.json --artifact patch_preview_json=.temp/readiness-fallback-patch-preview.json
-python -m minicode.release_readiness --check-artifact-manifest .temp/readiness-artifact-manifest.json
-python -m minicode.release_readiness --check-fallback-patch-preview .temp/readiness-fallback-patch-preview.json
-python -m minicode.release_readiness --check-fallback-simulation .temp/readiness-bundle/readiness-fallback-simulations.json
-python -m minicode.release_readiness --check-fallback-switch-smoke
-python benchmarks/release_readiness.py
-python -m minicode.release_readiness --check-fallback-evidence benchmarks/release_readiness_results.json
-python -m minicode.release_readiness --check-release-report benchmarks/release_readiness_results.json
-python -m minicode.release_readiness --check-release-markdown benchmarks/release_readiness_results.md --release-json benchmarks/release_readiness_results.json
+## Headless 与验收契约
+
+```powershell
+minicode-headless --profile deep "解释这个项目的结构和主要入口"
+```
+
+新版运行时可以按次选择。下面的命令只预览配置，不调用模型、工具或记忆服务：
+
+```powershell
+minicode-headless --preflight --runtime primary --profile deep --max-tokens 64000 --deadline-seconds 240
+```
+
+需要明确验收时，可再传 `--task-file <已审查的本地 JSON>`。实际运行会执行该文件的验收命令，但不会因此授予 Agent 工具权限；预期产物也不是写入白名单。未配置新版运行时的终端入口默认沿用 legacy。
+
+契约使用 `minicode-headless-task-v1` 格式。例如，要求任务生成合法的 `report.json`，可以使用下面的验收内容：
+
+```json
+{
+  "schemaVersion": "minicode-headless-task-v1",
+  "taskRequiresWorkspaceWrite": true,
+  "acceptanceCriteria": ["report.json 是合法的 JSON 文件"],
+  "expectedOutputs": ["report.json"],
+  "runtimeVerificationCommands": [
+    {
+      "name": "validate-json",
+      "kind": "invariant",
+      "command": ["python", "-m", "json.tool", "report.json"],
+      "timeout": 30,
+      "covers": [1]
+    }
+  ]
+}
+```
+
+将它保存为自己审查过的本地 JSON 文件，通过 `--task-file` 指定，并让任务提示词说明实际需要生成的内容。`command` 是参数数组，`covers` 对应从 1 开始的验收条件编号；检查执行环境必须能找到其中的解释器。先用 `--preflight` 检查配置，实际运行时移除该参数。契约不应包含密钥，验收命令按 Runtime 的检查机制执行，需在运行前核对。
+
+验收检查默认直接使用当前候选或集成工作区，不再为每次检查复制整个项目。原有候选工作区仍按任务的写入策略管理。测试临时数据、缓存、覆盖率文件与浏览器报告进入该工作区的 `.temp/verification/check-*`，不自动删除或回滚已有文件。Windows 浏览器的临时用户目录另用系统临时目录中的短路径，执行结束后清理，以兼容浏览器的路径限制；截图和报告仍保留在检查产物目录中。自定义检查可用环境变量 `MINICODE_VERIFICATION_OUTPUT_DIR` 保存报告，或用 `MINICODE_VERIFICATION_TEMP_DIR` 保存临时数据；任意脚本写到其他位置的输出不会被自动重定向。
+
+需要隔离时，在运行配置或 Headless 验收 JSON 中显式设置 `"runtimeVerificationIsolation": true`；也可在 `runtimeVerificationCommands` 的单条命令中设置 `"isolate": true`。单条设置优先，`false` 表示直接执行，未设置时默认直接执行。检查仍执行真实命令、遵守原有命令权限、取消和超时限制，不会自动重试。
+
+检查前后源码、配置、锁文件和已有测试数据的版本必须一致，否则检查失败并保留实际文件变化，需要修复后重新验收。npm 项目根目录的 `node_modules/`、`dist/` 和根级 `*.tsbuildinfo` 属于生成的依赖和产物，不计入源码版本，也不写入候选源码补丁；`src/dist/` 等源码路径及 `Data/` 不在此排除范围。npm 构建产物保留在当前工作区，复用浏览器检查结果时会重新验证 `dist/` 的内容，产物变化后重新执行检查。
+
+## 工具目录与搜索
+
+### 按需加载与执行回执
+
+默认 `toolProfile=full`，内置的 JSON/CSV、编解码、正则、摘要、时间戳、文本、压缩和 HTTP 工具
+都进入可用目录。legacy 与 primary AgentLoop 均通过 `discover_tools` 按需展示完整参数定义：
+核心工具保持可见，其余工具先浏览或搜索，再按准确名称选择，每次最多选择 8 个。
+选择只改变后续模型请求的工具展示，不执行工具，也不授予文件、网络或 Worker 权限。
+
+需要精简目录时，可显式设置 `MINI_CODE_TOOL_PROFILE=core`，或在设置文件中设置
+`"toolProfile": "core"`；环境变量优先。变更目录配置后重新启动当前运行进程。
+
+通用工具会检查必填字段、字段类型和取值，拒绝未知参数。随机字符串长度必须为整数，
+ISO 时间转时间戳必须带时区；HTTP 请求超时范围为 `(0, 120]` 秒，请求头的值必须为字符串。
+CSV 表头重复或数据行多出/缺少列时会报错，避免转换时静默丢失数据。
+
+HTTP 正文最多读取 1 MB、展示 10,000 字符，超过任一边界都会显示 `BODY_TRUNCATED: yes`。
+通用长输出也会明确标注截断；`outputTruncated` 与工具执行是否成功分别记录，成功响应不代表展示了完整正文。
+
+失败不会自动启动重试。模型在同一 AgentLoop 轮内重复发出相同工具和参数的临时失败调用时，
+仅 `safe` 重放策略允许最多两次重试；其他策略会返回 `NotExecuted`，要求先核对结果或走工具支持的幂等流程。
+该计数限于当前轮，不提供跨进程或外部服务的去重保证。
+压缩/解压写入中途失败、写请求结果不确定或工具超时，会阻止同批次后续写入并保留每个调用的回执；
+已有部分输出会保留供检查，不会宣称已回滚或已完成。
+
+### 搜索与代码导航
+
+每台机器安装一次 ripgrep，Docker 镜像已经包含该依赖：
+
+| 平台 | 安装命令 |
+| --- | --- |
+| Windows | `winget install --id BurntSushi.ripgrep.MSVC --exact` |
+| macOS | `brew install ripgrep` |
+| Debian/Ubuntu | `sudo apt-get install ripgrep` |
+
+安装后重新打开终端，通过 `rg --version` 和 `rg --pcre2-version` 检查。若程序不在 `PATH` 中，可通过 `MINI_CODE_RIPGREP_PATH` 指定可执行文件的完整路径。
+
+模型仍调用原有的`grep_files`，参数保持不变。底层流式读取 `rg --json`，
+保留工作区路径检查、原有 include/exclude 匹配规则，以及 `路径:行号:内容`
+输出和最多 5 行上下文。隐藏路径、构建目录及常见二进制扩展名继续排除；
+为保持原有搜索范围，不自动应用 `.gitignore`、`.ignore`、`.rgignore` 和用户个人的
+ripgrep 配置。重叠上下文合并显示，仅返回能严格解码为 UTF-8 的结果行。
+
+单次搜索最多运行 10 秒，最多返回 200 个匹配行、50,000 个输出字符，超大 JSON
+事件也有读取上限。达到结果上限会明确标注截断；缺少程序、超时、取消、引擎错误均返回
+失败回执，不伪装成“没有匹配”。正则使用 `auto` 引擎，前后查找和反向引用需要
+PCRE2 支持；不保证兼容 Python `re` 的全部扩展，无法处理的表达式会返回引擎错误，
+不会静默退回 Python 逐文件搜索。
+
+`find_references` 与 `grep_files` 共用结构化搜索后端、路径过滤和资源限制。
+它接受一个 Python 标识符，按大小写敏感的完整标识符搜索 `.py` 文件，附带前后各 2 行
+上下文。结果明确标为**候选引用**：定义、注释、字符串以及不同作用域中的同名项都可能
+命中，重命名前需要进一步核实。两个搜索工具的结果路径均相对于搜索目录，显式文件则
+相对于该文件的父目录。`find_symbols`、`get_ast_info` 继续使用 Python AST 分析；
+普通文本搜索优先使用 `grep_files`，命令工作流使用 `run_command`。
+
+## 扩展
+
+MiniCode 使用统一的 `minicode.dev/v1` 扩展包。一个包可以贡献 Skill、MCP、OpenAI-compatible Provider、外部 Tool、Hook、斜杠 Command、Agent Profile 和声明式 UI 资源。支持项目级与全局级作用域，以及目录、ZIP、Git URL 或普通 Skill 目录导入。
+
+```text
+/extension-install ./my-extension --scope=project
+/extension-inspect project:my-extension
+/extension-trust project:my-extension
+/extension-health project:my-extension
+```
+
+安装默认不等于信任；可执行贡献只有在权限被显式授予后才会激活。托管包有内容完整性锁、更新备份、回滚和可恢复卸载。完整清单格式、权限模型、Tool JSON 协议和管理 API 见 [MiniCode 本地扩展平台](./Docs/Documentation/superpowers/reports/2026-06-05-minicode-local-extension-workflow.md)。
+
+## Docker 运行
+
+在本后端目录首次创建 `.env`，已有文件时直接编辑现有配置：
+
+```powershell
+# 仅首次创建时执行
+Copy-Item .env.example .env
+```
+
+填入模型凭据，并核对工作区和数据路径，然后启动所需入口：
+
+```powershell
+docker compose build
+docker compose run --rm cli
+docker compose run --rm headless "解释这个项目的结构"
+```
+
+Compose 项目名固定为 `minicode`，定义 `cli` 和 `headless` 两种入口。从外层工作区执行时，增加 `-f ./MiniCode-Python-repo/docker-compose.yml`。`MINI_CODE_WORKSPACE` 指定挂载到 `/workspace` 的工作区，未设置时使用本后端目录。
+
+宿主机 `MINI_CODE_DATA_ROOT`（未设置时为 `D:/MiniCodeData`）挂载到容器的 `/data/minicode`，其他平台需在 `.env` 中改为实际绝对路径。用户配置使用具名卷 `minicode-home`。当前配置无需远程数据库、对象存储或向量索引服务；中间件管理遵守[工作区约定](../AGENTS.md)，保留已有运行时卷。
+
+## 检查与诊断
+
+后端测试与浏览器检查所需依赖：
+
+```powershell
+python -m pip install -e ".[dev,web,memory]"
+python -m playwright install chromium
 python -m pytest -q --import-mode=importlib
 ```
 
-Current state, honestly:
+默认 pytest 收集 `tests/` 和 `Package/AgentRuntime/Test`。其他结构模块的镜像测试与完整检查链见 [.github/workflows/ci.yml](./.github/workflows/ci.yml)，测试通过情况以当前环境的实际执行输出为准。
 
-- core runtime, session, replay, checkpoint, rewind, readiness, and structure-compliance surfaces are in good shape;
-- memory is not bolted on: working memory, project memory, memory injection, and memory-aware compaction are already in the runtime path;
-- provider and fallback diagnostics include local preflight checks, structured live-smoke failure context, and a validated headless trace artifact;
-- real provider availability still depends on your local credentials and configured channels;
-- the project is usable today, but it is still evolving toward a more polished lightweight Claude Code experience.
+运行时诊断与工程结构报告可以单独执行；下面的报告写入对应模块的 `Data/`：
 
-Live provider readiness still depends on configured credentials and channel
-availability, so the default CI readiness gate only fails when the runtime is
-blocked.
-
-## Architecture
-
-```mermaid
-flowchart LR
-    User["User task"] --> Loop["agent_loop.py"]
-    Loop --> Kernel["turn_kernel.py<br/>phase policy, widening,<br/>verification gate"]
-    Loop --> Memory["Memory stack<br/>working_memory.py,<br/>memory.py, memory_pipeline.py"]
-    Kernel --> Tools["Local tools<br/>files, search, edit, shell"]
-    Tools --> Loop
-    Memory --> Loop
-
-    Loop --> Signals["Signals<br/>context, cost, errors,<br/>progress, provider state"]
-    Signals --> Orchestrator["CyberneticOrchestrator"]
-    Orchestrator --> Actions["Runtime actions<br/>compact, checkpoint, rewind,<br/>adjust budget, recover, reflect"]
-    Actions --> Loop
+```powershell
+minicode-readiness --json --fail-on blocked
+minicode-readiness --bundle-out Main/MinicodeFrontline/Data/Checks/readiness-bundle --fail-on blocked
+python -m minicode.release_readiness --check-readiness-bundle Main/MinicodeFrontline/Data/Checks/readiness-bundle
+minicode-structure-check --root . --hotspots 5 --max-dependency-upstream 4 --check-material-inventory --report Package/EngineeringStructure/Data/Checks/structure-compliance.json
+python -m minicode.release_readiness --check-structure-compliance-artifact Package/EngineeringStructure/Data/Checks/structure-compliance.json
 ```
 
-What matters is not the diagram itself. What matters is that runtime state is treated as something explicit:
+`--fail-on blocked` 报告供应商 warning，但仅在运行时 blocked 时失败；要求供应商和 fallback 全部就绪时，可使用 `--fail-on warning`。真实模型能否调用仍取决于本机凭据和网络通道。
 
-- the loop can widen instead of silently stalling;
-- verification can block a premature "done";
-- memory can preserve task-critical context and re-inject project knowledge instead of relying only on the current chat window;
-- session state can survive process boundaries;
-- rewind can reverse local edits instead of asking you to clean them up by hand;
-- readiness can tell you whether failure is local logic or provider availability.
-
-## Repository Guide
-
-| Path | Role |
+| readiness 导出选项 | 内容与用途 |
 | --- | --- |
-| `minicode/` | Canonical Python package used by install and tests. |
-| `tests/` | Active test suite. |
-| `benchmarks/` | Runtime profile and release-readiness runners plus generated reports. |
-| `Docs/Documentation/` | Architecture notes, optimization history, and productization reports. |
-| `openspec/` | Specs, archived change records, and build/verify planning artifacts. |
-| `.mini-code-memory/` | Workspace-level durable memory state created by the runtime. |
-| `~/.mini-code/memory-v2/` | Shared, opt-in lossless base for authoritative events, paged and Runtime artifacts, verified cold archives, spool, and local backups. Tenant/workspace/task/run identifiers provide isolation. |
+| `--examples-out` | 只读的 fallback 配置建议，不写入凭据或修改设置。 |
+| `--doctor-out` | 供人工查看的运行时与供应商诊断。 |
+| `--repair-plan-out` | 脱敏 JSON 修复计划。 |
+| `--patch-preview-out` | 脱敏 settings merge patch 预览，由人工审查和合并。 |
+| `--bundle-out` | 上述诊断、离线 fallback 模拟与文件 manifest 的完整检查包。 |
 
-## Core Modules
+`minicode.release_readiness` 提供 manifest、脱敏、patch preview、离线模拟与发布报告校验。Manifest 记录文件存在性、大小和 SHA-256，用于发现缺失或漂移。离线模拟不调用真实供应商；供应商 live-smoke 的失败仍需保留诊断证据。更多选项通过 `python -m minicode.readiness --help`、`python -m minicode.release_readiness --help` 查看，发布检查还可参考 `benchmarks/release_readiness.py`。
 
-| Module | Purpose |
+## 源码导航
+
+| 模块 | 作用 |
 | --- | --- |
-| `minicode/agent_loop.py` | Main model and tool loop, runtime event flow, and product integration. |
-| `minicode/turn_kernel.py` | Step policy, phase transitions, widening, and verification gates. |
-| `minicode/session.py` | Durable sessions, inspect and replay views, checkpoints, and rewind helpers. |
-| `minicode/cli_commands.py` | Local product commands such as session, replay, rewind, and readiness. |
-| `minicode/memory.py` | Long-term project memory manager and retrieval surface. |
-| `minicode/working_memory.py` | Protected working-memory entries that survive compaction pressure. |
-| `minicode/memory_pipeline.py` | Closed-loop memory retrieval, injection, reflection writeback, and optimization path. |
-| `minicode/paged_memory/` | Opt-in INLINE/WORKING_SET/PAGED_MEMORY runtime, authoritative stores, artifact paging, indexing, lifecycle, and recovery tools. |
-| `minicode/product_surfaces.py` | User-facing summaries for readiness, hooks, instructions, delegation, and extensions. |
-| `minicode/readiness.py` | Standalone readiness CLI used by local checks and CI gates. |
-| `minicode/release_readiness.py` | Release-oriented runtime smoke and provider-readiness checks. |
-| `minicode/model_switcher.py` | Bounded fallback and failover selection. |
-| `minicode/runtime_profiles.py` | Runtime profiles such as `single` and `single-deep`. |
-| `minicode/cybernetic_orchestrator.py` | Runtime control lifecycle facade. |
+| `minicode/agent_loop.py` | 主 model/tool loop、runtime event flow 和产品集成。 |
+| `minicode/turn_kernel.py` | step policy、phase transition、widening 和 verification gate。 |
+| `minicode/session.py` | durable session、inspect/replay 视图、checkpoint 和 rewind helper。 |
+| `minicode/cli_commands.py` | `/session`、`/replay`、`/rewind`、`/readiness` 这类本地产品命令。 |
+| `minicode/memory.py` | 长期项目记忆管理和检索入口。 |
+| `minicode/working_memory.py` | 在 compaction 压力下仍会保留的 working memory 条目。 |
+| `minicode/memory_pipeline.py` | memory retrieval、injection、reflection writeback 和优化闭环。 |
+| `minicode/paged_memory/` | INLINE/PAGED_MEMORY 上下文、SQLite 存储、原文分页、检索、生命周期与恢复工具；WORKING_SET 为兼容输入。 |
+| `minicode/product_surfaces.py` | readiness、hooks、instructions、delegation、extensions 等用户可见摘要。 |
+| `minicode/readiness.py` | 独立 readiness CLI，用于本地检查和 CI 门禁。 |
+| `minicode/release_readiness.py` | 面向 release 的 runtime smoke 与 provider readiness 检查。 |
+| `minicode/model_switcher.py` | 有界 fallback 和 failover 选择逻辑。 |
+| `minicode/runtime_profiles.py` | `single`、`single-deep` 等 runtime profile。 |
+| `minicode/cybernetic_orchestrator.py` | runtime control 生命周期总控。 |
 
-## MiniCode Family
+## 技术文档
 
-| Version | Repository | Focus |
-| --- | --- | --- |
-| TypeScript | [LiuMengxuan04/MiniCode](https://github.com/LiuMengxuan04/MiniCode) | Mainline terminal agent, TUI, MCP, skills, sessions, and context controls. |
-| Python | [QUSETIONS/MiniCode-Python](https://github.com/QUSETIONS/MiniCode-Python) | Local-first Python runtime with stronger session, rewind, readiness, and observability surfaces. |
-| Rust | [harkerhand/MiniCode-rs](https://github.com/harkerhand/MiniCode-rs/tree/master) | Systems-side implementation and experiments. |
-| Java | [hobbescalvin414-tech/minicode4j](https://github.com/hobbescalvin414-tech/minicode4j/tree/feat/default-ts-ui) | Java implementation with a TypeScript-style UI direction. |
+如果你想继续看更深的实现与产品化记录，可以从这里开始：
 
-## Documentation
-
-Start here if you want the deeper implementation and productization record:
-
-
-- [Chinese README](./README.zh-CN.md)
+- [工作区总览与快速开始](../README.md)
+- [Web 工作台说明](../MiniCode-Web/README.md)
+- [项目学习手册](./Docs/Documentation/AgentProjectGuide/README.md)
+- [会话分叉与工作树](./Docs/Documentation/SESSION_FORK_WORKTREE.md)
+- [子代理持续协作](./Docs/Documentation/AGENT_COLLABORATION.md)
+- [浏览器截图与检查](./Docs/Documentation/BROWSER_CHECKS.md)
 - [Optimization Summary](./Docs/Documentation/OPTIMIZATION_SUMMARY.md)
 - [Memory Theory](./Docs/Documentation/memory_theory.md)
-- [Tiered Context and Lossless Out-of-Window Memory](./Docs/Documentation/PAGED_MEMORY.md)
+- [分级上下文与窗口外无损记忆](./Docs/Documentation/PAGED_MEMORY.md)
 - [Minicode-lite Productization Design](./Docs/Documentation/superpowers/specs/2026-06-05-minicode-lite-productization-design.md)
 - [Minicode-lite Build Plan](./Docs/Documentation/superpowers/plans/2026-06-05-minicode-lite-productization-build.md)
 - [Minicode-lite Verify Report](./Docs/Documentation/superpowers/reports/2026-06-05-minicode-lite-productization-verify.md)
 - [Main MiniCode Repository](https://github.com/LiuMengxuan04/MiniCode)
-
-## Design Principles
-
-- Keep the runtime inspectable.
-- Treat memory as a controllable runtime subsystem, not an afterthought.
-- Prefer measured signals over prompt folklore.
-- Make recovery a product feature, not a manual cleanup step.
-- Treat verification as part of execution, not just reporting.
-- Keep docs aligned with implemented behavior, not future ambition.

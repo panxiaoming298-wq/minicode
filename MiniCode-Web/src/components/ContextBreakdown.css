@@ -1,0 +1,13 @@
+.context-breakdown { margin-top: 14px; }
+.context-breakdown-heading { display: flex; justify-content: space-between; gap: 8px; margin-bottom: 12px; font-size: 10px; color: var(--muted); }
+.context-breakdown dl { display: grid; gap: 10px; margin: 0; font-size: 12px; }
+.context-breakdown dl > div { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+.context-breakdown dt { display: flex; align-items: center; gap: 7px; color: var(--muted); }
+.context-breakdown dd { margin: 0; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.context-breakdown dt i { display: block; width: 7px; height: 7px; flex-shrink: 0; border-radius: 2px; }
+.context-part-system { background: #a0a5af; }
+.context-part-tools { background: #9a7ce6; }
+.context-part-conversation { background: #5e92d8; }
+.context-part-memory { background: #62a58d; }
+.context-part-other { background: #c59855; }
+.context-breakdown-note { margin: 12px 0 0; color: var(--muted); font-size: 11px; line-height: 1.6; }

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-import json
 from dataclasses import asdict, dataclass, field
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -23,6 +23,12 @@ from minicode.config import (
     validate_provider_runtime,
 )
 from minicode.hooks import get_hook_manager
+from minicode.extensions import (
+    ExtensionManifest,
+    extension_manifest_payload as _extension_manifest_payload,
+    resolve_extension_set,
+    set_extension_enabled as _set_extension_enabled,
+)
 from minicode.model_registry import detect_provider
 
 
@@ -35,17 +41,10 @@ class InstructionLayer:
     exists: bool
     preview: str = ""
     content: str = ""
-
-
-@dataclass(frozen=True, slots=True)
-class ExtensionManifest:
-    name: str
-    scope: str
-    path: str
-    version: str = ""
-    description: str = ""
-    enabled: bool = True
-    entrypoint: str = ""
+    status: str = "unknown"
+    content_hash: str = ""
+    updated_at: float = 0.0
+    error: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +97,7 @@ class PromptBundle:
     readiness_report: ReadinessReport
     readiness_summary: str
     product_snapshot: dict[str, Any]
+    memory_sections: tuple[str, ...] = ()
 
 
 def _maybe_read_text(path: Path) -> str:
@@ -131,28 +131,41 @@ def collect_instruction_layers(cwd: str | Path) -> list[InstructionLayer]:
         ("global-user", "global", "user", MINI_CODE_USER_PROFILE_PATH),
         ("global-managed", "global", "managed", MINI_CODE_MANAGED_POLICY_PATH),
         ("project-claude", "project", "claude", cwd_path / "CLAUDE.md"),
+        ("project-agents", "project", "agents", cwd_path / "AGENTS.md"),
         ("project-user", "project", "user", project_user_profile_path(cwd_path)),
         ("project-managed", "project", "managed", project_managed_policy_path(cwd_path)),
     ]
     layers: list[InstructionLayer] = []
     for name, scope, kind, path in candidates:
-        content = _maybe_read_text(path) if path.exists() else ""
+        content, status, error, updated_at = "", "missing", "", 0.0
+        try:
+            content = path.read_text(encoding="utf-8-sig")
+            updated_at = path.stat().st_mtime
+            status = "available" if content.strip() else "empty"
+        except FileNotFoundError:
+            pass
+        except (OSError, UnicodeError) as exc:
+            status, error = "unreadable", type(exc).__name__
         layers.append(
             InstructionLayer(
                 name=name,
                 scope=scope,
                 kind=kind,
-                path=str(path),
-                exists=path.exists(),
+                path=str(path.absolute()),
+                exists=status != "missing",
                 preview=_preview_text(content),
                 content=content,
+                status=status,
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest() if content else "",
+                updated_at=updated_at,
+                error=error,
             )
         )
     return layers
 
 
 def format_instruction_summary(layers: list[dict[str, Any]] | list[InstructionLayer]) -> str:
-    usable = [layer for layer in layers if bool(_surface_value(layer, "exists", False))]
+    usable = [layer for layer in layers if _surface_value(layer, "status") == "available"]
     if not usable:
         return "instructions: no active layers"
     tokens = [
@@ -163,28 +176,7 @@ def format_instruction_summary(layers: list[dict[str, Any]] | list[InstructionLa
 
 
 def collect_extension_manifests(cwd: str | Path) -> list[ExtensionManifest]:
-    manifests: list[ExtensionManifest] = []
-    search_roots = extension_search_roots(cwd)
-    for scope, root in search_roots:
-        if not root.exists():
-            continue
-        for manifest_path in sorted(root.glob("*/extension.json")):
-            try:
-                payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
-                continue
-            manifests.append(
-                ExtensionManifest(
-                    name=str(payload.get("name") or manifest_path.parent.name),
-                    scope=scope,
-                    path=str(manifest_path),
-                    version=str(payload.get("version", "") or ""),
-                    description=str(payload.get("description", "") or ""),
-                    enabled=bool(payload.get("enabled", True)),
-                    entrypoint=str(payload.get("entrypoint", "") or ""),
-                )
-            )
-    return manifests
+    return resolve_extension_set(cwd, search_roots=extension_search_roots(cwd))
 
 
 def extension_search_roots(cwd: str | Path) -> list[tuple[str, Path]]:
@@ -218,7 +210,7 @@ def resolve_extension_manifest(
         for manifest in collect_extension_manifests(cwd)
         if (
             (not scope_filter or manifest.scope == scope_filter)
-            and manifest.name == name_filter
+            and name_filter in {manifest.id, manifest.name}
         )
     ]
     if not matches:
@@ -235,16 +227,10 @@ def resolve_extension_manifest(
 
 
 def extension_manifest_payload(manifest: ExtensionManifest) -> dict[str, Any]:
-    manifest_path = Path(manifest.path)
     try:
-        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError(
-            f"Failed to read extension manifest '{manifest.path}': {exc}"
-        ) from exc
-    if not isinstance(payload, dict):
-        raise ValueError(f"Extension manifest '{manifest.path}' is not a JSON object.")
-    return payload
+        return _extension_manifest_payload(manifest)
+    except RuntimeError as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def set_extension_enabled(
@@ -252,12 +238,10 @@ def set_extension_enabled(
     identifier: str,
     enabled: bool,
 ) -> ExtensionManifest:
-    manifest = resolve_extension_manifest(cwd, identifier)
-    payload = extension_manifest_payload(manifest)
-    payload["enabled"] = bool(enabled)
-    manifest_path = Path(manifest.path)
-    manifest_path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return resolve_extension_manifest(cwd, f"{manifest.scope}:{manifest.name}")
+    try:
+        return _set_extension_enabled(cwd, identifier, enabled)
+    except (RuntimeError, ValueError) as exc:
+        raise ValueError(str(exc)) from exc
 
 
 def format_extension_summary(

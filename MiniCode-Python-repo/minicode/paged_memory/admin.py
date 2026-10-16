@@ -1,12 +1,10 @@
-"""Administrative CLI for migrations, indexing, integrity, GC and restore drills."""
+"""Administrative CLI for local initialization, integrity, GC and restore drills."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import signal
 import sys
-import threading
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
@@ -16,22 +14,18 @@ from .archive import EventArchiveManager
 from .artifacts import build_artifact_store, build_encrypted_spool
 from .chunking import artifact_chunk_records
 from .config import PagedMemoryConfig
-from .indexer import OutboxIndexer, make_memory_index_outbox
 from .lifecycle import LifecycleManager
 from .models import (
     AgentEvent,
     ArtifactStatus,
     EventType,
     MemoryRecord,
-    MemoryStatus,
     MemoryType,
     SourceRange,
     content_hash_text,
 )
 from .policy import TokenBudgetManager
-from .postgres_store import PostgresMemoryStore
 from .sqlite_store import SqliteMemoryStore
-from .vector_index import build_vector_index, configured_index_descriptor
 
 
 def _json(value: Any) -> None:
@@ -39,19 +33,12 @@ def _json(value: Any) -> None:
 
 
 def _authority(config: PagedMemoryConfig) -> Any:
-    if config.backend == "postgres":
-        return PostgresMemoryStore(config.database_url)
+    config.validate()
     return SqliteMemoryStore(config.sqlite_path)
 
 
-def _components(
-    config: PagedMemoryConfig, *, with_vector: bool = False
-) -> tuple[Any, Any, Any, Any]:
-    authority = _authority(config)
-    artifacts = build_artifact_store(config)
-    spool = build_encrypted_spool(config)
-    vector = build_vector_index(config) if with_vector else None
-    return authority, artifacts, spool, vector
+def _components(config: PagedMemoryConfig) -> tuple[Any, Any, Any]:
+    return _authority(config), build_artifact_store(config), build_encrypted_spool(config)
 
 
 def _cmd_init(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
@@ -70,147 +57,12 @@ def _cmd_init(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_init_index(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    if not config.milvus_enabled:
-        raise RuntimeError("MILVUS_ENABLED=true is required")
-    vector = build_vector_index(config)
-    try:
-        _json(
-            {
-                "initialized": vector.health_check(),
-                "collection": vector.index_descriptor.collection,
-                "dimension": config.milvus_dense_dim,
-                "metric": config.milvus_metric_type,
-                "index_type": config.milvus_index_type,
-                "index_descriptor": vector.index_descriptor.to_dict(),
-            }
-        )
-    finally:
-        vector.close()
-    return 0
-
-
-def _cmd_reindex(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    if not config.milvus_enabled:
-        raise RuntimeError("MILVUS_ENABLED=true is required")
-    if args.task_id and not args.tenant_id:
-        raise ValueError("--task-id requires --tenant-id for an isolated reindex")
-    authority = _authority(config)
-    vector = build_vector_index(config)
-    try:
-        records = authority.all_memories(tenant_id=args.tenant_id, task_id=args.task_id)
-        active = [
-            record
-            for record in records
-            if record.status in {MemoryStatus.ACTIVE, MemoryStatus.OPEN}
-        ]
-        if args.dry_run:
-            _json(
-                {
-                    "dry_run": True,
-                    "candidate_count": len(active),
-                    "total_registry": len(records),
-                    "index_descriptor": vector.index_descriptor.to_dict(),
-                }
-            )
-            return 0
-        if args.rebuild:
-            indexed = vector.rebuild(
-                active,
-                tenant_id=args.tenant_id,
-                task_id=args.task_id,
-            )
-        else:
-            indexed = 0
-            for offset in range(0, len(active), config.milvus_batch_size):
-                batch = active[offset : offset + config.milvus_batch_size]
-                indexed += vector.upsert(batch)
-            flush = getattr(vector, "flush", None)
-            if callable(flush) and active:
-                flush()
-        collection = vector.index_descriptor.collection
-        for record in active:
-            authority.update_memory_indexed(
-                tenant_id=record.tenant_id,
-                task_id=record.task_id,
-                memory_id=record.id,
-                collection=collection,
-                primary_key=record.id,
-            )
-        _json(
-            {
-                "dry_run": False,
-                "indexed": indexed,
-                "collection": collection,
-                "index_descriptor": vector.index_descriptor.to_dict(),
-            }
-        )
-    finally:
-        vector.close()
-        authority.close()
-    return 0
-
-
-def _cmd_process_outbox(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    if not config.milvus_enabled:
-        raise RuntimeError("MILVUS_ENABLED=true is required")
-    authority = _authority(config)
-    vector = build_vector_index(config)
-    try:
-        report = OutboxIndexer(
-            authority=authority, vector_index=vector, config=config
-        ).drain(batch_size=args.batch_size, max_batches=args.max_batches)
-        _json(report)
-        return 0 if report["failed"] == 0 else 5
-    finally:
-        vector.close()
-        authority.close()
-
-
-def _cmd_run_indexer(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    """Run the durable outbox consumer as a long-lived service."""
-    if not config.milvus_enabled:
-        raise RuntimeError("MILVUS_ENABLED=true is required")
-    if args.batch_size < 1:
-        raise ValueError("--batch-size must be >= 1")
-    if args.poll_seconds < 0.05:
-        raise ValueError("--poll-seconds must be >= 0.05")
-    authority = _authority(config)
-    vector = build_vector_index(config)
-    stop_event = threading.Event()
-    previous_handlers: dict[signal.Signals, Any] = {}
-
-    def request_stop(_signum: int, _frame: Any) -> None:
-        stop_event.set()
-
-    try:
-        authority.initialize()
-        for signum in (signal.SIGINT, signal.SIGTERM):
-            try:
-                previous_handlers[signum] = signal.signal(signum, request_stop)
-            except (ValueError, OSError):
-                pass
-        OutboxIndexer(
-            authority=authority, vector_index=vector, config=config
-        ).run_forever(
-            stop_event=stop_event,
-            poll_seconds=args.poll_seconds,
-            batch_size=args.batch_size,
-        )
-        return 0
-    finally:
-        for signum, handler in previous_handlers.items():
-            try:
-                signal.signal(signum, handler)
-            except (ValueError, OSError):
-                pass
-        vector.close()
-        authority.close()
-
-
 def _cmd_backfill(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
     source = Path(args.source).resolve()
     source_text = source.read_text(encoding="utf-8")
+    from .markdown_export import is_generated_export
+    if source.is_relative_to(Path(config.export_root).resolve()) or is_generated_export(source_text):
+        raise ValueError('generated memory exports cannot be imported')
     source_hash = content_hash_text(source_text)
     data = json.loads(source_text)
     entries = data.get("entries", [])
@@ -293,16 +145,8 @@ def _cmd_backfill(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
                     created_at=float(entry.get("created_at", 0) or 0),
                     updated_at=float(entry.get("updated_at", 0) or 0),
                 )
-                outbox = (
-                    make_memory_index_outbox(
-                        memory,
-                        index_descriptor=configured_index_descriptor(config),
-                    )
-                    if config.milvus_enabled and config.indexer_enabled
-                    else None
-                )
                 stored_event, _ = authority.persist_event(
-                    event, memory=memory, outbox=outbox
+                    event, memory=memory
                 )
                 counts["imported"] += 1 if stored_event.id == event.id else 0
                 counts["skipped"] += 1 if stored_event.id != event.id else 0
@@ -328,8 +172,7 @@ def _cmd_backfill_artifact_chunks(
 ) -> int:
     """Idempotently project historical text Artifacts into bounded search cards."""
 
-    authority, artifacts, spool, _vector = _components(config, with_vector=False)
-    descriptor = configured_index_descriptor(config)
+    authority, artifacts, spool = _components(config)
     token_budget = TokenBudgetManager()
     report: dict[str, Any] = {
         "dry_run": not args.apply,
@@ -467,15 +310,7 @@ def _cmd_backfill_artifact_chunks(
                     report["missing_chunks"] += 1
                     if not args.apply:
                         continue
-                    outbox = (
-                        make_memory_index_outbox(
-                            chunk,
-                            index_descriptor=descriptor,
-                        )
-                        if config.milvus_enabled and config.indexer_enabled
-                        else None
-                    )
-                    stored = authority.put_memory(chunk, outbox=outbox)
+                    stored = authority.put_memory(chunk)
                     if stored.content_hash != chunk.content_hash:
                         raise ValueError("stored chunk conflicts with source bytes")
                     chunk_by_range[key] = stored
@@ -487,8 +322,6 @@ def _cmd_backfill_artifact_chunks(
                         "error": type(exc).__name__,
                     }
                 )
-        if config.milvus_enabled and config.indexer_enabled:
-            report["index_descriptor"] = descriptor.to_dict()
         _json(report)
         return 0 if not report["errors"] else 5
     finally:
@@ -500,45 +333,52 @@ def _cmd_backfill_artifact_chunks(
 
 
 def _cmd_verify(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    authority, artifacts, spool, vector = _components(config, with_vector=False)
-    vector_error = ""
-    if config.milvus_enabled:
-        try:
-            vector = build_vector_index(config)
-        except Exception as exc:  # noqa: BLE001 - verification reports this as invalid.
-            vector_error = type(exc).__name__
+    authority, artifacts, spool = _components(config)
     try:
         report = LifecycleManager(
             authority=authority,
             artifact_store=artifacts,
             spool_store=spool,
-            vector_index=vector,
             config=config,
         ).reference_integrity_scan(
             tenant_id=args.tenant_id,
             task_id=args.task_id,
             verify_payload_hashes=not args.skip_payload_hashes,
         )
-        if vector_error:
-            report["vector_error"] = vector_error
         _json(report)
         return 0 if report["valid"] else 3
     finally:
-        for component in (vector, spool, artifacts):
+        for component in (spool, artifacts):
             close = getattr(component, "close", None)
             if callable(close):
                 close()
         authority.close()
 
 
+def _cmd_backfill_tool_chunks(config, args):
+    from .tool_chunk_backfill import backfill_tool_chunks
+    authority, artifacts, spool = _components(config)
+    try:
+        report = backfill_tool_chunks(authority=authority, artifacts=artifacts, spool=spool,
+            config=config, tenant_id=args.tenant_id, task_id=args.task_id, apply=args.apply,
+            cursor=args.cursor, limit=args.limit, model_name=args.model,
+            max_source_bytes=args.max_source_bytes, timeout=args.timeout_seconds)
+        _json(report)
+        return 5 if report["errors"] else 0
+    finally:
+        for component in (spool, artifacts, authority):
+            close = getattr(component, "close", None)
+            if callable(close):
+                close()
+
+
 def _cmd_gc(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    authority, artifacts, spool, vector = _components(config, with_vector=False)
+    authority, artifacts, spool = _components(config)
     try:
         report = LifecycleManager(
             authority=authority,
             artifact_store=artifacts,
             spool_store=spool,
-            vector_index=vector,
             config=config,
         ).gc_orphans(
             tenant_id=args.tenant_id,
@@ -559,8 +399,6 @@ def _cmd_replay_artifacts(config: PagedMemoryConfig, args: argparse.Namespace) -
         enabled=True,
         shadow_write=False,
         tenant_id=args.tenant_id,
-        milvus_enabled=False,
-        indexer_enabled=False,
     )
     recovery_config.validate()
     runtime = PagedMemoryRuntime(
@@ -587,7 +425,7 @@ def _cmd_replay_artifacts(config: PagedMemoryConfig, args: argparse.Namespace) -
 
 
 def _cmd_backup(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    authority, artifacts, spool, _vector = _components(config, with_vector=False)
+    authority, artifacts, spool = _components(config)
     try:
         manager = LifecycleManager(
             authority=authority,
@@ -603,7 +441,7 @@ def _cmd_backup(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
 
 
 def _cmd_restore_drill(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    authority, artifacts, spool, _vector = _components(config, with_vector=False)
+    authority, artifacts, spool = _components(config)
     try:
         report = LifecycleManager(
             authority=authority,
@@ -617,8 +455,26 @@ def _cmd_restore_drill(config: PagedMemoryConfig, args: argparse.Namespace) -> i
     return 0
 
 
+def _cmd_export_markdown(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
+    from .markdown_export import export_markdown
+    _json(export_markdown(config, tenant_id=args.tenant_id or config.tenant_id,
+                          task_id=args.task_id, workspace_id=args.workspace_id))
+    return 0
+
+
+def _cmd_restore(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
+    authority, artifacts, spool = _components(config)
+    try:
+        target = LifecycleManager(authority=authority, artifact_store=artifacts, spool_store=spool,
+                                  config=config).restore_local_backup(args.backup, target_directory=args.target)
+        _json({'restored': True, 'directory': str(target)})
+    finally:
+        authority.close()
+    return 0
+
+
 def _cmd_retention(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    authority, artifacts, spool, _vector = _components(config, with_vector=False)
+    authority, artifacts, spool = _components(config)
     try:
         manager = LifecycleManager(
             authority=authority,
@@ -646,15 +502,14 @@ def _cmd_retention(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
 
 
 def _cmd_delete(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
-    authority, artifacts, spool, vector = _components(
-        config, with_vector=config.milvus_enabled
+    authority, artifacts, spool = _components(
+        config
     )
     try:
         report = LifecycleManager(
             authority=authority,
             artifact_store=artifacts,
             spool_store=spool,
-            vector_index=vector,
             config=config,
         ).delete_task(
             tenant_id=args.tenant_id,
@@ -665,8 +520,6 @@ def _cmd_delete(config: PagedMemoryConfig, args: argparse.Namespace) -> int:
         )
         _json(report)
     finally:
-        if vector is not None:
-            vector.close()
         authority.close()
     return 0
 
@@ -799,30 +652,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--cwd", default=".", help="workspace used to resolve local memory paths"
     )
+    parser.add_argument(
+        "--use-settings",
+        action="store_true",
+        help="load native MiniCode user settings; environment overrides still apply",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("init-db")
-    subparsers.add_parser("init-index")
 
-    reindex = subparsers.add_parser("reindex")
-    reindex.add_argument(
-        "--tenant-id", default=None, help="replace only this tenant during --rebuild"
-    )
-    reindex.add_argument(
-        "--task-id",
-        default=None,
-        help="replace only this task; requires --tenant-id",
-    )
-    reindex.add_argument("--dry-run", action="store_true")
-    reindex.add_argument("--rebuild", action="store_true")
-
-    process_outbox = subparsers.add_parser("process-outbox")
-    process_outbox.add_argument("--batch-size", type=int, default=100)
-    process_outbox.add_argument("--max-batches", type=int, default=100)
-
-    run_indexer = subparsers.add_parser("run-indexer")
-    run_indexer.add_argument("--batch-size", type=int, default=100)
-    run_indexer.add_argument("--poll-seconds", type=float, default=1.0)
+    setup = subparsers.add_parser("configure-local")
+    setup.add_argument("--data-root", required=True, help="absolute data directory; no remote data migration")
 
     backfill = subparsers.add_parser("backfill")
     backfill.add_argument("--source", default=".mini-code-memory/memory.json")
@@ -847,6 +687,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="write missing chunks; default is dry-run",
     )
 
+    tool_chunks = subparsers.add_parser("backfill-tool-chunks", help="resume bounded inline/artifact search-index repair")
+    tool_chunks.add_argument("--tenant-id", required=True)
+    tool_chunks.add_argument("--task-id", required=True)
+    tool_chunks.add_argument("--apply", action="store_true", help="write missing derived cards; default is dry-run")
+    tool_chunks.add_argument("--limit", type=int, default=25, help="maximum source events in this batch (1-100)")
+    tool_chunks.add_argument("--cursor", default="", help="next_cursor from a previous batch with the same mode/scope")
+    tool_chunks.add_argument("--model", default="", help="model used for capture-time chunk token estimates")
+    tool_chunks.add_argument("--max-source-bytes", type=int, default=8 * 1024 * 1024,
+                             help="per-source byte budget; increase explicitly for large originals (max 64 MiB)")
+    tool_chunks.add_argument("--timeout-seconds", type=float, default=10.0,
+                             help="batch deadline, checked between sources and database operations (max 60)")
+
     verify = subparsers.add_parser("verify")
     verify.add_argument("--tenant-id", required=True)
     verify.add_argument("--task-id", required=True)
@@ -868,6 +720,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     drill = subparsers.add_parser("restore-drill")
     drill.add_argument("backup")
+
+    restore = subparsers.add_parser("restore")
+    restore.add_argument("backup")
+    restore.add_argument("--target", required=True, help="new or empty directory; never overwrites live data")
+
+    export = subparsers.add_parser("export-markdown")
+    export.add_argument("--tenant-id", default=None)
+    export.add_argument("--task-id", default=None)
+    export.add_argument("--workspace-id", default=None)
 
     retention = subparsers.add_parser("set-retention")
     retention.add_argument("--tenant-id", required=True)
@@ -943,21 +804,33 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == 'configure-local':
+        from .local_setup import configure_local_storage
+        try:
+            _json(configure_local_storage(args.data_root))
+            return 0
+        except Exception as exc:
+            print(f'minicode-memory: {type(exc).__name__}: {exc}', file=sys.stderr)
+            return 1
     cwd = Path(args.cwd).resolve()
-    config = PagedMemoryConfig.from_sources(cwd=cwd)
+    runtime = None
+    if args.use_settings:
+        from minicode.config import load_effective_settings
+
+        runtime = load_effective_settings(cwd)
+    config = PagedMemoryConfig.from_sources(runtime=runtime, cwd=cwd)
     commands = {
         "init-db": _cmd_init,
-        "init-index": _cmd_init_index,
-        "reindex": _cmd_reindex,
-        "process-outbox": _cmd_process_outbox,
-        "run-indexer": _cmd_run_indexer,
         "backfill": _cmd_backfill,
         "backfill-artifact-chunks": _cmd_backfill_artifact_chunks,
+        "backfill-tool-chunks": _cmd_backfill_tool_chunks,
         "verify": _cmd_verify,
         "gc-artifacts": _cmd_gc,
         "replay-artifacts": _cmd_replay_artifacts,
         "backup": _cmd_backup,
         "restore-drill": _cmd_restore_drill,
+        "restore": _cmd_restore,
+        "export-markdown": _cmd_export_markdown,
         "set-retention": _cmd_retention,
         "delete-task": _cmd_delete,
         "deletion-audit": _cmd_deletion_audit,

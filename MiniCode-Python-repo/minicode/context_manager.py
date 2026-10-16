@@ -9,10 +9,12 @@ from __future__ import annotations
 import json
 import re
 import time
-from dataclasses import dataclass, field
+from copy import deepcopy
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from minicode.config import MINI_CODE_DIR
+from minicode.model_registry import MODEL_ID_ALIASES
 
 
 # ---------------------------------------------------------------------------
@@ -62,12 +64,13 @@ DEFAULT_CONTEXT_WINDOWS = {
 
 
 class ModelContextWindow:
-    __slots__ = ("context_window", "output_reserve", "effective_input")
+    __slots__ = ("context_window", "output_reserve", "effective_input", "known")
 
-    def __init__(self, context_window: int, output_reserve: int) -> None:
+    def __init__(self, context_window: int, output_reserve: int, *, known: bool = True) -> None:
         self.context_window = context_window
         self.output_reserve = output_reserve
         self.effective_input = context_window - output_reserve
+        self.known = known
 
 
 _UNKNOWN_MODEL_CONTEXT = (128_000, 8_000)
@@ -91,7 +94,7 @@ _MODEL_CONTEXT_RULES: list[tuple[list[str], int, int]] = [
     (["gemini-2.5-pro", "gemini 2.5 pro"], 1_048_576, 16_000),
     (["gemini-2.5-flash-lite", "gemini 2.5 flash-lite"], 1_048_576, 16_000),
     (["gemini-2.5-flash", "gemini 2.5 flash"], 1_048_576, 16_000),
-    (["deepseek-v4-pro", "deepseek-v4-flash"], 1_000_000, 384_000),
+    (["deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"], 1_000_000, 384_000),
     (["deepseek-reasoner"], 128_000, 16_000),
     (["deepseek-chat"], 128_000, 4_000),
 ]
@@ -104,11 +107,32 @@ def get_model_context_window(model: str) -> ModelContextWindow:
     Falls back to 128k / 8k reserve for unknown models.
     """
     normalized = (model or "").strip().lower()
+    normalized = MODEL_ID_ALIASES.get(normalized, normalized)
     for patterns, context_window, output_reserve in _MODEL_CONTEXT_RULES:
         if any(pattern in normalized for pattern in patterns):
             return ModelContextWindow(context_window, output_reserve)
     context_window, output_reserve = _UNKNOWN_MODEL_CONTEXT
-    return ModelContextWindow(context_window, output_reserve)
+    return ModelContextWindow(context_window, output_reserve, known=False)
+
+
+def configured_context_cap(runtime: dict[str, Any] | None = None) -> int:
+    """A local operating ceiling; it cannot enlarge the provider's window."""
+    runtime = runtime or {}
+    caps = []
+    for key in ("contextWindow", "maxContextTokens"):
+        try:
+            value = int(runtime.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            caps.append(value)
+    return min(caps) if caps else 0
+
+
+def resolve_context_limit(model: str, runtime: dict[str, Any] | None = None) -> int:
+    capacity = get_model_context_window(model).context_window
+    cap = configured_context_cap(runtime)
+    return min(capacity, cap) if cap else capacity
 
 # Auto-compaction threshold (95% of context window)
 AUTOCOMPACT_THRESHOLD = 0.95
@@ -280,9 +304,18 @@ def token_count_with_estimation(messages: list[dict[str, Any]]) -> dict[str, Any
     }
 
 
-def compute_context_stats(messages: list[dict[str, Any]], model: str) -> dict[str, Any]:
+def compute_context_stats(messages: list[dict[str, Any]], model: str,
+                          runtime: dict[str, Any] | None = None) -> dict[str, Any]:
     """Context stats with utilization + warning level (port of TS computeContextStats)."""
     window = get_model_context_window(model)
+    if runtime is not None:
+        from minicode.paged_memory.config import PagedMemoryConfig
+
+        memory = PagedMemoryConfig.from_sources(runtime)
+        limit = resolve_context_limit(model, runtime)
+        reserve = (memory.output_token_reserve + memory.safety_token_reserve
+                   if memory.enabled else min(window.output_reserve, max(0, limit - 1)))
+        window = ModelContextWindow(limit, min(reserve, max(0, limit - 1)))
     accounting = token_count_with_estimation(messages)
     effective = window.effective_input or 1
     utilization = min(1.0, accounting["total_tokens"] / effective)
@@ -575,18 +608,32 @@ class ContextManager:
     
     # 多级压缩支持
     _compaction_level: int = field(default_factory=lambda: 0)  # 0=无压缩, 1=轻微, 2=中等, 3=深度
+    context_cap: int = 0
     
     # 多级压缩目标 (相对于 context window 的百分比)
     _COMPACTION_LEVELS = [0.70, 0.50, 0.30]  # 轻度/中度/深度
     
     def __post_init__(self):
-        if self.context_window == 0:
-            self.context_window = get_model_context_window(self.model).context_window
+        limit = resolve_context_limit(self.model, {"contextWindow": self.context_cap})
+        self.context_window = min(self.context_window, limit) if self.context_window > 0 else limit
+
+    @classmethod
+    def from_runtime(cls, runtime: dict[str, Any]) -> ContextManager:
+        return cls(model=str(runtime.get("model", "default")), context_cap=configured_context_cap(runtime))
 
     def update_model(self, model: str) -> None:
         """Update model and adjust context window."""
         self.model = model
-        self.context_window = get_model_context_window(model).context_window
+        self.context_window = resolve_context_limit(model, {"contextWindow": self.context_cap})
+
+    def fork(self) -> ContextManager:
+        """Give a Worker its own mutable context while preserving configuration."""
+        return replace(
+            self,
+            messages=deepcopy(self.messages),
+            compaction_history=deepcopy(self.compaction_history),
+            _token_cache={},
+        )
     
     def add_message(self, message: dict[str, Any]) -> None:
         """Add a message and update tracking."""
@@ -1024,6 +1071,7 @@ def save_context_state(manager: ContextManager) -> None:
     state = {
         "model": manager.model,
         "context_window": manager.context_window,
+        "context_cap": manager.context_cap,
         "messages": manager.messages,
         "compaction_history": manager.compaction_history[-10:],  # Keep last 10
         "_compaction_level": manager._compaction_level,  # Save compaction level
@@ -1043,6 +1091,7 @@ def load_context_state() -> ContextManager | None:
         manager = ContextManager(
             model=state.get("model", "default"),
             context_window=state.get("context_window", 0),
+            context_cap=state.get("context_cap", 0),
             messages=state.get("messages", []),
             compaction_history=state.get("compaction_history", []),
         )

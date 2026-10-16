@@ -3,12 +3,17 @@ from __future__ import annotations
 import inspect
 import json
 import os
+import tempfile
+import threading
 from pathlib import Path
-from urllib.parse import urlparse
 from typing import Any
+from urllib.parse import urlparse
 
+from minicode.search_configuration import runtime_search_configuration
+from minicode.state_paths import configure_process_temporary_directory, select_state_directory
 
-MINI_CODE_DIR = Path.home() / ".mini-code"
+MINI_CODE_DIR, ISOLATED_STATE_DIRECTORY = select_state_directory(os.environ, Path.home())
+configure_process_temporary_directory(os.environ, Path.home(), MINI_CODE_DIR)
 MINI_CODE_SETTINGS_PATH = MINI_CODE_DIR / "settings.json"
 MINI_CODE_HISTORY_PATH = MINI_CODE_DIR / "history.json"
 MINI_CODE_PERMISSIONS_PATH = MINI_CODE_DIR / "permissions.json"
@@ -16,7 +21,9 @@ MINI_CODE_MCP_PATH = MINI_CODE_DIR / "mcp.json"
 MINI_CODE_USER_PROFILE_PATH = MINI_CODE_DIR / "USER.md"
 MINI_CODE_MANAGED_POLICY_PATH = MINI_CODE_DIR / "MANAGED.md"
 MINI_CODE_EXTENSIONS_DIR = MINI_CODE_DIR / "extensions"
-CLAUDE_SETTINGS_PATH = Path.home() / ".claude" / "settings.json"
+CLAUDE_SETTINGS_PATH = (MINI_CODE_DIR / "claude-settings.json" if ISOLATED_STATE_DIRECTORY
+                        else Path.home() / ".claude" / "settings.json")
+_SETTINGS_WRITE_LOCK = threading.RLock()
 
 
 def project_user_profile_path(cwd: str | Path | None = None) -> Path:
@@ -51,6 +58,10 @@ KNOWN_MODELS = [
     "deepseek-v4-flash",
     "deepseek-v4-flash-vision-exp",
     "deepseek-v4-pro[1m]",
+    # Alibaba Cloud Model Studio / Bailian
+    "qwen-plus",
+    "qwen-max",
+    "qwen-turbo",
     # OpenRouter popular models
     "openrouter/auto",
     "anthropic/claude-sonnet-4",
@@ -96,6 +107,7 @@ def configured_model_fallbacks(
         "anthropic": "anthropicFallbackModels",
         "openai": "openaiFallbackModels",
         "deepseek": "deepseekFallbackModels",
+        "bailian": "bailianFallbackModels",
         "openrouter": "openrouterFallbackModels",
         "custom": "customFallbackModels",
     }
@@ -123,6 +135,7 @@ def default_model_fallbacks(
 
     has_openai = bool(runtime.get("openaiApiKey")) and _is_valid_http_url(runtime.get("openaiBaseUrl"))
     has_deepseek = bool(runtime.get("deepseekApiKey")) and _is_valid_http_url(runtime.get("deepseekBaseUrl"))
+    has_bailian = bool(runtime.get("bailianApiKey")) and _is_valid_http_url(runtime.get("bailianBaseUrl"))
     has_openrouter = bool(runtime.get("openrouterApiKey")) and _is_valid_http_url(runtime.get("openrouterBaseUrl"))
 
     if provider_key == "anthropic":
@@ -159,6 +172,19 @@ def default_model_fallbacks(
             candidates.append("openrouter/auto")
         elif has_openai:
             candidates.append("gpt-4o-mini")
+    elif provider_key == "bailian":
+        if active_model == "qwen-plus":
+            candidates.extend(["qwen-turbo", "qwen-max"])
+        elif active_model == "qwen-max":
+            candidates.extend(["qwen-plus", "qwen-turbo"])
+        elif active_model == "qwen-turbo":
+            candidates.extend(["qwen-plus", "qwen-max"])
+        else:
+            candidates.extend(["qwen-plus", "qwen-turbo"])
+        if has_openrouter:
+            candidates.append("openrouter/auto")
+        elif has_openai:
+            candidates.append("gpt-4o-mini")
     elif provider_key == "openrouter":
         candidates.append("openrouter/auto")
         if has_openai:
@@ -170,6 +196,8 @@ def default_model_fallbacks(
             candidates.append("openrouter/auto")
         elif has_deepseek:
             candidates.append("deepseek-v4-flash")
+        elif has_bailian:
+            candidates.append("qwen-plus")
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -238,6 +266,11 @@ def describe_provider_channel(
         if runtime.get("deepseekApiKey") and _is_valid_http_url(runtime.get("deepseekBaseUrl")):
             return "deepseek via deepseekApiKey/deepseekBaseUrl"
         return "deepseek channel not configured"
+
+    if provider_key == "bailian":
+        if runtime.get("bailianApiKey") and _is_valid_http_url(runtime.get("bailianBaseUrl")):
+            return "bailian via DASHSCOPE_API_KEY/bailianBaseUrl"
+        return "bailian channel not configured"
 
     if provider_key == "openrouter":
         if runtime.get("openrouterApiKey") and _is_valid_http_url(runtime.get("openrouterBaseUrl")):
@@ -362,6 +395,7 @@ def describe_fallback_guidance(
         "anthropic": "anthropicFallbackModels",
         "openai": "openaiFallbackModels",
         "deepseek": "deepseekFallbackModels",
+        "bailian": "bailianFallbackModels",
         "openrouter": "openrouterFallbackModels",
         "custom": "customFallbackModels",
     }.get(provider_key, "fallbackModels")
@@ -400,25 +434,32 @@ def describe_fallback_guidance(
             )
 
     if provider_key in {"anthropic", "custom"}:
-        if not runtime.get("openaiApiKey") and not runtime.get("deepseekApiKey") and not runtime.get("openrouterApiKey") and not runtime.get("customApiKey"):
+        if not runtime.get("openaiApiKey") and not runtime.get("deepseekApiKey") and not runtime.get("bailianApiKey") and not runtime.get("openrouterApiKey") and not runtime.get("customApiKey"):
             guidance.append(
-                "No local fallback credentials are configured for OpenAI, DeepSeek, OpenRouter, or custom providers."
+                "No local fallback credentials are configured for OpenAI, DeepSeek, Bailian, OpenRouter, or custom providers."
             )
     elif provider_key == "openai":
-        if not runtime.get("deepseekApiKey") and not runtime.get("openrouterApiKey") and not runtime.get("customApiKey"):
+        if not runtime.get("deepseekApiKey") and not runtime.get("bailianApiKey") and not runtime.get("openrouterApiKey") and not runtime.get("customApiKey"):
             guidance.append(
-                "No local fallback credentials are configured for DeepSeek, OpenRouter, or custom providers."
+                "No local fallback credentials are configured for DeepSeek, Bailian, OpenRouter, or custom providers."
             )
     elif provider_key == "deepseek":
-        if not runtime.get("openaiApiKey") and not runtime.get("openrouterApiKey") and not runtime.get("customApiKey"):
+        if not runtime.get("openaiApiKey") and not runtime.get("bailianApiKey") and not runtime.get("openrouterApiKey") and not runtime.get("customApiKey"):
             guidance.append(
                 "No local fallback credentials are configured outside the DeepSeek provider."
             )
-    elif provider_key == "openrouter":
-        if not runtime.get("openaiApiKey") and not runtime.get("customApiKey"):
+    elif provider_key == "bailian":
+        if not runtime.get("openaiApiKey") and not runtime.get("deepseekApiKey") and not runtime.get("openrouterApiKey") and not runtime.get("customApiKey"):
             guidance.append(
-                "No local fallback credentials are configured for OpenAI or custom providers."
+                "No local fallback credentials are configured outside the Bailian provider."
             )
+    elif provider_key == "openrouter" and not any(
+        runtime.get(key)
+        for key in ("openaiApiKey", "bailianApiKey", "customApiKey")
+    ):
+        guidance.append(
+            "No local fallback credentials are configured for OpenAI, Bailian, or custom providers."
+        )
 
     ordered: list[str] = []
     seen: set[str] = set()
@@ -494,6 +535,13 @@ def merge_settings(base: dict[str, Any], override: dict[str, Any]) -> dict[str, 
     }
 
 
+def runtime_sessions_directory() -> Path:
+    """Keep mutable session carriers beside an explicitly selected data root."""
+    settings = read_settings_file(MINI_CODE_SETTINGS_PATH)
+    root = os.environ.get("MINI_CODE_DATA_ROOT") or settings.get("memoryDataRoot")
+    return Path(str(root)).expanduser().resolve() / "sessions" if root else MINI_CODE_DIR / "sessions"
+
+
 def load_effective_settings(
     cwd: str | Path | None = None,
     *,
@@ -528,20 +576,35 @@ def load_effective_settings(
 
 
 def save_mini_code_settings(updates: dict[str, Any]) -> None:
-    MINI_CODE_DIR.mkdir(parents=True, exist_ok=True)
-    existing = read_settings_file(MINI_CODE_SETTINGS_PATH)
-    next_settings = merge_settings(existing, updates)
-    MINI_CODE_SETTINGS_PATH.write_text(
-        json.dumps(next_settings, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    with _SETTINGS_WRITE_LOCK:
+        MINI_CODE_DIR.mkdir(parents=True, exist_ok=True)
+        existing = read_settings_file(MINI_CODE_SETTINGS_PATH)
+        next_settings = merge_settings(existing, updates)
+        temporary: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=MINI_CODE_DIR, prefix=".settings-", suffix=".tmp", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(json.dumps(next_settings, indent=2) + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            # Concurrent readers see one complete version.
+            os.replace(temporary, MINI_CODE_SETTINGS_PATH)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
 
 
 def load_runtime_config(
     cwd: str | Path | None = None,
     *,
     trust_project_mcp: bool | None = None,
+    runtime_orchestration: str | None = None,
 ) -> dict[str, Any]:
+    if runtime_orchestration is not None:
+        # Validate a per-call selection before reading any configuration. It
+        # wins over saved/environment routing without mutating either source.
+        if not isinstance(runtime_orchestration, str) or runtime_orchestration.strip().lower() not in {"legacy", "primary"}:
+            raise ValueError("runtime_orchestration must be 'legacy' or 'primary'")
     if trust_project_mcp is None:
         trust_project_mcp = os.environ.get("MINI_CODE_TRUST_PROJECT_MCP", "").strip().lower() in (
             "1", "true", "yes", "on",
@@ -561,6 +624,8 @@ def load_runtime_config(
         effective = load_effective(cwd)
     settings_env = dict(effective.get("env", {}))
     env = {**settings_env, **os.environ}
+    if runtime_orchestration is not None:
+        env["MINI_CODE_RUNTIME_ORCHESTRATION"] = runtime_orchestration
 
     def runtime_setting(name: str, *, prefer_settings_env: bool = False) -> str:
         if prefer_settings_env:
@@ -580,6 +645,7 @@ def load_runtime_config(
         or effective.get("provider", "")
         or runtime_setting("MINI_CODE_PROVIDER", prefer_settings_env=True)
     ).strip().lower()
+    extension_provider_name = ""
     if provider_name:
         from minicode.model_registry import Provider
 
@@ -587,10 +653,16 @@ def load_runtime_config(
             provider.value for provider in Provider if provider.value != "mock"
         }
         if provider_name not in supported_providers:
-            supported = ", ".join(sorted(supported_providers))
-            raise RuntimeError(
-                f"Unsupported provider '{provider_name}'. Supported providers: {supported}."
-            )
+            from minicode.extensions import extension_provider_presets
+
+            provider_presets = extension_provider_presets(cwd or Path.cwd())
+            if provider_name in provider_presets:
+                extension_provider_name = provider_name
+            else:
+                supported = ", ".join(sorted(supported_providers | set(provider_presets)))
+                raise RuntimeError(
+                    f"Unsupported provider '{provider_name}'. Supported providers: {supported}."
+                )
 
     model = (
         os.environ.get("MINI_CODE_MODEL")
@@ -637,6 +709,19 @@ def load_runtime_config(
         or effective.get("deepseekReasoningEffort", "")
     )
 
+    # Alibaba Cloud Model Studio (Bailian) OpenAI-compatible API
+    bailian_base_url = (
+        runtime_setting("DASHSCOPE_BASE_URL", prefer_settings_env=True)
+        or runtime_setting("BAILIAN_BASE_URL", prefer_settings_env=True)
+        or effective.get("bailianBaseUrl", "")
+        or "https://dashscope.aliyuncs.com/compatible-mode/v1"
+    )
+    bailian_api_key = (
+        runtime_setting("DASHSCOPE_API_KEY", prefer_settings_env=True)
+        or runtime_setting("BAILIAN_API_KEY", prefer_settings_env=True)
+        or effective.get("bailianApiKey", "")
+    )
+
     # OpenRouter
     openrouter_base_url = (
         runtime_setting("OPENROUTER_BASE_URL", prefer_settings_env=True)
@@ -672,8 +757,8 @@ def load_runtime_config(
     # Validate: at least one auth method must be available
     has_auth = any([
         auth_token, api_key, openai_api_key, deepseek_api_key,
-        openrouter_api_key, custom_api_key,
-    ])
+        bailian_api_key, openrouter_api_key, custom_api_key,
+    ]) or bool(extension_provider_name)
     if not model:
         raise RuntimeError(
             "No model configured. Set ~/.mini-code/settings.json, MINI_CODE_MODEL, "
@@ -682,7 +767,7 @@ def load_runtime_config(
     if not has_auth:
         raise RuntimeError(
             "No auth configured. Set one of: ANTHROPIC_API_KEY, OPENAI_API_KEY, "
-            "DEEPSEEK_API_KEY, OPENROUTER_API_KEY, or CUSTOM_API_KEY."
+            "DEEPSEEK_API_KEY, DASHSCOPE_API_KEY, OPENROUTER_API_KEY, or CUSTOM_API_KEY."
         )
 
     # --- User profile paths ---
@@ -719,6 +804,11 @@ def load_runtime_config(
         os.environ.get("DEEPSEEK_MODEL_FALLBACKS", "")
         or effective.get("deepseekFallbackModels", [])
     )
+    bailian_fallback_models = _coerce_model_list(
+        os.environ.get("BAILIAN_MODEL_FALLBACKS", "")
+        or os.environ.get("DASHSCOPE_MODEL_FALLBACKS", "")
+        or effective.get("bailianFallbackModels", [])
+    )
     openrouter_fallback_models = _coerce_model_list(
         os.environ.get("OPENROUTER_MODEL_FALLBACKS", "")
         or effective.get("openrouterFallbackModels", [])
@@ -728,7 +818,7 @@ def load_runtime_config(
         or effective.get("customFallbackModels", [])
     )
 
-    return {
+    runtime_config = {
         "model": model,
         "configuredModel": model,
         "provider": provider_name,
@@ -759,11 +849,15 @@ def load_runtime_config(
         "deepseekApiKey": deepseek_api_key,
         "deepseekThinking": str(deepseek_thinking or "").strip().lower(),
         "deepseekReasoningEffort": str(deepseek_reasoning_effort or "").strip().lower(),
+        "bailianBaseUrl": bailian_base_url,
+        "bailianApiKey": bailian_api_key,
         "openrouterBaseUrl": openrouter_base_url,
         "openrouterApiKey": openrouter_api_key,
         "customBaseUrl": custom_base_url,
         "customApiKey": custom_api_key,
+        **runtime_search_configuration(effective),
         "maxOutputTokens": max_output_tokens,
+        "runtimeModelPricing": effective.get("runtimeModelPricing", {}),
         "mcpServers": effective.get("mcpServers", {}),
         "globalUserProfilePath": str(global_user_profile),
         "projectUserProfilePath": str(proj_user_profile),
@@ -777,6 +871,7 @@ def load_runtime_config(
         "anthropicFallbackModels": anthropic_fallback_models,
         "openaiFallbackModels": openai_fallback_models,
         "deepseekFallbackModels": deepseek_fallback_models,
+        "bailianFallbackModels": bailian_fallback_models,
         "openrouterFallbackModels": openrouter_fallback_models,
         "customFallbackModels": custom_fallback_models,
         "runtimeProfile": str(
@@ -798,14 +893,32 @@ def load_runtime_config(
         "toolProfile": str(
             os.environ.get("MINI_CODE_TOOL_PROFILE")
             or effective.get("toolProfile", "")
-            or "core"
+            or "full"
+        ).strip().lower(),
+        "agentProfile": str(
+            os.environ.get("MINI_CODE_AGENT_PROFILE")
+            or effective.get("agentProfile", "")
+            or ""
         ).strip().lower(),
         **{
             key: effective[key]
             for key in (
+                "runtimeMaxTokens", "runtimeMaxCost", "runtimeDeadline", "runtimeNetworkAccess",
+                "contextWindow", "maxContextTokens",
                 "memoryV2", "memoryShadowWrite", "memoryModeAuto",
+                "memoryHandoffNotesEnabled", "memoryHandoffNoteTokenBudget",
+                "memoryContextRotationEnabled",
+                "memoryContextModePolicyEnabled", "memoryToolResultProjectionEnabled",
+                "memoryToolResultReclaimPolicyEnabled", "memoryToolResultReclaimMinTokens",
+                "memoryToolResultReclaimMinRatio",
+                "memoryElasticContextBudgetEnabled", "memoryRecentMemoryTokenBudget",
+                "memoryContextUtilizationEnabled", "memoryContextNoteWarningRatio",
+                "memoryContextRotationTargetRatio", "memoryContextProtectionRatio",
+                "memoryContextGrowthReserveTokens", "memoryContextRecoveryMaxSteps",
+                "memoryCodeFocusEnabled",
                 "memoryModeDefault", "memoryModeOverride", "memoryBackend",
-                "memoryDatabaseUrl", "memorySqlitePath", "memoryTenantId",
+                "memorySqlitePath", "memoryTenantId",
+                "memoryDataRoot", "memoryExportRoot", "sessionHistoryBackend",
                 "memoryWorkspaceId", "memoryUserId",
                 "memoryWorkingSetContextRatio", "memoryPagedContextRatio",
                 "memoryWorkingSetStepThreshold", "memoryPagedStepThreshold",
@@ -814,29 +927,99 @@ def load_runtime_config(
                 "memoryRecentEventTokenBudget", "memoryWorkingSetTokenBudget",
                 "memorySupplementalTokenBudget", "memoryRawPageTokenLimit",
                 "memoryCandidateLimit", "memoryOutputTokenReserve",
+                "memoryLexicalCandidateLimit", "memoryContextCardLimit", "memoryRetrievalRefillMultiplier",
+                "memoryRetrievalTimeoutSeconds", "memoryContextRetrievalTimeoutSeconds",
+                "memoryPostRerankRefill",
+                "memorySourceNeighborLimit",
+                "memoryAdaptiveRetrieval",
+                "memoryAdaptiveMinCandidates",
+                "memoryAdaptiveMaxCandidates",
+                "memoryRerankEnabled",
+                "memoryRerankShadow",
+                "memoryRerankPolicy",
+                "memoryRerankSharedCoordination",
+                "memoryRerankProvider",
+                "memoryRerankModel",
+                "memoryRerankBaseUrl",
+                "memoryRerankApiKey",
+                "memoryRerankCandidateLimit",
+                "memoryRerankInputTokenBudget",
+                "memoryRerankTimeoutSeconds",
+                "memoryRerankFailureThreshold",
+                "memoryRerankCooldownSeconds",
+                "memoryRerankCacheTtlSeconds",
+                "memoryRerankMinScore",
                 "memoryToolTokenReserve", "memorySafetyTokenReserve",
                 "memoryInlineRecentTokenBudget", "memoryArtifactLargeBytes",
                 "memoryLocalSpoolEnabled", "memoryLocalSpoolRoot",
                 "memoryLocalSpoolMaxBytes", "memoryLocalSpoolKey",
-                "memoryIndexerEnabled", "memoryIndexerAsync",
-                "memoryIndexerMaxRetries", "memoryIndexerRetryBackoffSeconds",
                 "memoryRetentionDefaultDays", "memoryArtifactGcGraceHours",
                 "memoryBackupMaxAgeHours", "memoryBackupRoot",
                 "memoryBackupEncryptionKey", "memoryBackupRpoHours",
                 "memoryBackupRtoHours", "memoryLegalHoldDefault",
-                "artifactStoreType", "artifactStoreRoot", "artifactStoreEndpoint",
-                "artifactStoreBucket", "artifactStoreAccessKey",
-                "artifactStoreSecretKey", "artifactStoreRegion", "artifactStoreSecure",
-                "milvusEnabled", "milvusUri", "milvusToken", "milvusDatabase",
-                "milvusCollection", "milvusDenseDim", "milvusMetricType",
-                "milvusIndexType", "milvusSearchParams", "milvusEnableSparse",
-                "milvusEnableHybrid", "milvusRanker", "milvusBatchSize",
-                "milvusTimeoutSeconds",
-            )
+                "artifactStoreType", "artifactStoreRoot", )
             if key in effective
         },
         "sourceSummary": f"config: {MINI_CODE_SETTINGS_PATH} > {CLAUDE_SETTINGS_PATH} > process.env",
     }
+    runtime_config.update(_runtime_policy_settings(effective, env))
+    runtime_config["imageInputOverrides"] = dict(effective.get("imageInputOverrides") or {})
+    from minicode.extension_agents import apply_extension_agent_profile
+
+    runtime_config = apply_extension_agent_profile(cwd or Path.cwd(), runtime_config)
+    resulting_provider = str(runtime_config.get("provider") or "").strip().lower()
+    from minicode.model_registry import Provider
+
+    built_in_providers = {provider.value for provider in Provider}
+    if extension_provider_name or (
+        resulting_provider and resulting_provider not in built_in_providers
+    ):
+        from minicode.extensions import apply_extension_provider
+
+        runtime_config["provider"] = resulting_provider or extension_provider_name
+        runtime_config = apply_extension_provider(
+            cwd or Path.cwd(), runtime_config, environ=env
+        )
+    return runtime_config
+
+
+def _runtime_policy_settings(effective: dict[str, Any], environ: dict[str, str]) -> dict[str, Any]:
+    """Opt in new primary-led runs without changing legacy config material."""
+    selected = environ.get("MINI_CODE_RUNTIME_ORCHESTRATION") or effective.get("runtimeOrchestration")
+    if selected in (None, ""):
+        return {}
+    if not isinstance(selected, str) or selected.strip().lower() not in {"legacy", "primary"}:
+        raise ValueError("runtimeOrchestration must be 'legacy' or 'primary'")
+    selected = selected.strip().lower()
+    result: dict[str, Any] = {"runtimeOrchestration": selected}
+    if selected == "primary":
+        estimation = environ.get("MINI_CODE_RUNTIME_TOKEN_ESTIMATION") or effective.get("runtimeTokenEstimation")
+        if estimation not in (None, ""):
+            if not isinstance(estimation, str) or estimation not in {"utf8-bytes", "official-tokenizer"}:
+                raise ValueError("runtimeTokenEstimation must be 'utf8-bytes' or 'official-tokenizer'")
+            result["runtimeTokenEstimation"] = estimation
+        for key in (
+            "runtimeMaxAgents", "runtimeMaxActiveWorkers", "runtimeRetryBudget",
+            "runtimePlannerBudget", "runtimeVerifierBudget", "runtimeReasoningEffort",
+            "runtimeAutonomousDelegation",
+            "runtimeParallelCandidates", "runtimeMaxActiveWriters", "runtimeSharedWorkspaceWrites",
+            "runtimeDurableConsultation", "runtimeMaxContinuations", "runtimeMaxRepairRounds",
+            "runtimeAsyncAgents",
+            "runtimeAgentMessages",
+            "runtimeAgentResume",
+            "runtimeAgentCollaboration", "runtimeAgentPeerMessages",
+            "runtimeAgentMaxGenerations", "runtimeAgentMaxSessions", "runtimeAgentMaxTasks",
+            "runtimeAgentMaxMessages", "runtimeAgentMaxPendingMessages",
+            "runtimeAgentTeams",
+            "runtimePromptCache",
+            "runtimeAgentFork",
+            "runtimePrimaryRole",
+            "runtimeAgentTeamWrites",
+            "runtimeVerificationIsolation",
+        ):
+            if key in effective:
+                result[key] = effective[key]
+    return result
 
 
 def _is_valid_http_url(value: str | None) -> bool:
@@ -909,6 +1092,13 @@ def validate_provider_runtime(
         ).strip().lower()
         if reasoning_effort and reasoning_effort not in {"low", "high", "max"}:
             errors.append("DEEPSEEK_REASONING_EFFORT must be 'low', 'high', or 'max'.")
+    elif provider == Provider.BAILIAN:
+        if not runtime.get("bailianApiKey"):
+            errors.append(
+                "Provider is bailian for this model, but DASHSCOPE_API_KEY/bailianApiKey is not configured."
+            )
+        if not _is_valid_http_url(runtime.get("bailianBaseUrl")):
+            errors.append("Bailian base URL must be an http(s) URL.")
     elif provider == Provider.CUSTOM:
         if not runtime.get("customBaseUrl"):
             errors.append("Provider is custom, but CUSTOM_API_BASE_URL/customBaseUrl is not configured.")
@@ -981,9 +1171,9 @@ def validate_config(cwd: str | Path | None = None) -> tuple[bool, list[str]]:
             if not server.get("command"):
                 errors.append(f"MCP server '{name}' has no command configured")
         execution_profile = str(config.get("executionProfile", "standard")).lower()
-        if execution_profile not in {"standard", "ultra"}:
+        if execution_profile not in {"standard", "deep", "ultra"}:
             errors.append(
-                "executionProfile must be 'standard' or 'ultra'; Auto and multi-writer modes are not public"
+                "executionProfile must be 'standard', 'deep', or 'ultra'; Auto and multi-writer modes are not public"
             )
         
         return len(errors) == 0, errors + warnings
@@ -1013,9 +1203,10 @@ def validate_config(cwd: str | Path | None = None) -> tuple[bool, list[str]]:
                 "  1. Anthropic:  export ANTHROPIC_API_KEY=sk-ant-...\n"
                 "  2. OpenAI:     export OPENAI_API_KEY=sk-...\n"
                 "  3. DeepSeek:   export DEEPSEEK_API_KEY=sk-...\n"
-                "  4. OpenRouter: export OPENROUTER_API_KEY=sk-or-...\n"
-                "  5. Custom:     export CUSTOM_API_KEY=... + CUSTOM_API_BASE_URL=...\n"
-                "  6. Or edit ~/.mini-code/settings.json:\n"
+                "  4. Bailian:    export DASHSCOPE_API_KEY=sk-...\n"
+                "  5. OpenRouter: export OPENROUTER_API_KEY=sk-or-...\n"
+                "  6. Custom:     export CUSTOM_API_KEY=... + CUSTOM_API_BASE_URL=...\n"
+                "  7. Or edit ~/.mini-code/settings.json:\n"
                 '     {"env": {"ANTHROPIC_API_KEY": "sk-ant-..."}}\n'
             )
             errors.append(help_msg)
@@ -1023,7 +1214,7 @@ def validate_config(cwd: str | Path | None = None) -> tuple[bool, list[str]]:
             errors.append(str(e))
         
         return False, errors
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001 - diagnostic boundary must return errors
         return False, [f"Unexpected error: {e}"]
 
 
@@ -1057,7 +1248,7 @@ def format_config_diagnostic(cwd: str | Path | None = None) -> str:
         lines.append(f"  Model: {model_name}")
 
         # Show provider info
-        from minicode.model_registry import detect_provider, Provider
+        from minicode.model_registry import Provider, detect_provider
         provider = detect_provider(
             model_name,
             config,
@@ -1079,6 +1270,9 @@ def format_config_diagnostic(cwd: str | Path | None = None) -> str:
         elif provider == Provider.DEEPSEEK:
             lines.append(f"  DeepSeek Base URL: {config.get('deepseekBaseUrl', 'not set')}")
             auth_methods = ["DEEPSEEK_API_KEY"] if config.get("deepseekApiKey") else []
+        elif provider == Provider.BAILIAN:
+            lines.append(f"  Bailian Base URL: {config.get('bailianBaseUrl', 'not set')}")
+            auth_methods = ["DASHSCOPE_API_KEY"] if config.get("bailianApiKey") else []
         elif provider == Provider.OPENROUTER:
             lines.append(f"  OpenRouter Base URL: {config.get('openrouterBaseUrl', 'not set')}")
             auth_methods = ["OPENROUTER_API_KEY"] if config.get("openrouterApiKey") else []
@@ -1094,7 +1288,7 @@ def format_config_diagnostic(cwd: str | Path | None = None) -> str:
         if fallback_models:
             lines.append(f"  Fallback Models: {', '.join(fallback_models)}")
         lines.append(f"  MCP Servers: {len(config.get('mcpServers', {}))}")
-        lines.append(f"  Tool Profile: {config.get('toolProfile', 'core')}")
+        lines.append(f"  Tool Profile: {config.get('toolProfile', 'full')}")
 
         # User profile info
         global_profile_path = config.get('globalUserProfilePath', '')
@@ -1109,7 +1303,7 @@ def format_config_diagnostic(cwd: str | Path | None = None) -> str:
             lines.append(f"  Response Language: {config.get('responseLanguage')}")
         if config.get('responseVerbosity'):
             lines.append(f"  Response Verbosity: {config.get('responseVerbosity')}")
-    except Exception:
+    except Exception:  # noqa: BLE001,S110 - summary is optional after primary diagnostics
         pass
     
     return "\n".join(lines)

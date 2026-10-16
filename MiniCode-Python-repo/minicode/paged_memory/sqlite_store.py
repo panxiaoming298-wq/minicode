@@ -1,7 +1,6 @@
 """SQLite authority adapter used by local MiniCode and deterministic tests.
 
-Production/server deployments use the PostgreSQL adapter.  SQLite preserves
-the same event/state/outbox invariants so the local CLI remains usable without
+SQLite preserves atomic event/state invariants for local execution without
 requiring a network service.
 """
 
@@ -10,6 +9,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -38,8 +38,6 @@ from .models import (
     MemorySearchRequest,
     MemoryStatus,
     MemoryType,
-    OutboxClaimLostError,
-    OutboxRecord,
     SourceRange,
     TaskRetentionPolicy,
     TaskStateSnapshot,
@@ -49,15 +47,16 @@ from .models import (
     now_epoch,
     stable_json,
 )
+from .search_budget import SearchResults, bounded_search, remaining_seconds
 
 SCHEMA_VERSION = 9
+# Written last, in the same transaction as every required schema change.
+# Advance this when adding schema objects so existing installations migrate
+# before taking the read-only initialization path.
+_INITIALIZATION_VERSION = 16
 
 
 _SCHEMA = r"""
-PRAGMA foreign_keys = ON;
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous = FULL;
-
 CREATE TABLE IF NOT EXISTS memory_schema_version (
     version INTEGER PRIMARY KEY,
     applied_at REAL NOT NULL
@@ -138,6 +137,10 @@ CREATE UNIQUE INDEX IF NOT EXISTS agent_event_idempotency
     ON agent_event(tenant_id, task_id, idempotency_key) WHERE idempotency_key <> '';
 CREATE INDEX IF NOT EXISTS agent_event_task_time
     ON agent_event(tenant_id, task_id, created_at DESC);
+-- SQLite appends rowid to this index, allowing stable history keyset pages
+-- without sorting all of the task's events for each request.
+CREATE INDEX IF NOT EXISTS agent_event_history_order
+    ON agent_event(tenant_id, task_id);
 CREATE INDEX IF NOT EXISTS agent_event_step
     ON agent_event(tenant_id, task_id, step_id);
 
@@ -168,6 +171,8 @@ CREATE TABLE IF NOT EXISTS agent_task_state (
     pending_steps TEXT NOT NULL DEFAULT '[]',
     active_artifacts TEXT NOT NULL DEFAULT '[]',
     blocked_by TEXT NOT NULL DEFAULT '[]',
+    handoff_notes TEXT NOT NULL DEFAULT '{}',
+    context_rotations TEXT NOT NULL DEFAULT '{}',
     updated_at REAL NOT NULL,
     PRIMARY KEY (tenant_id, task_id),
     FOREIGN KEY (tenant_id, task_id) REFERENCES agent_task(tenant_id, id) ON DELETE CASCADE
@@ -266,9 +271,6 @@ CREATE TABLE IF NOT EXISTS agent_memory (
     token_count INTEGER NOT NULL DEFAULT 0,
     phase TEXT NOT NULL DEFAULT '',
     facets TEXT NOT NULL DEFAULT '[]',
-    milvus_collection TEXT NOT NULL DEFAULT '',
-    milvus_primary_key TEXT NOT NULL DEFAULT '',
-    indexed_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE (
@@ -279,22 +281,6 @@ CREATE TABLE IF NOT EXISTS agent_memory (
 );
 CREATE INDEX IF NOT EXISTS agent_memory_search
     ON agent_memory(tenant_id, task_id, status, memory_type, phase);
-
-CREATE TABLE IF NOT EXISTS agent_outbox (
-    id TEXT PRIMARY KEY,
-    aggregate_type TEXT NOT NULL,
-    aggregate_id TEXT NOT NULL,
-    event_type TEXT NOT NULL,
-    payload TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'PENDING',
-    retry_count INTEGER NOT NULL DEFAULT 0,
-    next_retry_at REAL NOT NULL DEFAULT 0,
-    claim_token TEXT NOT NULL DEFAULT '',
-    created_at REAL NOT NULL,
-    processed_at REAL
-);
-CREATE INDEX IF NOT EXISTS agent_outbox_pending
-    ON agent_outbox(status, next_retry_at, created_at);
 
 CREATE TABLE IF NOT EXISTS memory_working_set (
     tenant_id TEXT NOT NULL,
@@ -391,9 +377,6 @@ CREATE TABLE agent_memory_v4 (
     token_count INTEGER NOT NULL DEFAULT 0,
     phase TEXT NOT NULL DEFAULT '',
     facets TEXT NOT NULL DEFAULT '[]',
-    milvus_collection TEXT NOT NULL DEFAULT '',
-    milvus_primary_key TEXT NOT NULL DEFAULT '',
-    indexed_at REAL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
     UNIQUE (
@@ -411,19 +394,24 @@ class StateVersionConflict(RuntimeError):
 
 
 class SqliteMemoryStore:
-    """Relational authority with atomic event/state/artifact/outbox bundles."""
+    """Relational authority with atomic event/state/artifact bundles."""
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(self, path: str | Path, *, lock_timeout: float = 3.0) -> None:
+        if not 0 <= lock_timeout <= 30:
+            raise ValueError("lock_timeout must be between 0 and 30 seconds")
+        self._lock_timeout = lock_timeout
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(
             self.path,
-            timeout=10.0,
+            timeout=min(0.1, lock_timeout),
             isolation_level=None,
             check_same_thread=False,
         )
         self._connection.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        self._savepoint_counter = 0
+        self._query_deadline = None
         self._hard_delete_allowed = False
         self._fts_available = False
         self._connection.create_function(
@@ -431,34 +419,176 @@ class SqliteMemoryStore:
             0,
             lambda: 1 if self._hard_delete_allowed else 0,
         )
-        self.initialize()
+        try:
+            self.initialize()
+        except BaseException:
+            self._connection.close()
+            raise
+
+    @contextmanager
+    def query_deadline(self, deadline):
+        if deadline is None:
+            yield
+            return
+        # The connection and progress handler are shared; keep the same lock
+        # used by all ordinary reads/writes for the duration of the scope.
+        if not self._lock.acquire(timeout=remaining_seconds(deadline)):
+            raise TimeoutError("memory query deadline exceeded waiting for connection")
+        try:
+            previous = self._query_deadline
+            effective = min(
+                value
+                for value in (previous, deadline, float("inf"))
+                if value is not None
+            )
+            remaining = remaining_seconds(effective)
+            previous_busy = self._connection.execute("PRAGMA busy_timeout").fetchone()[
+                0
+            ]
+            self._query_deadline = effective
+            self._connection.execute(
+                f"PRAGMA busy_timeout={min(previous_busy, max(0, int(remaining * 1000)))}"
+            )
+            self._connection.set_progress_handler(
+                lambda: time.monotonic() >= effective, 500
+            )
+            try:
+                yield
+            except sqlite3.OperationalError as exc:
+                if (getattr(exc, "sqlite_errorcode", 0) & 0xFF) in {
+                    sqlite3.SQLITE_INTERRUPT,
+                    sqlite3.SQLITE_BUSY,
+                    sqlite3.SQLITE_LOCKED,
+                } or time.monotonic() >= effective:
+                    raise TimeoutError("memory query deadline exceeded") from exc
+                raise
+            finally:
+                self._query_deadline = previous
+                self._connection.set_progress_handler(
+                    (lambda: time.monotonic() >= previous)
+                    if previous is not None
+                    else None,
+                    500,
+                )
+                self._connection.execute(f"PRAGMA busy_timeout={previous_busy}")
+        finally:
+            self._lock.release()
 
     def initialize(self) -> None:
         with self._lock:
-            self._connection.executescript(_SCHEMA)
-            self._migrate_event_idempotency_scope()
-            self._migrate_memory_source_identity()
-            self._migrate_outbox_claim_token()
-            self._initialize_task_write_fences()
-            self._initialize_memory_fts()
-            audit_columns = {
-                row["name"]
-                for row in self._connection.execute(
-                    "PRAGMA table_info(memory_deletion_audit)"
-                ).fetchall()
-            }
-            for column, definition in (
-                ("actor_hash", "TEXT NOT NULL DEFAULT ''"),
-                ("reason_hash", "TEXT NOT NULL DEFAULT ''"),
-                ("execution_status", "TEXT NOT NULL DEFAULT 'COMPLETED'"),
-            ):
-                if column not in audit_columns:
-                    self._connection.execute(
-                        f"ALTER TABLE memory_deletion_audit ADD COLUMN {column} {definition}"
-                    )
-            self._connection.execute(
-                "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (?, ?)",
-                (SCHEMA_VERSION, now_epoch()),
+            self._connection.execute("PRAGMA foreign_keys = ON")
+            self._connection.execute("PRAGMA synchronous = FULL")
+            if self._connection.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+                previous_busy = self._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+                try:
+                    self._connection.execute(f"PRAGMA busy_timeout = {int(self._lock_timeout * 1000)}")
+                    self._connection.execute("PRAGMA journal_mode = WAL")
+                finally:
+                    self._connection.execute(f"PRAGMA busy_timeout = {previous_busy}")
+            # Browsing history opens independent connections to this authority.
+            # A ready database needs no write lock, even while an Agent writes.
+            if self._schema_ready():
+                return
+            with self._transaction():
+                self._initialize_schema()
+
+    def _schema_ready(self) -> bool:
+        tables = {row[0] for row in self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "memory_schema_version" not in tables:
+            return False
+        versions = {row[0] for row in self._connection.execute("SELECT version FROM memory_schema_version")}
+        if not {SCHEMA_VERSION, 10, 11, 13, 14, 15, _INITIALIZATION_VERSION}.issubset(versions):
+            return False
+        for table, required in (
+            ("agent_task_state", {"handoff_notes", "context_rotations"}),
+            ("memory_deletion_audit", {"actor_hash", "reason_hash", "execution_status"}),
+        ):
+            columns = {row["name"] for row in self._connection.execute(f"PRAGMA table_info({table})")}
+            if not required.issubset(columns):
+                return False
+        if not self._connection.execute("SELECT 1 FROM pragma_module_list WHERE name='fts5'").fetchone():
+            self._fts_available = False
+            return True
+        if not {"agent_memory_fts", "memory_fts_state"}.issubset(tables):
+            return False
+        version = self._connection.execute("SELECT version FROM memory_fts_state WHERE id=1").fetchone()
+        self._fts_available = bool(version and version[0] == 1)
+        return self._fts_available
+
+    def _execute_schema_script(self, script: str) -> None:
+        # executescript() implicitly commits the caller's transaction. Execute
+        # complete SQL statements instead, preserving triggers and atomic DDL.
+        statement = ""
+        for line in script.splitlines(keepends=True):
+            statement += line
+            if sqlite3.complete_statement(statement):
+                self._connection.execute(statement)
+                statement = ""
+        if statement.strip():
+            self._connection.execute(statement)
+
+    def _initialize_schema(self) -> None:
+        self._execute_schema_script(_SCHEMA)
+        self._migrate_handoff_notes()
+        self._migrate_context_rotations()
+        self._execute_schema_script(
+            (Path(__file__).with_name("sql") / "002_retrieval_control.sql").read_text(encoding="utf-8")
+        )
+        self._migrate_event_idempotency_scope()
+        self._migrate_memory_source_identity()
+        self._execute_schema_script(
+            (Path(__file__).with_name("sql") / "003_memory_lifecycle.sql").read_text(encoding="utf-8")
+        )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (11, ?)",
+            (now_epoch(),),
+        )
+        self._initialize_task_write_fences()
+        self._initialize_memory_fts()
+        audit_columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(memory_deletion_audit)").fetchall()
+        }
+        for column, definition in (
+            ("actor_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("reason_hash", "TEXT NOT NULL DEFAULT ''"),
+            ("execution_status", "TEXT NOT NULL DEFAULT 'COMPLETED'"),
+        ):
+            if column not in audit_columns:
+                self._connection.execute(f"ALTER TABLE memory_deletion_audit ADD COLUMN {column} {definition}")
+        self._connection.execute(
+            "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (?, ?)",
+            (SCHEMA_VERSION, now_epoch()),
+        )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (10, ?)",
+            (now_epoch(),),
+        )
+        self._connection.execute(
+            "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (?, ?)",
+            (_INITIALIZATION_VERSION, now_epoch()),
+        )
+
+    def _migrate_handoff_notes(self) -> None:
+        # Serialize the existence check and additive migration across processes.
+        with self._transaction() as db:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(agent_task_state)")}
+            if "handoff_notes" not in columns:
+                db.execute("ALTER TABLE agent_task_state ADD COLUMN handoff_notes TEXT NOT NULL DEFAULT '{}'")
+            db.execute(
+                "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (13, ?)",
+                (now_epoch(),),
+            )
+
+    def _migrate_context_rotations(self) -> None:
+        with self._transaction() as db:
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(agent_task_state)")}
+            if "context_rotations" not in columns:
+                db.execute("ALTER TABLE agent_task_state ADD COLUMN context_rotations TEXT NOT NULL DEFAULT '{}'")
+            db.execute(
+                "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (14, ?)",
+                (now_epoch(),),
             )
 
     def _migrate_event_idempotency_scope(self) -> None:
@@ -479,23 +609,17 @@ class SqliteMemoryStore:
                 "WHERE idempotency_key<>''"
             )
 
-    def _migrate_outbox_claim_token(self) -> None:
-        """Add the fencing token used to reject acknowledgements from stale leases."""
-        columns = {
-            row["name"]
-            for row in self._connection.execute(
-                "PRAGMA table_info(agent_outbox)"
-            ).fetchall()
-        }
-        if "claim_token" not in columns:
-            self._connection.execute(
-                "ALTER TABLE agent_outbox "
-                "ADD COLUMN claim_token TEXT NOT NULL DEFAULT ''"
-            )
 
     def _initialize_task_write_fences(self) -> None:
         """Reject task-scoped inserts/updates once real deletion begins."""
+        self._execute_schema_script(
+            (Path(__file__).with_name("sql") / "004_history_journal.sql").read_text(encoding="utf-8"))
+        self._connection.execute(
+            "INSERT OR IGNORE INTO memory_schema_version(version, applied_at) VALUES (15, ?)",
+            (now_epoch(),),
+        )
         tables = (
+            "conversation_history_head", "conversation_history_event", "conversation_history_migration",
             "agent_run",
             "agent_step",
             "agent_event",
@@ -527,45 +651,64 @@ class SqliteMemoryStore:
                 )
 
     def _initialize_memory_fts(self) -> None:
-        """Create and deterministically rebuild the local BM25 projection."""
+        """Initialize the projection once; normal writes maintain it incrementally.
+
+        History reads open short-lived connections. Rebuilding here on every
+        connection serializes all conversation reads behind a full-memory scan.
+        The version and backfill commit together so another opener cannot see
+        an incomplete index or mistake an interrupted migration for success.
+        """
 
         try:
-            self._connection.executescript(
-                """
-                CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5(
+            with self._transaction() as db:
+                exists = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='agent_memory_fts'"
+                ).fetchone()
+                db.execute("""CREATE VIRTUAL TABLE IF NOT EXISTS agent_memory_fts USING fts5(
                     memory_id UNINDEXED,
                     search_document,
                     tokenize='unicode61 remove_diacritics 2'
-                );
-                CREATE TRIGGER IF NOT EXISTS agent_memory_fts_delete
+                )""")
+                db.execute("""CREATE TRIGGER IF NOT EXISTS agent_memory_fts_delete
                 AFTER DELETE ON agent_memory
                 BEGIN
                     DELETE FROM agent_memory_fts WHERE memory_id=OLD.id;
-                END;
-                """
-            )
-            rows = self._connection.execute(
-                "SELECT id,title,preview_text,facets FROM agent_memory"
-            ).fetchall()
-            self._connection.execute("DELETE FROM agent_memory_fts")
-            self._connection.executemany(
-                "INSERT INTO agent_memory_fts(memory_id,search_document) VALUES (?,?)",
-                [
-                    (
-                        row["id"],
-                        memory_search_document(
-                            title=row["title"],
-                            preview_text=row["preview_text"],
-                            facets=json.loads(row["facets"] or "[]"),
+                END""")
+                db.execute("""CREATE TABLE IF NOT EXISTS memory_fts_state (
+                    id INTEGER PRIMARY KEY CHECK(id=1), version INTEGER NOT NULL
+                )""")
+                version = db.execute(
+                    "SELECT version FROM memory_fts_state WHERE id=1"
+                ).fetchone()
+                if not exists or version is None or version["version"] != 1:
+                    rows = db.execute(
+                        "SELECT id,title,preview_text,facets FROM agent_memory"
+                    ).fetchall()
+                    db.execute("DELETE FROM agent_memory_fts")
+                    db.executemany(
+                        "INSERT INTO agent_memory_fts(memory_id,search_document) VALUES (?,?)",
+                        (
+                            (
+                                row["id"],
+                                memory_search_document(
+                                    title=row["title"],
+                                    preview_text=row["preview_text"],
+                                    facets=json.loads(row["facets"] or "[]"),
+                                ),
+                            )
+                            for row in rows
                         ),
                     )
-                    for row in rows
-                ],
-            )
+                    db.execute(
+                        "INSERT INTO memory_fts_state(id,version) VALUES (1,1) "
+                        "ON CONFLICT(id) DO UPDATE SET version=excluded.version"
+                    )
             self._fts_available = True
-        except sqlite3.OperationalError:
+        except sqlite3.OperationalError as error:
             # Some embedded Python distributions omit FTS5. Search remains
             # correct through the unbounded in-process BM25 fallback.
+            if "no such module: fts5" not in str(error).lower():
+                raise
             self._fts_available = False
 
     def _migrate_memory_source_identity(self) -> None:
@@ -598,8 +741,7 @@ class SqliteMemoryStore:
         column_sql = (
             "id,tenant_id,task_id,run_id,step_id,memory_type,title,preview_text,"
             "status,importance,source_event_id,artifact_id,source_start,source_end,"
-            "source_unit,content_hash,token_count,phase,facets,milvus_collection,"
-            "milvus_primary_key,indexed_at,created_at,updated_at"
+            "source_unit,content_hash,token_count,phase,facets,created_at,updated_at"
         )
         with self._transaction() as db:
             db.execute("DROP TABLE IF EXISTS agent_memory_v4")
@@ -616,16 +758,86 @@ class SqliteMemoryStore:
             )
 
     @contextmanager
+    def read_transaction(self) -> Iterator[sqlite3.Connection]:
+        """Keep a consistent WAL snapshot without reserving the single writer."""
+        with self._lock:
+            if self._connection.in_transaction:
+                yield self._connection
+                return
+            previous = self._connection.execute("PRAGMA query_only").fetchone()[0]
+            self._connection.execute("PRAGMA query_only = ON")
+            try:
+                self._connection.execute("BEGIN")
+                try:
+                    yield self._connection
+                finally:
+                    self._connection.rollback()
+            finally:
+                self._connection.execute(f"PRAGMA query_only = {previous}")
+
+    @contextmanager
     def _transaction(self) -> Iterator[sqlite3.Connection]:
         with self._lock:
-            self._connection.execute("BEGIN IMMEDIATE")
+            if self._query_deadline is not None:
+                remaining_seconds(self._query_deadline)
+            if self._connection.in_transaction:
+                self._savepoint_counter += 1
+                name = f"memory_{self._savepoint_counter}"
+                self._connection.execute(f"SAVEPOINT {name}")
+                try:
+                    yield self._connection
+                except BaseException:
+                    self._connection.execute(f"ROLLBACK TO {name}")
+                    raise
+                finally:
+                    self._connection.execute(f"RELEASE {name}")
+                return
+            # Retry admission only: no transaction body or external operation
+            # is replayed. A short competing writer need not fail the Agent.
+            deadline = time.monotonic() + self._lock_timeout
+            if self._query_deadline is not None:
+                deadline = min(deadline, self._query_deadline)
+            previous_busy = self._connection.execute("PRAGMA busy_timeout").fetchone()[0]
+            try:
+                while True:
+                    if self._query_deadline is not None:
+                        remaining_seconds(self._query_deadline)
+                    remaining = max(0, deadline - time.monotonic())
+                    self._connection.execute(
+                        f"PRAGMA busy_timeout={min(previous_busy, int(remaining * 1000))}"
+                    )
+                    try:
+                        self._connection.execute("BEGIN IMMEDIATE")
+                        break
+                    except sqlite3.OperationalError as error:
+                        code = getattr(error, "sqlite_errorcode", 0) & 0xff
+                        remaining = deadline - time.monotonic()
+                        if code not in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED} or remaining <= 0:
+                            raise
+                        time.sleep(min(0.05, remaining))
+            finally:
+                self._connection.execute(f"PRAGMA busy_timeout={previous_busy}")
             try:
                 yield self._connection
             except BaseException:
                 self._connection.rollback()
                 raise
             else:
-                self._connection.commit()
+                try:
+                    self._connection.commit()
+                except BaseException:
+                    self._connection.rollback()
+                    raise
+
+    def maintain_memories(self, *, tenant_id: str, task_id: str, now: float) -> dict[str, Any]:
+        from .maintenance import maintain_records
+        with self._transaction() as db:
+            return maintain_records(db, placeholder="?", tenant_id=tenant_id, task_id=task_id, now=now)
+
+    def touch_memories(self, *, tenant_id: str, task_id: str, memory_ids: Sequence[str], now: float) -> None:
+        from .maintenance import touch_records
+        with self._transaction() as db:
+            touch_records(db, placeholder="?", tenant_id=tenant_id, task_id=task_id, memory_ids=memory_ids, now=now)
 
     def close(self) -> None:
         with self._lock:
@@ -765,9 +977,7 @@ class SqliteMemoryStore:
             )
             return previous
 
-    def restore_task_status(
-        self, *, tenant_id: str, task_id: str, status: str
-    ) -> bool:
+    def restore_task_status(self, *, tenant_id: str, task_id: str, status: str) -> bool:
         with self._transaction() as db:
             cursor = db.execute(
                 "UPDATE agent_task SET status=?,updated_at=? "
@@ -852,6 +1062,53 @@ class SqliteMemoryStore:
         )
         return value
 
+    def sync_history(self, *, tenant_id, task_id, stream, messages):
+        """Append a verified batch and its head in one durable transaction."""
+        from .history_journal import genesis, reconcile, verify_records, HistoryIntegrityError
+        scope = (tenant_id, task_id, stream)
+        with self._transaction() as db:
+            rows = db.execute("SELECT sequence,event_id,payload_hash,chain_hash,message FROM conversation_history_event "
+                              "WHERE tenant_id=? AND task_id=? AND stream=? ORDER BY sequence", scope).fetchall()
+            records = []
+            for record_row in rows:
+                try:
+                    message = json.loads(record_row["message"])
+                    if not isinstance(message, dict):
+                        raise ValueError("history event must be an object")
+                except (TypeError, ValueError) as error:
+                    raise HistoryIntegrityError("stored_event_unreadable", sequence=record_row["sequence"],
+                                                event_id=record_row["event_id"]) from error
+                records.append({**dict(record_row), "message": message})
+            row = db.execute("SELECT event_count,chain_hash FROM conversation_history_head "
+                             "WHERE tenant_id=? AND task_id=? AND stream=?", scope).fetchone()
+            if row is None and records:
+                raise HistoryIntegrityError("stored_head_missing")
+            head = {"count": row["event_count"], "hash": row["chain_hash"]} if row else {"count": 0, "hash": genesis(stream)}
+            verify_records(records, stream, head)
+            additions, observed = reconcile(records, messages, stream)
+            for record in additions:
+                db.execute("INSERT INTO conversation_history_event "
+                           "(tenant_id,task_id,stream,sequence,event_id,payload_hash,chain_hash,message) VALUES (?,?,?,?,?,?,?,?)",
+                           (*scope, record["sequence"], record["event_id"], record["payload_hash"], record["chain_hash"], stable_json(record["message"])))
+            records += additions
+            if row is None or additions:
+                db.execute("INSERT INTO conversation_history_head (tenant_id,task_id,stream,event_count,chain_hash) VALUES (?,?,?,?,?) "
+                           "ON CONFLICT(tenant_id,task_id,stream) DO UPDATE SET event_count=excluded.event_count,chain_hash=excluded.chain_hash",
+                           (*scope, len(records), records[-1]["chain_hash"] if records else genesis(stream)))
+        return records, observed
+
+    def history_migration(self, *, tenant_id, task_id, stream, key, proof=None):
+        scope = (tenant_id, task_id, stream, key)
+        with self._transaction() as db:
+            row = db.execute("SELECT proof FROM conversation_history_migration "
+                             "WHERE tenant_id=? AND task_id=? AND stream=? AND boundary_key=?", scope).fetchone()
+            if row is not None:
+                return json.loads(row["proof"])
+            if proof is not None:
+                db.execute("INSERT INTO conversation_history_migration (tenant_id,task_id,stream,boundary_key,proof) VALUES (?,?,?,?,?)",
+                           (*scope, stable_json(proof)))
+            return proof
+
     def persist_event(
         self,
         event: AgentEvent,
@@ -859,9 +1116,7 @@ class SqliteMemoryStore:
         state_patch: Mapping[str, Any] | None = None,
         artifact: ArtifactRecord | None = None,
         memory: MemoryRecord | None = None,
-        outbox: OutboxRecord | None = None,
         memories: Sequence[MemoryRecord] = (),
-        outboxes: Sequence[OutboxRecord] = (),
         decision: DecisionRecord | None = None,
         checkpoint: CheckpointRecord | None = None,
         step_status: str = "",
@@ -875,6 +1130,14 @@ class SqliteMemoryStore:
             raise ValueError("event bundle must share one tenant/task scope")
         with self._transaction() as db:
             existing = None
+            for name in ("_context_rotation_update", "_handoff_note_update"):
+                anchor = (state_patch or {}).get(name, {}).get("history_anchor")
+                if anchor is not None:
+                    from .history_journal import HISTORY_BASIS, verify_boundary
+                    if anchor.get("history_basis") == HISTORY_BASIS:
+                        records, _ = self.sync_history(tenant_id=event.tenant_id, task_id=event.task_id,
+                            stream=anchor["history_stream"], messages=[])
+                        verify_boundary([r["message"] for r in records], anchor)
             if event.idempotency_key:
                 existing = db.execute(
                     "SELECT * FROM agent_event "
@@ -920,31 +1183,14 @@ class SqliteMemoryStore:
             if artifact is not None:
                 self._put_artifact(db, artifact)
             if memory is not None:
-                requested_memory_id = memory.id
                 memory = self._put_memory(db, memory)
-                if outbox is not None and outbox.aggregate_id == requested_memory_id:
-                    self._align_memory_outbox(outbox, memory)
-            if outbox is not None:
-                self._put_outbox(db, outbox)
-            extra_outboxes = {
-                item.aggregate_id: item
-                for item in outboxes
-                if item.event_type == "UPSERT_MEMORY_INDEX"
-            }
             for extra_memory in memories:
-                requested_memory_id = extra_memory.id
-                stored_memory = self._put_memory(db, extra_memory)
-                extra_outbox = extra_outboxes.get(requested_memory_id)
-                if extra_outbox is not None:
-                    self._align_memory_outbox(extra_outbox, stored_memory)
-            for extra_outbox in outboxes:
-                self._put_outbox(db, extra_outbox)
+                self._put_memory(db, extra_memory)
             if decision is not None:
                 self._put_decision(
                     db,
                     decision,
                     project_state=state_patch is None,
-                    index_outbox_template=outbox,
                 )
             state = None
             if state_patch is not None:
@@ -977,9 +1223,7 @@ class SqliteMemoryStore:
                         else None
                     )
                 if checkpoint_state is None:
-                    raise StateVersionConflict(
-                        "checkpoint state is unavailable"
-                    )
+                    raise StateVersionConflict("checkpoint state is unavailable")
                 if checkpoint.state_version != checkpoint_state.version:
                     if state_patch is None:
                         raise StateVersionConflict(
@@ -1038,6 +1282,40 @@ class SqliteMemoryStore:
             ).fetchone()
         return self._event(row) if row else None
 
+    def history_event_page(self, *, tenant_id, task_id, snapshot=None, position=None,
+                           recent_first=True, role="", tool_name="", run_id="", limit=100):
+        """Browse original conversation events in persisted order, without memory status filters."""
+        from .models import MEMORY_NAVIGATION_TOOL_NAMES
+        role_sql = ("CASE event_type WHEN 'USER_INPUT' THEN 'user' "
+                    "WHEN 'MODEL_OUTPUT' THEN COALESCE(json_extract(content_json,'$.role'),'assistant') "
+                    "WHEN 'TOOL_CALL' THEN 'assistant_tool_call' ELSE 'tool_result' END")
+        where = ["tenant_id=?", "task_id=?", "event_type IN ('USER_INPUT','MODEL_OUTPUT','TOOL_CALL','TOOL_RESULT','TOOL_ERROR')"]
+        where.append(role_sql + " IN ('user','assistant','assistant_progress','assistant_tool_call','tool_result')")
+        params = [tenant_id, task_id]
+        where.append("COALESCE(json_extract(content_json,'$.tool_name'),'') NOT IN ("
+                     + ",".join("?" for _ in MEMORY_NAVIGATION_TOOL_NAMES) + ")")
+        params.extend(MEMORY_NAVIGATION_TOOL_NAMES)
+        for expression, value in ((role_sql, role), ("json_extract(content_json,'$.tool_name')", tool_name),
+                                  ("run_id", run_id)):
+            if value:
+                where.append(expression + "=?")
+                params.append(value)
+        with self._lock:
+            if snapshot is None:
+                snapshot = self._connection.execute(
+                    "SELECT COALESCE(MAX(rowid),0) FROM agent_event WHERE tenant_id=? AND task_id=?",
+                    (tenant_id, task_id)).fetchone()[0]
+            where.append("rowid<=?")
+            params.append(snapshot)
+            if position is not None:
+                where.append("rowid<?" if recent_first else "rowid>?")
+                params.append(position)
+            direction = "DESC" if recent_first else "ASC"
+            rows = self._connection.execute(
+                f"SELECT rowid AS history_sequence,* FROM agent_event WHERE {' AND '.join(where)} "
+                f"ORDER BY rowid {direction} LIMIT ?", (*params, limit + 1)).fetchall()
+        return snapshot, [(row["history_sequence"], self._event(row)) for row in rows[:limit]], len(rows) > limit
+
     def get_event_by_idempotency(
         self, *, tenant_id: str, task_id: str, idempotency_key: str
     ) -> AgentEvent | None:
@@ -1052,6 +1330,39 @@ class SqliteMemoryStore:
                 (tenant_id, task_id, idempotency_key),
             ).fetchone()
         return self._event(row) if row else None
+
+    def tool_result_events(
+        self, *, tenant_id: str, task_id: str, call_ids: Sequence[str]
+    ) -> list[AgentEvent]:
+        """Find scoped receipts without limiting a parallel batch to a tail count."""
+        identifiers = sorted(set(call_ids))
+        result = []
+        with self._lock:
+            for offset in range(0, len(identifiers), 128):
+                batch = identifiers[offset:offset + 128]
+                placeholders = ",".join("?" for _ in batch)
+                rows = self._connection.execute(
+                    "SELECT * FROM agent_event WHERE tenant_id=? AND task_id=? "
+                    "AND event_type IN ('TOOL_RESULT','TOOL_ERROR') "
+                    f"AND correlation_id IN ({placeholders}) ORDER BY created_at DESC,id DESC",
+                    [tenant_id, task_id, *batch],
+                ).fetchall()
+                result.extend(self._event(row) for row in rows)
+        return result
+
+    def code_focus_events(
+        self, *, tenant_id: str, task_id: str, owner: str, workspace: str, limit: int = 256,
+    ) -> list[AgentEvent]:
+        """Bound the source receipts, not unrelated logs or other Workers' events."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM agent_event WHERE tenant_id=? AND task_id=? AND event_type=? "
+                "AND json_extract(content_json,'$.code_focus.owner')=? "
+                "AND json_extract(content_json,'$.code_focus.workspace')=? "
+                "ORDER BY created_at DESC,id DESC LIMIT ?",
+                (tenant_id, task_id, EventType.TOOL_RESULT.value, owner, workspace, max(1, min(limit, 256))),
+            ).fetchall()
+        return [self._event(row) for row in reversed(rows)]
 
     def recent_events(
         self,
@@ -1143,7 +1454,6 @@ class SqliteMemoryStore:
         decision: DecisionRecord,
         *,
         project_state: bool = True,
-        index_outbox_template: OutboxRecord | None = None,
     ) -> DecisionRecord:
         old = db.execute(
             """
@@ -1166,26 +1476,6 @@ class SqliteMemoryStore:
                 """,
                 (now_epoch(), decision.tenant_id, decision.task_id, old["id"]),
             )
-            if index_outbox_template is not None:
-                descriptor_payload: dict[str, Any] = {
-                    key: index_outbox_template.payload[key]
-                    for key in ("index_id", "collection", "index_descriptor")
-                    if key in index_outbox_template.payload
-                }
-                self._put_outbox(
-                    db,
-                    OutboxRecord(
-                        aggregate_type="MEMORY",
-                        aggregate_id=old["id"],
-                        event_type="UPSERT_MEMORY_INDEX",
-                        payload={
-                            "tenant_id": decision.tenant_id,
-                            "task_id": decision.task_id,
-                            "memory_id": old["id"],
-                            **descriptor_payload,
-                        },
-                    ),
-                )
         db.execute(
             """
             INSERT INTO agent_decision(
@@ -1408,13 +1698,10 @@ class SqliteMemoryStore:
                 )
 
     def put_memory(
-        self, memory: MemoryRecord, *, outbox: OutboxRecord | None = None
+        self, memory: MemoryRecord
     ) -> MemoryRecord:
         with self._transaction() as db:
             stored = self._put_memory(db, memory)
-            if outbox is not None:
-                self._align_memory_outbox(outbox, stored)
-                self._put_outbox(db, outbox)
         return stored
 
     def get_memories(
@@ -1436,6 +1723,7 @@ class SqliteMemoryStore:
         by_id = {row["id"]: self._memory(row) for row in rows}
         return [by_id[memory_id] for memory_id in memory_ids if memory_id in by_id]
 
+    @bounded_search
     def search_memories_lexical(self, request: MemorySearchRequest) -> list[MemoryHit]:
         if request.candidate_limit <= 0 or not request.statuses:
             return []
@@ -1450,7 +1738,14 @@ class SqliteMemoryStore:
                 + ")"
             )
             params.extend(request.memory_types)
-        pool_limit = max(request.candidate_limit * 4, request.candidate_limit)
+        if request.excluded_facets:
+            where += (
+                " AND NOT EXISTS (SELECT 1 FROM json_each(m.facets) AS facet WHERE facet.value IN ("
+                + ",".join("?" for _ in request.excluded_facets)
+                + "))"
+            )
+            params.extend(request.excluded_facets)
+        pool_limit = request.candidate_limit * 4 + 1
         match = sqlite_match_expression(request.query)
         lexical_values: dict[str, float] = {}
         if match and self._fts_available:
@@ -1476,7 +1771,7 @@ class SqliteMemoryStore:
                     SELECT m.* FROM agent_memory AS m
                     WHERE {where}
                     ORDER BY m.importance DESC,m.updated_at DESC
-                    {'' if match else 'LIMIT ?'}
+                    {"" if match else "LIMIT ?"}
                     """,
                     (*params, *(() if match else (pool_limit,))),
                 ).fetchall()
@@ -1522,11 +1817,16 @@ class SqliteMemoryStore:
                     record=record,
                     score=score,
                     lexical_score=lexical,
-                    reason="sqlite-fts5-bm25" if self._fts_available else "bm25-fallback",
+                    reason="sqlite-fts5-bm25"
+                    if self._fts_available
+                    else "bm25-fallback",
                 )
             )
         hits.sort(key=lambda hit: (hit.score, hit.record.updated_at), reverse=True)
-        return hits[: request.candidate_limit]
+        return SearchResults(
+            hits[: request.candidate_limit],
+            has_more=len(hits) > request.candidate_limit or len(rows) >= pool_limit,
+        )
 
     def verify_active_memories(
         self,
@@ -1543,131 +1843,6 @@ class SqliteMemoryStore:
             if memory.status in {MemoryStatus.ACTIVE, MemoryStatus.OPEN}
         ]
 
-    def update_memory_indexed(
-        self,
-        *,
-        tenant_id: str,
-        task_id: str,
-        memory_id: str,
-        collection: str,
-        primary_key: str,
-    ) -> None:
-        with self._transaction() as db:
-            db.execute(
-                """
-                UPDATE agent_memory SET milvus_collection=?,milvus_primary_key=?,indexed_at=?,updated_at=?
-                WHERE tenant_id=? AND task_id=? AND id=?
-                """,
-                (
-                    collection,
-                    primary_key,
-                    now_epoch(),
-                    now_epoch(),
-                    tenant_id,
-                    task_id,
-                    memory_id,
-                ),
-            )
-
-    def pending_outbox(
-        self, *, limit: int = 100, now: float | None = None
-    ) -> list[OutboxRecord]:
-        current = now_epoch() if now is None else now
-        with self._lock:
-            rows = self._connection.execute(
-                """
-                SELECT * FROM agent_outbox
-                WHERE status IN ('PENDING','RETRY') AND next_retry_at<=?
-                ORDER BY created_at ASC LIMIT ?
-                """,
-                (current, max(1, limit)),
-            ).fetchall()
-        return [self._outbox(row) for row in rows]
-
-    def claim_outbox(
-        self,
-        *,
-        limit: int = 1,
-        now: float | None = None,
-        lease_seconds: float = 60.0,
-        index_id: str = "",
-    ) -> list[OutboxRecord]:
-        """Atomically lease due rows so concurrent consumers cannot duplicate work."""
-        current = now_epoch() if now is None else now
-        lease_until = current + max(1.0, lease_seconds)
-        claim_token = new_id("claim")
-        with self._transaction() as db:
-            index_filter = " AND json_extract(payload,'$.index_id')=?" if index_id else ""
-            claim_params: list[Any] = [current, current]
-            if index_id:
-                claim_params.append(index_id)
-            claim_params.append(max(1, limit))
-            rows = db.execute(
-                f"""
-                SELECT * FROM agent_outbox
-                WHERE ((status IN ('PENDING','RETRY') AND next_retry_at<=?)
-                    OR (status='PROCESSING' AND next_retry_at<=?))
-                    {index_filter}
-                ORDER BY created_at ASC LIMIT ?
-                """,
-                claim_params,
-            ).fetchall()
-            if not rows:
-                return []
-            ids = [str(row["id"]) for row in rows]
-            placeholders = ",".join("?" for _ in ids)
-            db.execute(
-                f"UPDATE agent_outbox "
-                f"SET status='PROCESSING',next_retry_at=?,claim_token=? "
-                f"WHERE id IN ({placeholders})",
-                (lease_until, claim_token, *ids),
-            )
-            claimed = db.execute(
-                f"SELECT * FROM agent_outbox WHERE id IN ({placeholders})",
-                ids,
-            ).fetchall()
-        return [self._outbox(row) for row in claimed]
-
-    def complete_outbox(self, outbox_id: str, *, claim_token: str) -> None:
-        with self._transaction() as db:
-            cursor = db.execute(
-                "UPDATE agent_outbox "
-                "SET status='COMPLETED',processed_at=?,claim_token='' "
-                "WHERE id=? AND status='PROCESSING' AND claim_token=?",
-                (now_epoch(), outbox_id, claim_token),
-            )
-            self._require_outbox_claim(cursor.rowcount, outbox_id)
-
-    def fail_outbox(
-        self, outbox_id: str, *, claim_token: str, retry_at: float
-    ) -> None:
-        with self._transaction() as db:
-            cursor = db.execute(
-                """
-                UPDATE agent_outbox
-                SET status='RETRY',retry_count=retry_count+1,next_retry_at=?,claim_token=''
-                WHERE id=? AND status='PROCESSING' AND claim_token=?
-                """,
-                (retry_at, outbox_id, claim_token),
-            )
-            self._require_outbox_claim(cursor.rowcount, outbox_id)
-
-    def dead_letter_outbox(self, outbox_id: str, *, claim_token: str) -> None:
-        with self._transaction() as db:
-            cursor = db.execute(
-                "UPDATE agent_outbox "
-                "SET status='FAILED',processed_at=?,claim_token='' "
-                "WHERE id=? AND status='PROCESSING' AND claim_token=?",
-                (now_epoch(), outbox_id, claim_token),
-            )
-            self._require_outbox_claim(cursor.rowcount, outbox_id)
-
-    @staticmethod
-    def _require_outbox_claim(updated: int, outbox_id: str) -> None:
-        if updated != 1:
-            raise OutboxClaimLostError(
-                f"outbox claim is no longer current: {outbox_id}"
-            )
 
     def put_checkpoint(self, checkpoint: CheckpointRecord) -> CheckpointRecord:
         with self._transaction() as db:
@@ -1708,6 +1883,7 @@ class SqliteMemoryStore:
             row = self._connection.execute(
                 """
                 SELECT * FROM agent_checkpoint WHERE tenant_id=? AND task_id=?
+                AND COALESCE(json_extract(snapshot, '$.checkpoint_type'), 'TASK_STATE')='TASK_STATE'
                 ORDER BY created_at DESC LIMIT 1
                 """,
                 (tenant_id, task_id),
@@ -1981,6 +2157,63 @@ class SqliteMemoryStore:
                 for query, params in checks
             )
 
+    def protected_artifact_ids(
+        self, *, tenant_id: str, artifacts: Sequence[ArtifactRecord], ignore_candidate_rows: bool = False
+    ) -> set[str]:
+        """Trace all candidate artifact owners with one scan per source table.
+
+        Checking each candidate separately repeatedly reads large checkpoint
+        snapshots under the history write lease. Include every reference source
+        used by artifact_reference_exists, and protect aliases of a retained URI.
+        Before collection, candidates' own registry rows are not external owners.
+        """
+        by_id = {artifact.id: artifact for artifact in artifacts}
+        by_uri: dict[str, set[str]] = {}
+        for artifact in artifacts:
+            by_uri.setdefault(artifact.uri, set()).add(artifact.id)
+        referenced: set[str] = set()
+        if not by_id:
+            return referenced
+
+        def protect(value: str) -> None:
+            if value in by_id:
+                referenced.update(by_uri[by_id[value].uri])
+            referenced.update(by_uri.get(value, ()))
+
+        with self._lock:
+            for row in self._connection.execute(
+                "SELECT id,uri FROM agent_artifact WHERE tenant_id=?", (tenant_id,)
+            ):
+                if ignore_candidate_rows and row["id"] in by_id:
+                    continue
+                protect(row["id"])
+                protect(row["uri"])
+            for query in (
+                "SELECT artifact_uri FROM agent_event WHERE tenant_id=? AND artifact_uri<>''",
+                "SELECT artifact_id FROM agent_memory WHERE tenant_id=? AND artifact_id<>''",
+                "SELECT artifact_id,uri FROM memory_archive_manifest WHERE tenant_id=? AND status<>'TOMBSTONED'",
+            ):
+                for row in self._connection.execute(query, (tenant_id,)):
+                    for value in row:
+                        if isinstance(value, str):
+                            protect(value)
+            for query in (
+                "SELECT active_artifacts FROM agent_task_state WHERE tenant_id=?",
+                "SELECT snapshot FROM agent_checkpoint WHERE tenant_id=?",
+            ):
+                for row in self._connection.execute(query, (tenant_id,)):
+                    pending = [json.loads(row[0])]
+                    while pending:
+                        value = pending.pop()
+                        if isinstance(value, str):
+                            protect(value)
+                        elif isinstance(value, dict):
+                            pending.extend(value.keys())
+                            pending.extend(value.values())
+                        elif isinstance(value, list):
+                            pending.extend(value)
+        return referenced
+
     def hard_delete_task(
         self,
         *,
@@ -1991,10 +2224,12 @@ class SqliteMemoryStore:
         reason_hash: str = "",
     ) -> dict[str, int]:
         tables = [
+            "conversation_history_migration",
+            "conversation_history_event",
+            "conversation_history_head",
             "memory_working_set",
             "memory_retention_policy",
             "memory_archive_manifest",
-            "agent_outbox",
             "agent_memory",
             "agent_checkpoint",
             "agent_dependency",
@@ -2012,21 +2247,11 @@ class SqliteMemoryStore:
         try:
             with self._transaction() as db:
                 for table in tables:
-                    if table == "agent_outbox":
-                        cursor = db.execute(
-                            """
-                            DELETE FROM agent_outbox WHERE aggregate_id IN (
-                                SELECT id FROM agent_memory WHERE tenant_id=? AND task_id=?
-                            )
-                            """,
-                            (tenant_id, task_id),
-                        )
-                    else:
-                        column = "id" if table == "agent_task" else "task_id"
-                        cursor = db.execute(
-                            f"DELETE FROM {table} WHERE tenant_id=? AND {column}=?",
-                            (tenant_id, task_id),
-                        )
+                    column = "id" if table == "agent_task" else "task_id"
+                    cursor = db.execute(
+                        f"DELETE FROM {table} WHERE tenant_id=? AND {column}=?",
+                        (tenant_id, task_id),
+                    )
                     counts[table] = max(0, cursor.rowcount)
                 db.execute(
                     """
@@ -2063,6 +2288,7 @@ class SqliteMemoryStore:
         value = dict(row)
         value["deleted_counts"] = json.loads(value["deleted_counts"])
         return value
+
 
     def all_memories(
         self, *, tenant_id: str | None = None, task_id: str | None = None
@@ -2141,9 +2367,8 @@ class SqliteMemoryStore:
             INSERT INTO agent_memory(
                 id,tenant_id,task_id,run_id,step_id,memory_type,title,preview_text,status,
                 importance,source_event_id,artifact_id,source_start,source_end,source_unit,
-                content_hash,token_count,phase,facets,milvus_collection,milvus_primary_key,
-                indexed_at,created_at,updated_at
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                content_hash,token_count,phase,facets,created_at,updated_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 memory.id,
@@ -2165,17 +2390,12 @@ class SqliteMemoryStore:
                 memory.token_count,
                 memory.phase,
                 stable_json(memory.facets),
-                memory.milvus_collection,
-                memory.milvus_primary_key,
-                memory.indexed_at,
                 memory.created_at,
                 memory.updated_at,
             ),
         )
         if self._fts_available:
-            db.execute(
-                "DELETE FROM agent_memory_fts WHERE memory_id=?", (memory.id,)
-            )
+            db.execute("DELETE FROM agent_memory_fts WHERE memory_id=?", (memory.id,))
             db.execute(
                 "INSERT INTO agent_memory_fts(memory_id,search_document) VALUES (?,?)",
                 (
@@ -2189,40 +2409,6 @@ class SqliteMemoryStore:
             )
         return memory
 
-    @staticmethod
-    def _align_memory_outbox(outbox: OutboxRecord, memory: MemoryRecord) -> None:
-        outbox.aggregate_id = memory.id
-        outbox.payload = {
-            **outbox.payload,
-            "tenant_id": memory.tenant_id,
-            "task_id": memory.task_id,
-            "memory_id": memory.id,
-            "content_hash": memory.content_hash,
-        }
-
-    @staticmethod
-    def _put_outbox(db: sqlite3.Connection, outbox: OutboxRecord) -> None:
-        db.execute(
-            """
-            INSERT OR IGNORE INTO agent_outbox(
-                id,aggregate_type,aggregate_id,event_type,payload,status,retry_count,
-                next_retry_at,created_at,processed_at,claim_token
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-            """,
-            (
-                outbox.id,
-                outbox.aggregate_type,
-                outbox.aggregate_id,
-                outbox.event_type,
-                stable_json(outbox.payload),
-                outbox.status,
-                outbox.retry_count,
-                outbox.next_retry_at,
-                outbox.created_at,
-                outbox.processed_at,
-                outbox.claim_token,
-            ),
-        )
 
     @staticmethod
     def _write_state(
@@ -2233,7 +2419,7 @@ class SqliteMemoryStore:
             UPDATE agent_task_state SET
                 version=?,phase=?,current_step_id=?,goal=?,active_constraints=?,
                 active_decisions=?,open_errors=?,completed_steps=?,pending_steps=?,
-                active_artifacts=?,blocked_by=?,updated_at=?
+                active_artifacts=?,blocked_by=?,handoff_notes=?,context_rotations=?,updated_at=?
             WHERE tenant_id=? AND task_id=? AND version=?
             """,
             (
@@ -2248,6 +2434,8 @@ class SqliteMemoryStore:
                 stable_json(state.pending_steps),
                 stable_json(state.active_artifacts),
                 stable_json(state.blocked_by),
+                stable_json(state.handoff_notes),
+                stable_json(state.context_rotations),
                 state.updated_at,
                 state.tenant_id,
                 state.task_id,
@@ -2296,6 +2484,8 @@ class SqliteMemoryStore:
             pending_steps=json.loads(row["pending_steps"] or "[]"),
             active_artifacts=json.loads(row["active_artifacts"] or "[]"),
             blocked_by=json.loads(row["blocked_by"] or "[]"),
+            handoff_notes=json.loads(row["handoff_notes"] or "{}") if "handoff_notes" in row.keys() else {},
+            context_rotations=json.loads(row["context_rotations"] or "{}") if "context_rotations" in row.keys() else {},
             updated_at=row["updated_at"],
         )
 
@@ -2375,9 +2565,6 @@ class SqliteMemoryStore:
             token_count=row["token_count"],
             phase=row["phase"],
             facets=json.loads(row["facets"] or "[]"),
-            milvus_collection=row["milvus_collection"],
-            milvus_primary_key=row["milvus_primary_key"],
-            indexed_at=row["indexed_at"],
             created_at=row["created_at"],
             updated_at=row["updated_at"],
         )
@@ -2398,21 +2585,6 @@ class SqliteMemoryStore:
             created_at=row["created_at"],
         )
 
-    @staticmethod
-    def _outbox(row: sqlite3.Row | Mapping[str, Any]) -> OutboxRecord:
-        return OutboxRecord(
-            id=row["id"],
-            aggregate_type=row["aggregate_type"],
-            aggregate_id=row["aggregate_id"],
-            event_type=row["event_type"],
-            payload=json.loads(row["payload"] or "{}"),
-            status=row["status"],
-            retry_count=row["retry_count"],
-            next_retry_at=row["next_retry_at"],
-            created_at=row["created_at"],
-            processed_at=row["processed_at"],
-            claim_token=row["claim_token"],
-        )
 
     @staticmethod
     def _archive_manifest_values(manifest: ArchiveManifest) -> dict[str, Any]:

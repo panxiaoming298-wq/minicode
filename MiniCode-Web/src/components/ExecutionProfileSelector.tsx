@@ -16,8 +16,9 @@ const PROFILE_OPTIONS: Array<{
   label: string;
   detail: string;
 }> = [
-  { value: "standard", label: "Standard", detail: "日常任务 · 单 Agent 优先" },
-  { value: "ultra", label: "Ultra", detail: "复杂任务 · 智能并行" },
+  { value: "standard", label: "Standard", detail: "日常执行 · 单 Agent 优先" },
+  { value: "deep", label: "Deep", detail: "深入探索、验证与修复 · 单主 Agent" },
+  { value: "ultra", label: "Ultra", detail: "深度执行 · 按需并行协作" },
 ];
 
 export function ExecutionProfileSelector({
@@ -170,7 +171,7 @@ export function ExecutionProfileSelector({
             </button>
           ))}
           <p className="execution-profile-note">
-            Ultra 会按任务自动选择深度单 Agent 或只读并行。
+            三档按任务风险选择复核范围；Deep 加强主 Agent 的执行深度，Ultra 支持按需并行协作。
           </p>
         </div>
       )}

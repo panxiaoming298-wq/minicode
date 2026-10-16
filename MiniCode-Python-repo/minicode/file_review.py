@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import difflib
+import hashlib
+import os
 from pathlib import Path
 
 from minicode.session import create_file_checkpoint
@@ -38,12 +40,16 @@ def apply_reviewed_file_change(
 ) -> ToolResult:
     target = Path(target_path)
     previous_content = load_existing_file(target)
-    if previous_content == next_content:
+    if target.exists() and previous_content == next_content:
         return ToolResult(ok=True, output=f"No changes needed for {file_path}")
 
-    diff = build_unified_diff(file_path, previous_content, next_content)
+    diff = (f"Create empty file: {file_path}" if not target.exists() and next_content == ""
+            else build_unified_diff(file_path, previous_content, next_content))
     if context.permissions is not None:
         context.permissions.ensure_edit(str(target), diff)
+
+    if context.cancellation_event is not None and context.cancellation_event.is_set():
+        return ToolResult(ok=False, output="Canceled: file edit canceled before writing", failureKind="canceled")
 
     create_file_checkpoint(
         context.session,
@@ -51,6 +57,18 @@ def apply_reviewed_file_change(
         existed=target.exists(),
         previous_content=previous_content,
     )
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(next_content, encoding="utf-8")
-    return ToolResult(ok=True, output=f"Applied reviewed changes to {file_path}")
+    from minicode.native_read_set import current_native_read_set
+
+    reads = current_native_read_set()
+    creation = reads.prepare_file_creation(target) if reads is not None and not target.exists() else {}
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(next_content, encoding="utf-8")
+    except OSError:
+        if reads is not None and creation:
+            reads.record_dynamic("file-creation:write-incomplete")
+        raise
+    if reads is not None and creation:
+        reads.finish_file_creation(creation)
+    revision = hashlib.sha256((os.path.normcase(str(target.resolve())) + "\0" + next_content).encode("utf-8")).hexdigest()
+    return ToolResult(ok=True, output=f"Applied reviewed changes to {file_path}", contextWriteRevision=revision)

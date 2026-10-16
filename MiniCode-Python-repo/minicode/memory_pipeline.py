@@ -15,7 +15,7 @@ Sub-components (internal, not exposed):
   - MemoryReranker: LLM curation of BM25 results
   - MemoryInjector: PID-controlled injection into prompt
   - MemoryCuratorAgent: background optimization during idle
-  - VectorMemoryStore: optional parallel semantic search
+  - SparseVectorStore: optional local TF-IDF keyword similarity
 """
 from __future__ import annotations
 
@@ -58,7 +58,6 @@ class MemoryPipeline:
         self._curator: Any = None
         self._reflection: Any = None
         self._vector_store: Any = None
-        self._dense_store: Any = None
         self._graph_store: Any = None
         self._defer_graph_consolidation = False
         self._domain_classifier_loaded = False
@@ -119,13 +118,11 @@ class MemoryPipeline:
         from minicode.agent_reflection import ReflectionEngine
         self._reflection = ReflectionEngine(memory_manager=self._memory)
 
-        # Vector store — sparse TF-IDF always available, optional sentence-transformers
+        # Optional zero-dependency TF-IDF keyword similarity
         if enable_vector:
             try:
-                from minicode.vector_memory import SparseVectorStore, VectorMemoryStore
+                from minicode.vector_memory import SparseVectorStore
                 self._vector_store = SparseVectorStore()  # Zero-dependency, always works
-                # Also try the optional dense backend
-                self._dense_store = VectorMemoryStore()
                 if self._memory:
                     all_entries = []
                     from minicode.memory import MemoryScope
@@ -135,8 +132,6 @@ class MemoryPipeline:
                     if all_entries:
                         n = self._vector_store.index_entries(all_entries)
                         logger.info("SparseVectorStore: indexed %d entries", n)
-                        if self._dense_store.enabled:
-                            self._dense_store.index_entries(all_entries)
             except Exception:
                 pass
 
@@ -333,6 +328,8 @@ class MemoryPipeline:
             self._last_graph_trace = graph_trace
             return []
 
+        if record_usage:
+            self.maintain_lifecycle()
         self._read_count += 1
         self._refresh_graph()
 
@@ -366,6 +363,7 @@ class MemoryPipeline:
         # path unchanged.
         graph_evidence: dict[str, Any] = {}
         graph_conflicts: dict[str, set[str]] = {}
+        superseded_memory_ids: set[str] = set()
         if self._graph_store and self._should_use_graph(task_description, entries):
             graph_trace["routed"] = True
             try:
@@ -378,6 +376,14 @@ class MemoryPipeline:
                     seed_limit=graph_policy["seed_limit"],
                     supersedes_preference=graph_policy["supersedes_preference"],
                 )
+                # A disabled summary cannot return indirectly as another
+                # memory's graph evidence or act as a bridge to that memory.
+                allowed_ids = {entry.id for entry in self._memory.context_eligible_entries(
+                    self._all_memory_entries(), task_description)}
+                graph_hits = [hit for hit in graph_hits if hit.memory_id in allowed_ids and all(
+                    fact_id in self._graph_store.facts
+                    and self._graph_store.facts[fact_id].memory_id in allowed_ids
+                    for fact_id in hit.path)]
                 graph_trace["outcome"] = "searched"
                 graph_trace["graph_hit_count"] = len(graph_hits)
                 if as_of is not None:
@@ -472,6 +478,8 @@ class MemoryPipeline:
         elif self._graph_store and self._graph_store.enabled:
             graph_trace["outcome"] = "not_routed"
 
+        entries = self._memory.context_eligible_entries(entries, task_description)
+
         # 3. Score entries with value function (T1)
         if self._reranker and self._reranker.enabled and len(entries) > 3:
             try:
@@ -488,6 +496,8 @@ class MemoryPipeline:
 
         # 4. Spreading activation via related_to graph (T3)
         entries = self._spread_activation(entries)
+        entries = [entry for entry in self._memory.context_eligible_entries(entries, task_description)
+                   if entry.id not in superseded_memory_ids]
 
         # 5. Format results
         results = []
@@ -523,6 +533,8 @@ class MemoryPipeline:
             if memory_id in result_ranks
         }
         self._last_graph_trace = graph_trace
+        if record_usage:
+            self._memory.record_access([result["id"] for result in results])
         return results
 
     # ── INJECT: Memory into prompt ──────────────────────────────────
@@ -541,6 +553,8 @@ class MemoryPipeline:
         """
         if not self._initialized or not self._memory:
             return messages
+
+        self.maintain_lifecycle()
 
         # Adaptive cooldown check
         now = time.time()
@@ -604,14 +618,21 @@ class MemoryPipeline:
                 execution_trace,
                 persist=False,
             )
-            if result and result.confidence >= self._reflection.min_confidence:
+            if result and self._reflection.should_persist(result):
                 mem_data = result.to_memory_entry()
                 from minicode.memory import MemoryScope
+                # Repeated completion callbacks must not create duplicate summaries.
+                for existing in self._memory.memories[MemoryScope.LOCAL].entries:
+                    if (existing.content == mem_data["content"] and existing.sources ==
+                            self._memory._entry_sources(mem_data["category"], ["task:" + result.task_summary[:500]])):
+                        return existing.id
                 entry = self._memory.add_entry(
-                    scope=MemoryScope.PROJECT,
+                    scope=MemoryScope.LOCAL,
                     category=mem_data["category"],
                     content=mem_data["content"],
                     tags=mem_data["tags"],
+                    origin="agent_reflection",
+                    sources=["task:" + result.task_summary[:500]],
                 )
                 # Post-add domain assignment
                 if mem_data.get("domains"):
@@ -696,6 +717,29 @@ class MemoryPipeline:
 
     # ── MAINTAIN: Background optimization ───────────────────────────
 
+    def maintain_lifecycle(self, *, force: bool = False) -> dict[str, Any] | None:
+        """Run cheap ageing before reads, at most hourly in this runtime.
+
+        The store's persisted per-entry clock is the authority; this throttle
+        only avoids unnecessary IO and is not relied upon for correctness.
+        """
+        from minicode.memory_lifecycle import MAINTENANCE_INTERVAL_SECONDS
+
+        if not self._memory:
+            return None
+        now = time.monotonic()
+        previous = getattr(self, "_last_lifecycle_check", None)
+        if not force and previous is not None and now - previous < MAINTENANCE_INTERVAL_SECONDS:
+            return None
+        try:
+            report = {"decayed": self._memory.decay_memories()}
+            report.update(self._memory.promote_memories())
+        except Exception as exc:
+            logger.warning("Memory lifecycle maintenance failed: %s", exc)
+            return None
+        self._last_lifecycle_check = now
+        return report
+
     def maintain(self, force: bool = False) -> dict[str, Any] | None:
         """Run background memory optimization.
 
@@ -707,6 +751,7 @@ class MemoryPipeline:
         if not self._curator:
             return None
 
+        self.maintain_lifecycle(force=force)
         self._curator.on_task_complete()
 
         if not force and not self._curator.should_run:

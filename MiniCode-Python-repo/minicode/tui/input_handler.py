@@ -9,7 +9,11 @@ from typing import Any, Callable
 from minicode.tui.state import AggregatedEditProgress, ScreenState, TtyAppArgs
 from minicode.cli_commands import try_handle_local_command, find_matching_slash_commands
 from minicode.unified_runtime import run_runtime_turn as run_agent_turn
+from minicode.runtime_delivery import entry_completion, task_memory_notice
+from minicode.entry_task import bind_task
+from minicode.tui.task_entry import handle_task_command, take_task
 from minicode.context_manager import save_context_state
+from minicode.extension_commands import expand_extension_command
 from minicode.history import save_history_entries
 from minicode.local_tool_shortcuts import parse_local_tool_shortcut
 from minicode.prompt import build_system_prompt_bundle
@@ -356,6 +360,10 @@ def _handle_input(
         return False
 
     # Local commands
+    task_command = handle_task_command(args, state, input_text)
+    if task_command is not None:
+        _push_transcript_entry(state, kind="progress", body=task_command)
+        return False
     if state.session is not None:
         refresh_tty_session_snapshot(args, state)
     local_result = try_handle_local_command(
@@ -368,6 +376,18 @@ def _handle_input(
         _push_transcript_entry(state, kind="assistant", body=local_result)
         return False
 
+    from minicode.skill_runtime import user_skill_request
+    if args.runtime is None:
+        args.runtime = {}
+    try:
+        input_text = user_skill_request(input_text, args.runtime)
+    except ValueError as error:
+        _push_transcript_entry(state, kind="assistant", body=str(error))
+        return False
+    extension_command = expand_extension_command(args.cwd, input_text)
+    if extension_command is not None:
+        input_text = extension_command.prompt
+
     # Tool shortcuts
     shortcut = parse_local_tool_shortcut(input_text)
     if shortcut:
@@ -378,7 +398,7 @@ def _handle_input(
 
     # Unknown slash commands
     if input_text.startswith("/"):
-        matches = find_matching_slash_commands(input_text)
+        matches = find_matching_slash_commands(input_text, args.cwd)
         _push_transcript_entry(
             state,
             kind="assistant",
@@ -391,6 +411,12 @@ def _handle_input(
         return False
 
     # Agent turn
+    try:
+        selected_task = take_task(args, state)
+    except ValueError as error:
+        _push_transcript_entry(state, kind="progress", body=str(error))
+        state.input = input_text
+        return False
     _push_transcript_entry(state, kind="user", body=input_text)
     state.transcript_scroll_offset = 0
     state.status = "Thinking..."
@@ -734,19 +760,39 @@ def _handle_input(
     def _run_agent_background():
         nonlocal agent_error, agent_result
         try:
-            next_messages = run_agent_turn(
-                model=args.model,
-                tools=args.tools,
-                messages=list(args.messages),  # Copy to avoid race condition
-                cwd=args.cwd,
-                permissions=args.permissions,
-                session=state.session,
-                callbacks=agent_event_queue,
-                store=state.app_state,
-                context_manager=args.context_manager,
-                memory_manager=memory_mgr,
-                runtime=args.runtime,
-            )
+            from minicode.unified_runtime import _as_bool
+
+            # Keep the trace on the entry-owned mapping, even for old callers
+            # that did not supply runtime configuration. Do not reuse a receipt.
+            if args.runtime is None:
+                args.runtime = {}
+            args.runtime.pop("lastRuntimeTrace", None)
+            with bind_task(args.runtime, selected_task):
+                next_messages = run_agent_turn(
+                    model=args.model,
+                    tools=args.tools,
+                    messages=list(args.messages),  # Copy to avoid race condition
+                    cwd=args.cwd,
+                    permissions=args.permissions,
+                    session=state.session,
+                    callbacks=agent_event_queue,
+                    store=state.app_state,
+                    context_manager=args.context_manager,
+                    memory_manager=memory_mgr,
+                    runtime=args.runtime,
+                )
+            if _as_bool(args.runtime.get("runtimeV2", True)):
+                trace = args.runtime.get("lastRuntimeTrace")
+                completion = entry_completion(trace, expected_run_id=args.runtime.get("runtimeRunId"))
+                if state.session:
+                    state.session.metadata.status = "completed" if completion.completed else "failed"
+                agent_event_queue.on_event(TurnEvent.progress_message(step=None, content=completion.message))
+                memory_notice = task_memory_notice(trace)
+                if memory_notice:
+                    agent_event_queue.on_event(TurnEvent.progress_message(step=None, content=memory_notice))
+                with agent_thread_lock:
+                    agent_result["completed"] = completion.completed
+                    agent_result["completion_reason"] = completion.reason
             if args.context_manager is not None:
                 args.context_manager.messages = next_messages
                 save_context_state(args.context_manager)
@@ -754,6 +800,8 @@ def _handle_input(
                 agent_result["messages"] = next_messages
         except Exception as e:
             agent_error = e
+            if state.session:
+                state.session.metadata.status = "failed"
             # Do not let a worker failure disappear into the background
             # thread.  Publish a safe runtime event so the UI can surface the
             # failure without rendering exception text that may contain

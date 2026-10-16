@@ -10,6 +10,7 @@ from typing import Any
 from Package.EngineeringStructure.Src.Application.Query.ProductRootProjection import (
     PROJECT_ROLE_SPACE_NAMES,
     ROOT_PROJECT_ID,
+    filesystem_root,
     scan_product_project_root,
     summarize_structure_projection,
 )
@@ -99,7 +100,7 @@ class DependencyFinding:
 
 
 def check_product_project_compliance(root: str | Path) -> dict[str, Any]:
-    root_path = Path(root).resolve()
+    root_path = filesystem_root(root)
     structure_records = scan_product_project_root(root_path)
     import_findings, import_edges = _check_import_file_boundaries(structure_records)
     dependency_findings, dependency_edges = _check_python_dependency_boundaries(

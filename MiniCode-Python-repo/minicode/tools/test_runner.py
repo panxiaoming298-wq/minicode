@@ -4,18 +4,41 @@ import os
 import re
 import subprocess
 import sys
+import importlib.util
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 from minicode.tooling import ToolDefinition, ToolResult
+from minicode.tools._validation import validate_contract
+from minicode.tools.run_command import _run_with_bounded_pipes
 from minicode.workspace import resolve_tool_path
+
+
+TEST_RUNNER_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "path": {"type": "string", "minLength": 1, "default": ".",
+                 "description": "Directory or file path to test (default: current directory)"},
+        "framework": {"type": "string", "enum": ["auto", "pytest", "unittest"], "default": "auto",
+                      "description": "Test framework to use (default: auto)"},
+        "verbose": {"type": "boolean", "default": False, "description": "Show detailed output"},
+        "coverage": {"type": "boolean", "default": False,
+                     "description": "Enable coverage reporting (requires pytest-cov)"},
+        "pattern": {"type": ["string", "null"],
+                    "description": "Filter tests by name pattern; omit or use null for all tests"},
+        "timeout": {"type": "integer", "minimum": 10, "maximum": 300, "default": 60,
+                    "description": "Timeout in whole seconds (10-300, default: 60)"},
+    },
+}
 
 
 # ---------------------------------------------------------------------------
 # Test Discovery
 # ---------------------------------------------------------------------------
 
-def _discover_test_files(path: Path, pattern: str = "test_*.py") -> list[Path]:
+def _discover_test_files(path: Path, pattern: str = "test_*.py", *, cancellation_event=None,
+                         limit: int | None = None) -> list[Path]:
     """Discover test files matching pattern."""
     test_files: list[Path] = []
     
@@ -24,12 +47,16 @@ def _discover_test_files(path: Path, pattern: str = "test_*.py") -> list[Path]:
             test_files.append(path)
     elif path.is_dir():
         for root, dirs, files in os.walk(path):
+            if cancellation_event is not None and cancellation_event.is_set():
+                raise InterruptedError("test discovery canceled")
             # Skip common non-test dirs
-            dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "venv", "env", ".tox", "node_modules")]
+            dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", ".venv", "venv", "env", ".tox", "node_modules")]
             
             for f in files:
-                if f.startswith("test_") and f.endswith(".py"):
+                if f.endswith(".py") and (f.startswith("test_") or f.endswith("_test.py")):
                     test_files.append(Path(root) / f)
+                    if limit is not None and len(test_files) >= limit:
+                        return test_files
     
     return sorted(test_files)
 
@@ -133,23 +160,13 @@ def _parse_unittest_output(output: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 def _validate(input_data: dict) -> dict:
+    validate_contract(input_data, TEST_RUNNER_INPUT)
     path = input_data.get("path", ".")
     framework = input_data.get("framework", "auto")
-    if framework not in ("auto", "pytest", "unittest"):
-        raise ValueError("framework must be one of: auto, pytest, unittest")
-    
     verbose = input_data.get("verbose", False)
-    if not isinstance(verbose, bool):
-        raise ValueError("verbose must be a boolean")
-    
     coverage = input_data.get("coverage", False)
-    if not isinstance(coverage, bool):
-        raise ValueError("coverage must be a boolean")
-    
     pattern = input_data.get("pattern")
-    timeout = int(input_data.get("timeout", 60))
-    if timeout < 10 or timeout > 300:
-        raise ValueError("timeout must be between 10 and 300 seconds")
+    timeout = input_data.get("timeout", 60)
     
     return {
         "path": path,
@@ -177,7 +194,16 @@ def _run(input_data: dict, context) -> ToolResult:
         return ToolResult(ok=False, output=f"Path not found: {target}")
     
     # Discover test files
-    test_files = _discover_test_files(target)
+    cancellation = getattr(context, "cancellation_event", None)
+    try:
+        # Only establish that the target has tests. The framework performs the
+        # complete discovery once; counting every file here doubles broad scans.
+        test_files = _discover_test_files(target, cancellation_event=cancellation, limit=1)
+    except InterruptedError as error:
+        return ToolResult(ok=False, output=str(error), failureKind="canceled", commandExecutionSettled=True)
+    if cancellation is not None and cancellation.is_set():
+        return ToolResult(ok=False, output="Test execution canceled before process start", failureKind="canceled",
+                          commandExecutionSettled=True)
     
     if not test_files:
         return ToolResult(
@@ -188,16 +214,7 @@ def _run(input_data: dict, context) -> ToolResult:
     
     # Determine framework
     if framework == "auto":
-        # Check if pytest is available
-        try:
-            subprocess.run(
-                [sys.executable, "-m", "pytest", "--version"],
-                capture_output=True,
-                timeout=5,
-            )
-            framework = "pytest"
-        except Exception:
-            framework = "unittest"
+        framework = "pytest" if importlib.util.find_spec("pytest") is not None else "unittest"
     
     # Build command
     if framework == "pytest":
@@ -237,7 +254,7 @@ def _run(input_data: dict, context) -> ToolResult:
         "=" * 60,
         "",
         f"Framework: {framework}",
-        f"Test files: {len(test_files)}",
+        f"Target: {input_data['path']}",
         f"Pattern: {pattern or 'all'}",
         f"Coverage: {'enabled' if coverage else 'disabled'}",
         "",
@@ -245,17 +262,18 @@ def _run(input_data: dict, context) -> ToolResult:
         "",
     ]
     
+    result = None
     try:
-        result = subprocess.run(
-            cmd,
+        result = _run_with_bounded_pipes(
+            cmd[0], cmd[1:],
             cwd=str(context.cwd),
-            capture_output=True,
-            text=True,
             timeout=timeout,
+            cancellation_event=cancellation,
         )
-        
-        output = result.stdout + "\n" + result.stderr
-        success = result.returncode == 0
+        if result.timedOut or result.failureKind == "canceled" or result.ambiguousSideEffect:
+            return replace(result, output="\n".join(lines) + "\n" + result.output)
+        output = result.output
+        success = result.ok
         
         # Parse results
         if framework == "pytest":
@@ -321,26 +339,15 @@ def _run(input_data: dict, context) -> ToolResult:
         lines.append(f"❌ Test execution error: {e}")
         success = False
     
-    return ToolResult(
-        ok=success,
-        output="\n".join(lines),
-    )
+    if result is not None:
+        return replace(result, ok=success, output="\n".join(lines))
+    return ToolResult(ok=success, output="\n".join(lines))
 
 
 test_runner_tool = ToolDefinition(
     name="test_runner",
     description="Discover and run Python tests automatically. Supports pytest and unittest frameworks. Provides structured results with pass/fail counts, failure details, and optional coverage reporting.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Directory or file path to test (default: current directory)"},
-            "framework": {"type": "string", "enum": ["auto", "pytest", "unittest"], "description": "Test framework to use (default: auto)"},
-            "verbose": {"type": "boolean", "description": "Show detailed output (default: false)"},
-            "coverage": {"type": "boolean", "description": "Enable coverage reporting (default: false, requires pytest-cov)"},
-            "pattern": {"type": "string", "description": "Filter tests by name pattern"},
-            "timeout": {"type": "number", "description": "Timeout in seconds (default: 60, max: 300)"},
-        },
-    },
+    input_schema=TEST_RUNNER_INPUT,
     validator=_validate,
     run=_run,
 )

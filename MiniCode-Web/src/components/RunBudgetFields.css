@@ -1,0 +1,19 @@
+.run-budget-fields { margin: 8px 0; padding: 8px 12px; border: 1px solid var(--line); border-radius: var(--radius-control); font-size: 12px; color: var(--text-soft); overflow-wrap: anywhere; max-height: 35vh; overflow: auto; }
+.run-budget-fields summary { cursor: pointer; min-height: 24px; }
+.run-budget-fields summary span { margin-left: 8px; color: var(--muted); }
+.run-budget-fields p { margin: 8px 0; line-height: 1.6; }
+.run-budget-fields fieldset { margin: 0; padding: 0; border: 0; min-width: 0; }
+.run-budget-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+.run-budget-grid input { display: block; width: 100%; min-width: 0; margin: 6px 0; padding: 8px; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: var(--radius-control); }
+.run-budget-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+.run-budget-actions button { padding: 6px 10px; border: 1px solid var(--line); border-radius: var(--radius-control); }
+.run-budget-actions button[aria-pressed="true"] { border-color: var(--accent); background: var(--accent-soft); color: var(--accent-dark); }
+.run-budget-fields :disabled { opacity: .5; cursor: not-allowed; }
+.run-budget-fields [role="alert"] { color: var(--danger); }
+@media (max-width: 520px) { .run-budget-grid { grid-template-columns: minmax(0, 1fr); gap: 4px; } }
+.web-runtime-status { margin: 6px 0; font-size: 12px; color: var(--text-soft); line-height: 1.6; overflow-wrap: anywhere; }
+.execution-location-fields { padding: 8px 0; font-size: 12px; line-height: 1.6; color: var(--text-soft); }
+.execution-location-fields select { display: block; width: 100%; margin-top: 6px; padding: 7px; border: 1px solid var(--line); border-radius: var(--radius-control); background: var(--panel); color: var(--text); }
+.execution-location-fields p { margin: 6px 0; overflow-wrap: anywhere; }
+.execution-location-fields [role="alert"] { color: var(--danger); }
+.execution-location-path { user-select: text; }

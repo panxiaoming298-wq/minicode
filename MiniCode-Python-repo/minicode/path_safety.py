@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import os
 import stat
-from pathlib import Path
+from pathlib import Path, PurePath, PureWindowsPath
 
 
 _FILE_ATTRIBUTE_REPARSE_POINT = getattr(
@@ -18,6 +18,24 @@ _FILE_ATTRIBUTE_REPARSE_POINT = getattr(
     "FILE_ATTRIBUTE_REPARSE_POINT",
     0x0400,
 )
+
+
+def _resolved_comparison_path(path: PurePath) -> PurePath:
+    """Compare resolved Windows paths in the same extended namespace.
+
+    During concurrent creation, realpath can retain ``\\\\?\\`` for one
+    result but not its parent. Adding that prefix to normal resolved paths
+    avoids a false containment failure. Never strip it: trailing dots/spaces
+    have distinct meanings in the extended namespace. Device paths and volume
+    identifiers remain distinct; this is not a filesystem alias exemption.
+    """
+    if isinstance(path, PureWindowsPath) and path.is_absolute():
+        drive = path.drive
+        if len(drive) == 2 and drive[0].isalpha() and drive[1] == ":":
+            return PureWindowsPath("\\\\?\\" + str(path))
+        if drive.startswith("\\\\") and not drive.startswith(("\\\\?\\", "\\\\.\\")):
+            return PureWindowsPath("\\\\?\\UNC\\" + str(path)[2:])
+    return path
 
 
 def is_link_or_reparse(path: Path) -> bool:
@@ -60,6 +78,20 @@ def is_unsafe_stored_path(
     except ValueError:
         return True
 
+    # Reject known hard-link aliases before resolving every ancestor. Large
+    # package trees often contain thousands of these. Keep the final check too:
+    # a link created while the parent chain is inspected must still be rejected.
+    if reject_hardlinks:
+        try:
+            metadata = candidate.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            return True
+        else:
+            if stat.S_ISREG(metadata.st_mode) and metadata.st_nlink > 1:
+                return True
+
     cursor = root
     for part in relative.parts:
         cursor = cursor / part
@@ -72,7 +104,9 @@ def is_unsafe_stored_path(
         resolved_root = root.resolve(strict=False)
     try:
         resolved_candidate = candidate.resolve(strict=candidate.exists())
-        resolved_candidate.relative_to(resolved_root)
+        _resolved_comparison_path(resolved_candidate).relative_to(
+            _resolved_comparison_path(resolved_root)
+        )
     except (OSError, RuntimeError, ValueError):
         return True
 

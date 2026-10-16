@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
+from minicode.tools._validation import validate_fields
 
 
 def _validate(input_data: dict) -> dict:
     """Validate input for json_format tool."""
+    validate_fields(input_data, required=("content",), content=str)
     content = input_data.get("content", "")
     if not isinstance(content, str) or not content.strip():
         raise ValueError("content is required and must be a non-empty string")
@@ -21,7 +23,7 @@ def _run(input_data: dict, context: ToolContext) -> ToolResult:
         formatted = json.dumps(parsed, indent=2, ensure_ascii=False)
         return ToolResult(ok=True, output=formatted)
     except json.JSONDecodeError as e:
-        return ToolResult(ok=False, output=f"Invalid JSON: {e}")
+        return ToolResult(ok=False, output=f"Invalid JSON: {e}", failureKind="invalid_input")
 
 
 json_format_tool = ToolDefinition(
@@ -29,6 +31,7 @@ json_format_tool = ToolDefinition(
     description="Format and validate JSON content. Pretty-prints JSON with proper indentation.",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "content": {"type": "string", "description": "JSON string to format"}
         },
@@ -44,6 +47,7 @@ json_format_tool = ToolDefinition(
 # ---------------------------------------------------------------------------
 
 def _validate_parse(input_data: dict) -> dict:
+    validate_fields(input_data, required=("content",), content=str, path=str)
     """Validate input for json_parse tool."""
     content = input_data.get("content", "")
     path = input_data.get("path", "")
@@ -66,23 +70,23 @@ def _run_parse(input_data: dict, context: ToolContext) -> ToolResult:
             current = parsed
             for key in keys:
                 if isinstance(current, dict):
-                    current = current.get(key)
+                    if key not in current:
+                        return ToolResult(ok=False, output=f"Path not found: {path}", failureKind="not_found")
+                    current = current[key]
                 elif isinstance(current, list):
                     try:
                         idx = int(key)
                         current = current[idx]
                     except (ValueError, IndexError):
-                        return ToolResult(ok=False, output=f"Invalid path: {path}")
+                        return ToolResult(ok=False, output=f"Invalid path: {path}", failureKind="invalid_input")
                 else:
-                    return ToolResult(ok=False, output=f"Cannot index into {type(current)}")
+                    return ToolResult(ok=False, output=f"Cannot index into {type(current)}", failureKind="invalid_input")
             
-            if current is None:
-                return ToolResult(ok=False, output=f"Path not found: {path}")
             return ToolResult(ok=True, output=json.dumps(current, indent=2, ensure_ascii=False))
         
         return ToolResult(ok=True, output=json.dumps(parsed, indent=2, ensure_ascii=False))
     except json.JSONDecodeError as e:
-        return ToolResult(ok=False, output=f"Invalid JSON: {e}")
+        return ToolResult(ok=False, output=f"Invalid JSON: {e}", failureKind="invalid_input")
 
 
 json_parse_tool = ToolDefinition(
@@ -90,6 +94,7 @@ json_parse_tool = ToolDefinition(
     description="Parse JSON and extract values by dot-notation path (e.g., 'data.items.0.name').",
     input_schema={
         "type": "object",
+        "additionalProperties": False,
         "properties": {
             "content": {"type": "string", "description": "JSON string to parse"},
             "path": {"type": "string", "description": "Optional dot-notation path to extract (e.g., 'data.0.name')"}

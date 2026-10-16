@@ -24,7 +24,8 @@ import time
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-from minicode.path_safety import is_unsafe_stored_path
+from minicode.path_safety import _resolved_comparison_path, is_unsafe_stored_path
+from minicode.runtime_messages import is_user_input, runtime_message_kind
 
 
 SESSION_FORMAT_VERSION = "minicode-rust-compatible-v1"
@@ -100,7 +101,8 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
     file_descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
+        # Keep temporary paths shorter than long hashed receipt filenames on Windows.
+        prefix=".tmp-",
         suffix=".tmp",
         dir=str(path.parent),
     )
@@ -111,7 +113,17 @@ def atomic_write_json(path: Path, payload: Mapping[str, Any]) -> None:
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary_path, path)
+        # Windows readers (including indexers and antivirus) can briefly deny
+        # delete sharing. Retry the same complete file; never truncate the old
+        # document or retry serialization against a partially changed payload.
+        for attempt in range(9):
+            try:
+                os.replace(temporary_path, path)
+                break
+            except PermissionError:
+                if attempt == 8:
+                    raise
+                time.sleep(min(0.01 * (2 ** attempt), 0.15))
         temporary_path = None
     finally:
         if temporary_path is not None:
@@ -293,8 +305,10 @@ def derive_turn_records(
         role = _message_role(message)
         if role == "system":
             continue
+        if current is None and runtime_message_kind(message):
+            continue
 
-        if role == "user" or current is None:
+        if is_user_input(message) or current is None:
             flush()
             turn_number += 1
             current = {
@@ -378,15 +392,15 @@ def build_session_record(session: Any) -> SessionRecord:
         if isinstance(message, Mapping)
     ]
     turns = derive_turn_records(messages, created_at=created_at)
-    user_input_count = sum(1 for message in messages if _message_role(message) == "user")
+    user_input_count = sum(1 for message in messages if is_user_input(message))
     tool_call_count = sum(
         1
         for message in messages
-        if _message_role(message) in {"assistant_tool_call", "tool_result", "tool"}
+        if _message_role(message) == "assistant_tool_call"
     )
     runtime_report = getattr(session, "readiness_report", {}) or {}
-    model = None
-    if isinstance(runtime_report, Mapping):
+    model = _optional_text(getattr(python_metadata, "model", None))
+    if model is None and isinstance(runtime_report, Mapping):
         model = _optional_text(
             runtime_report.get("model")
             or runtime_report.get("configuredModel")
@@ -396,6 +410,8 @@ def build_session_record(session: Any) -> SessionRecord:
     if not isinstance(memory_continuity, Mapping):
         memory_continuity = {}
     extensions: dict[str, Any] = {}
+    extensions["binding"] = deepcopy(getattr(session, "binding", {}) or {})
+    extensions["context_state"] = deepcopy(getattr(session, "context_state", {}) or {})
     transcript_entries = getattr(session, "transcript_entries", []) or []
     if isinstance(transcript_entries, list):
         extensions["transcript_entries"] = deepcopy(transcript_entries)
@@ -414,6 +430,7 @@ def build_session_record(session: Any) -> SessionRecord:
             for checkpoint in checkpoints
         ]
     runtime_runs = getattr(session, "runtime_runs", []) or []
+    extensions["review_pending"] = bool(getattr(python_metadata, "review_pending", False))
     if isinstance(runtime_runs, list):
         extensions["runtime_runs"] = deepcopy(
             [item for item in runtime_runs if isinstance(item, Mapping)]
@@ -489,7 +506,7 @@ def _valid_session_id(session_id: str) -> bool:
     if (
         not isinstance(session_id, str)
         or not session_id
-        or session_id in {".", ".."}
+        or session_id.lower() in {".", "..", "trash", "deltas"}
         or "/" in session_id
         or "\\" in session_id
     ):
@@ -562,29 +579,68 @@ def read_session_bundle(session_id: str, sessions_dir: Path) -> SessionRecord | 
     )
 
 
-def delete_session_bundle(session_id: str, sessions_dir: Path) -> bool:
-    """Remove only the validated bundle directory for one session."""
-
+def _bundle_delete_inventory(session_id: str, sessions_dir: Path) -> tuple[list[Path], list[Path]]:
+    """Check all owned descendants before removing any conversation files."""
     if not _valid_session_id(session_id):
-        return False
-    sessions_root = Path(sessions_dir)
+        raise ValueError("invalid session identity")
+    # Keep both the boundary and descendants in the same Windows namespace.
+    sessions_root = Path(_resolved_comparison_path(Path(sessions_dir).absolute()))
     bundle_dir = sessions_root / session_id
-    if is_unsafe_stored_path(bundle_dir, boundary=sessions_root) or not bundle_dir.is_dir():
-        return False
-    removed = False
+    if is_unsafe_stored_path(bundle_dir, boundary=sessions_root):
+        raise ValueError("unsafe session directory")
+    if not bundle_dir.exists():
+        return [], []
+    if not bundle_dir.is_dir():
+        raise ValueError("invalid session directory")
+    files, directories, bundle_files = [], [], []
     for path in bundle_dir.iterdir():
         if is_unsafe_stored_path(
             path,
             boundary=sessions_root,
             reject_hardlinks=path.is_file(),
         ):
-            return False
+            raise ValueError("unsafe session content")
         if path.is_file():
-            path.unlink()
-            removed = True
+            bundle_files.append(path)
+        elif path.name == "history" and path.is_dir():
+            history_files = list(path.iterdir())
+            if any(not p.is_file() or p.suffix != ".json" or
+                   is_unsafe_stored_path(p, boundary=sessions_root, reject_hardlinks=True) for p in history_files):
+                raise ValueError("unsafe session history")
+            files.extend(history_files)
+            directories.append(path)
+        elif path.name == "tool-images" and path.is_dir():
+            from minicode.run_images import image_storage_inventory
+            image_files, image_directories = image_storage_inventory(path)
+            files.extend(image_files)
+            directories.extend(image_directories)
+        else:
+            raise ValueError("unrecognized session content")
+    # Remove the metadata last so an interrupted deletion can still be retried.
+    return files + sorted(bundle_files, key=lambda p: p.name == "metadata.json"), directories + [bundle_dir]
+
+
+def session_bundle_deletable(session_id: str, sessions_dir: Path) -> bool:
     try:
-        bundle_dir.rmdir()
-        removed = True
-    except OSError:
-        pass
-    return removed
+        _bundle_delete_inventory(session_id, sessions_dir)
+        return True
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+def delete_session_bundle(session_id: str, sessions_dir: Path) -> bool:
+    """Delete an entirely validated session tree, including its image copies."""
+    try:
+        files, directories = _bundle_delete_inventory(session_id, sessions_dir)
+        boundary = Path(_resolved_comparison_path(Path(sessions_dir).absolute()))
+        for path in files:
+            if is_unsafe_stored_path(path, boundary=boundary, reject_hardlinks=True):
+                return False
+            path.unlink(missing_ok=True)
+        for path in directories:
+            if is_unsafe_stored_path(path, boundary=boundary):
+                return False
+            path.rmdir()
+        return bool(directories)
+    except (OSError, ValueError, RuntimeError):
+        return False

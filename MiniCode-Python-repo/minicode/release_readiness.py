@@ -110,12 +110,12 @@ _SECRET_TEXT_PATTERNS = (
     re.compile(r"\bsk-[A-Za-z0-9_-]{8,}\b"),
     re.compile(r"\bBearer\s+[A-Za-z0-9._-]{8,}\b", re.IGNORECASE),
     re.compile(
-        r"(?P<key>[\"']?\b(?:apiKey|authToken|authorization|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|OPENROUTER_API_KEY)\b[\"']?"
+        r"(?P<key>[\"']?\b(?:apiKey|authToken|authorization|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|DASHSCOPE_API_KEY|BAILIAN_API_KEY|OPENROUTER_API_KEY)\b[\"']?"
         r"[ \t]*[:=][ \t]*[\"']?)(?P<value>[A-Za-z0-9._/-]{8,})(?P<quote>[\"']?)",
         re.IGNORECASE,
     ),
     re.compile(
-        r"(?P<key>\b(?:apiKey|authToken|authorization|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|OPENROUTER_API_KEY)\b"
+        r"(?P<key>\b(?:apiKey|authToken|authorization|OPENAI_API_KEY|ANTHROPIC_API_KEY|DEEPSEEK_API_KEY|DASHSCOPE_API_KEY|BAILIAN_API_KEY|OPENROUTER_API_KEY)\b"
         r"[ \t]+)(?P<value>[A-Za-z0-9._/-]{8,})",
         re.IGNORECASE,
     ),

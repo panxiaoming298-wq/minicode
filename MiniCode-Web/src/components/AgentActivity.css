@@ -1,0 +1,39 @@
+.agent-run-summary { display: flex; align-items: center; gap: 7px; margin: 0 0 10px; color: var(--text-soft); font-size: 12px; line-height: 1.6; }
+.agent-run-summary > svg { flex-shrink: 0; color: var(--muted); }
+.agent-badge { display: inline-flex; align-items: center; gap: 4px; max-width: 100%; padding: 2px 6px; border-radius: 4px; background: var(--panel-deep); color: var(--muted); font: 11px/1.5 var(--font-ui); vertical-align: middle; overflow-wrap: anywhere; }
+.agent-badge > svg { flex-shrink: 0; }
+.agent-badge.agent-child { color: #4864a4; background: #eef2fb; }
+.agent-badge.agent-primary { color: var(--text-soft); }
+.agent-empty-note { margin: 8px 0; font-size: 12px; color: var(--muted); line-height: 1.7; }
+.agent-attributed-message { min-width: 0; }
+.agent-attributed-message > .agent-badge { margin-top: 8px; }
+.agent-roster-list { display: grid; gap: 8px; }
+.agent-roster-card { min-width: 0; padding: 10px 12px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.agent-roster-card.agent-child { border-left: 2px solid #97a9cf; }
+.agent-roster-heading { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 12px; }
+.agent-roster-heading > span { color: var(--muted); font-size: 11px; }
+.agent-roster-task { min-width: 0; margin-top: 7px; font-size: 12px; }
+.agent-roster-task > summary { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; cursor: pointer; list-style: none; }
+.agent-roster-task > summary > span { min-width: 0; overflow-wrap: anywhere; line-height: 1.6; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
+.agent-roster-task > summary > small { flex-shrink: 0; color: var(--muted); line-height: 1.8; }
+.agent-roster-task p { margin: 8px 0; color: var(--muted); overflow-wrap: anywhere; }
+.agent-task-result { max-height: 220px; overflow: auto; margin-top: 10px; }
+.agent-task-result p { white-space: pre-wrap; line-height: 1.7; }
+
+/* Main-thread entries open an independent agent conversation in the inspector. */
+.delegated-task { display: flex; align-items: center; gap: 8px; width: fit-content; max-width: 100%; min-height: 36px; margin: 4px 0; padding: 6px 8px; border-radius: 7px; color: var(--muted); background: transparent; text-align: left; }
+.delegated-task:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+@media (hover: hover) { .delegated-task:hover { background: var(--panel); color: var(--text); } }
+.delegated-task:active { background: var(--panel-deep); }
+.delegated-icon { color: #b26e59; }
+.delegated-label { display: flex; gap: 8px; min-width: 0; align-items: baseline; font-size: 12px; line-height: 1.7; }
+.delegated-label strong { color: var(--text-soft); font-weight: 550; }
+.delegated-label > span { font-size: 11px; }
+.delegated-status { display: inline-flex; align-items: center; gap: 5px; font-size: 11px; white-space: nowrap; }
+.delegated-issue { font-size: 11px; color: var(--danger); }
+.delegated-failed_terminal .delegated-status { color: var(--danger); }
+.delegated-unknown .delegated-status, .delegated-waiting_approval .delegated-status, .delegated-waiting_input .delegated-status { color: var(--warning); }
+@media (max-width: 700px) {
+  .agent-roster-task > summary { flex-wrap: wrap; gap: 3px; }
+  .delegated-task { min-height: 44px; gap: 6px; flex-wrap: wrap; }
+}

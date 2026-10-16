@@ -49,11 +49,16 @@ services:
       - CUSTOM_API_KEY=${CUSTOM_API_KEY:-}
       - CUSTOM_API_BASE_URL=${CUSTOM_API_BASE_URL:-}
       - MINI_CODE_LOG_LEVEL=${MINI_CODE_LOG_LEVEL:-WARNING}
-      - MEMORY_V2_ENABLED=${MEMORY_V2_ENABLED:-false}
+      - MINI_CODE_SEARCH_PROVIDER=${MINI_CODE_SEARCH_PROVIDER:-auto}
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - MINI_CODE_WEB_PROXY=${MINI_CODE_WEB_PROXY:-auto}
+      - MEMORY_V2_ENABLED=${MEMORY_V2_ENABLED:-true}
       - MEMORY_SHADOW_WRITE=${MEMORY_SHADOW_WRITE:-false}
+      - MINI_CODE_DATA_ROOT=/data/minicode
+      - MINI_CODE_HISTORY_BACKEND=${MINI_CODE_HISTORY_BACKEND:-sqlite}
       - MEMORY_BACKEND=${MEMORY_BACKEND:-sqlite}
-      - MEMORY_DATABASE_URL=${MEMORY_DATABASE_URL:-}
-      - MEMORY_SQLITE_PATH=${MEMORY_SQLITE_PATH:-/home/minicode/.mini-code/memory-v2/state.db}
+      - MEMORY_SQLITE_PATH=/data/minicode/database/state.db
       - MEMORY_TENANT_ID=${MEMORY_TENANT_ID:-local}
       - MEMORY_WORKSPACE_ID=${MEMORY_WORKSPACE_ID:-}
       - MEMORY_USER_ID=${MEMORY_USER_ID:-local}
@@ -69,36 +74,19 @@ services:
       - MEMORY_TOOL_TOKEN_RESERVE=${MEMORY_TOOL_TOKEN_RESERVE:-2048}
       - MEMORY_SAFETY_TOKEN_RESERVE=${MEMORY_SAFETY_TOKEN_RESERVE:-1024}
       - ARTIFACT_STORE_TYPE=${ARTIFACT_STORE_TYPE:-file}
-      - ARTIFACT_STORE_ROOT=${ARTIFACT_STORE_ROOT:-/home/minicode/.mini-code/memory-v2/artifacts}
-      - ARTIFACT_STORE_ENDPOINT=${ARTIFACT_STORE_ENDPOINT:-}
-      - ARTIFACT_STORE_BUCKET=${ARTIFACT_STORE_BUCKET:-minicode-artifacts}
-      - ARTIFACT_STORE_ACCESS_KEY=${ARTIFACT_STORE_ACCESS_KEY:-}
-      - ARTIFACT_STORE_SECRET_KEY=${ARTIFACT_STORE_SECRET_KEY:-}
+      - ARTIFACT_STORE_ROOT=/data/minicode/artifacts
+      - MEMORY_EXPORT_ROOT=/data/minicode/exports
       - MEMORY_LOCAL_SPOOL_KEY=${MEMORY_LOCAL_SPOOL_KEY:-}
       - MEMORY_LOCAL_SPOOL_ENABLED=${MEMORY_LOCAL_SPOOL_ENABLED:-true}
-      - MEMORY_LOCAL_SPOOL_ROOT=${MEMORY_LOCAL_SPOOL_ROOT:-/home/minicode/.mini-code/memory-v2/spool}
+      - MEMORY_LOCAL_SPOOL_ROOT=/data/minicode/spool
       - MEMORY_LOCAL_SPOOL_MAX_BYTES=${MEMORY_LOCAL_SPOOL_MAX_BYTES:-268435456}
       - MEMORY_LOCAL_SPOOL_MIN_FREE_BYTES=${MEMORY_LOCAL_SPOOL_MIN_FREE_BYTES:-67108864}
-      - MILVUS_ENABLED=${MILVUS_ENABLED:-false}
-      - MILVUS_URI=${MILVUS_URI:-}
-      - MILVUS_COLLECTION=${MILVUS_COLLECTION:-agent_memory_v2}
-      - MILVUS_DENSE_DIM=${MILVUS_DENSE_DIM:-512}
-      - MILVUS_METRIC_TYPE=${MILVUS_METRIC_TYPE:-COSINE}
-      - MILVUS_CONSISTENCY_LEVEL=${MILVUS_CONSISTENCY_LEVEL:-Strong}
-      - MILVUS_INDEX_TYPE=${MILVUS_INDEX_TYPE:-AUTOINDEX}
-      - MEMORY_EMBEDDING_PROVIDER=${MEMORY_EMBEDDING_PROVIDER:-fastembed}
-      - MEMORY_EMBEDDING_MODEL=${MEMORY_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
-      - MEMORY_EMBEDDING_REVISION=${MEMORY_EMBEDDING_REVISION:-fastembed-0.8.0-builtin-v1}
-      - MEMORY_EMBEDDING_CACHE_DIR=${MEMORY_EMBEDDING_CACHE_DIR:-/home/minicode/.mini-code/models/fastembed}
-      - MEMORY_EMBEDDING_THREADS=${MEMORY_EMBEDDING_THREADS:-0}
-      - MEMORY_EMBEDDING_BATCH_SIZE=${MEMORY_EMBEDDING_BATCH_SIZE:-64}
-      - MEMORY_EMBEDDING_ALLOW_HASH=${MEMORY_EMBEDDING_ALLOW_HASH:-false}
       - MEMORY_RETENTION_DEFAULT_DAYS=${MEMORY_RETENTION_DEFAULT_DAYS:-365}
       - MEMORY_RETENTION_RULES_JSON=${MEMORY_RETENTION_RULES_JSON:-[]}
       - MEMORY_ARCHIVE_MAX_EVENTS=${MEMORY_ARCHIVE_MAX_EVENTS:-100000}
       - MEMORY_ARCHIVE_MAX_UNCOMPRESSED_BYTES=${MEMORY_ARCHIVE_MAX_UNCOMPRESSED_BYTES:-1073741824}
       - MEMORY_ARTIFACT_GC_GRACE_HOURS=${MEMORY_ARTIFACT_GC_GRACE_HOURS:-24}
-      - MEMORY_BACKUP_ROOT=${MEMORY_BACKUP_ROOT:-/home/minicode/.mini-code/memory-v2/backups}
+      - MEMORY_BACKUP_ROOT=/data/minicode/backups
       - MEMORY_BACKUP_ENCRYPTION_KEY=${MEMORY_BACKUP_ENCRYPTION_KEY:-}
       - MEMORY_BACKUP_RPO_HOURS=${MEMORY_BACKUP_RPO_HOURS:-24}
       - MEMORY_BACKUP_RTO_HOURS=${MEMORY_BACKUP_RTO_HOURS:-4}
@@ -107,6 +95,9 @@ services:
       - ${MINI_CODE_WORKSPACE:-.}:/workspace
       # Persist user-level config, memory, skills across containers
       - minicode-home:/home/minicode/.mini-code
+      - type: bind
+        source: ${MINI_CODE_DATA_ROOT:-D:/MiniCodeData}
+        target: /data/minicode
     working_dir: /workspace
 
   # ===========================================================================
@@ -141,11 +132,16 @@ services:
       - CUSTOM_API_KEY=${CUSTOM_API_KEY:-}
       - CUSTOM_API_BASE_URL=${CUSTOM_API_BASE_URL:-}
       - MINI_CODE_LOG_LEVEL=${MINI_CODE_LOG_LEVEL:-WARNING}
-      - MEMORY_V2_ENABLED=${MEMORY_V2_ENABLED:-false}
+      - MINI_CODE_SEARCH_PROVIDER=${MINI_CODE_SEARCH_PROVIDER:-auto}
+      - BRAVE_SEARCH_API_KEY=${BRAVE_SEARCH_API_KEY:-}
+      - TAVILY_API_KEY=${TAVILY_API_KEY:-}
+      - MINI_CODE_WEB_PROXY=${MINI_CODE_WEB_PROXY:-auto}
+      - MEMORY_V2_ENABLED=${MEMORY_V2_ENABLED:-true}
       - MEMORY_SHADOW_WRITE=${MEMORY_SHADOW_WRITE:-false}
+      - MINI_CODE_DATA_ROOT=/data/minicode
+      - MINI_CODE_HISTORY_BACKEND=${MINI_CODE_HISTORY_BACKEND:-sqlite}
       - MEMORY_BACKEND=${MEMORY_BACKEND:-sqlite}
-      - MEMORY_DATABASE_URL=${MEMORY_DATABASE_URL:-}
-      - MEMORY_SQLITE_PATH=${MEMORY_SQLITE_PATH:-/home/minicode/.mini-code/memory-v2/state.db}
+      - MEMORY_SQLITE_PATH=/data/minicode/database/state.db
       - MEMORY_TENANT_ID=${MEMORY_TENANT_ID:-local}
       - MEMORY_WORKSPACE_ID=${MEMORY_WORKSPACE_ID:-}
       - MEMORY_USER_ID=${MEMORY_USER_ID:-local}
@@ -161,225 +157,30 @@ services:
       - MEMORY_TOOL_TOKEN_RESERVE=${MEMORY_TOOL_TOKEN_RESERVE:-2048}
       - MEMORY_SAFETY_TOKEN_RESERVE=${MEMORY_SAFETY_TOKEN_RESERVE:-1024}
       - ARTIFACT_STORE_TYPE=${ARTIFACT_STORE_TYPE:-file}
-      - ARTIFACT_STORE_ROOT=${ARTIFACT_STORE_ROOT:-/home/minicode/.mini-code/memory-v2/artifacts}
-      - ARTIFACT_STORE_ENDPOINT=${ARTIFACT_STORE_ENDPOINT:-}
-      - ARTIFACT_STORE_BUCKET=${ARTIFACT_STORE_BUCKET:-minicode-artifacts}
-      - ARTIFACT_STORE_ACCESS_KEY=${ARTIFACT_STORE_ACCESS_KEY:-}
-      - ARTIFACT_STORE_SECRET_KEY=${ARTIFACT_STORE_SECRET_KEY:-}
+      - ARTIFACT_STORE_ROOT=/data/minicode/artifacts
+      - MEMORY_EXPORT_ROOT=/data/minicode/exports
       - MEMORY_LOCAL_SPOOL_KEY=${MEMORY_LOCAL_SPOOL_KEY:-}
       - MEMORY_LOCAL_SPOOL_ENABLED=${MEMORY_LOCAL_SPOOL_ENABLED:-true}
-      - MEMORY_LOCAL_SPOOL_ROOT=${MEMORY_LOCAL_SPOOL_ROOT:-/home/minicode/.mini-code/memory-v2/spool}
+      - MEMORY_LOCAL_SPOOL_ROOT=/data/minicode/spool
       - MEMORY_LOCAL_SPOOL_MAX_BYTES=${MEMORY_LOCAL_SPOOL_MAX_BYTES:-268435456}
       - MEMORY_LOCAL_SPOOL_MIN_FREE_BYTES=${MEMORY_LOCAL_SPOOL_MIN_FREE_BYTES:-67108864}
-      - MILVUS_ENABLED=${MILVUS_ENABLED:-false}
-      - MILVUS_URI=${MILVUS_URI:-}
-      - MILVUS_COLLECTION=${MILVUS_COLLECTION:-agent_memory_v2}
-      - MILVUS_DENSE_DIM=${MILVUS_DENSE_DIM:-512}
-      - MILVUS_METRIC_TYPE=${MILVUS_METRIC_TYPE:-COSINE}
-      - MILVUS_CONSISTENCY_LEVEL=${MILVUS_CONSISTENCY_LEVEL:-Strong}
-      - MILVUS_INDEX_TYPE=${MILVUS_INDEX_TYPE:-AUTOINDEX}
-      - MEMORY_EMBEDDING_PROVIDER=${MEMORY_EMBEDDING_PROVIDER:-fastembed}
-      - MEMORY_EMBEDDING_MODEL=${MEMORY_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
-      - MEMORY_EMBEDDING_REVISION=${MEMORY_EMBEDDING_REVISION:-fastembed-0.8.0-builtin-v1}
-      - MEMORY_EMBEDDING_CACHE_DIR=${MEMORY_EMBEDDING_CACHE_DIR:-/home/minicode/.mini-code/models/fastembed}
-      - MEMORY_EMBEDDING_THREADS=${MEMORY_EMBEDDING_THREADS:-0}
-      - MEMORY_EMBEDDING_BATCH_SIZE=${MEMORY_EMBEDDING_BATCH_SIZE:-64}
-      - MEMORY_EMBEDDING_ALLOW_HASH=${MEMORY_EMBEDDING_ALLOW_HASH:-false}
       - MEMORY_RETENTION_DEFAULT_DAYS=${MEMORY_RETENTION_DEFAULT_DAYS:-365}
       - MEMORY_RETENTION_RULES_JSON=${MEMORY_RETENTION_RULES_JSON:-[]}
       - MEMORY_ARCHIVE_MAX_EVENTS=${MEMORY_ARCHIVE_MAX_EVENTS:-100000}
       - MEMORY_ARCHIVE_MAX_UNCOMPRESSED_BYTES=${MEMORY_ARCHIVE_MAX_UNCOMPRESSED_BYTES:-1073741824}
       - MEMORY_ARTIFACT_GC_GRACE_HOURS=${MEMORY_ARTIFACT_GC_GRACE_HOURS:-24}
-      - MEMORY_BACKUP_ROOT=${MEMORY_BACKUP_ROOT:-/home/minicode/.mini-code/memory-v2/backups}
+      - MEMORY_BACKUP_ROOT=/data/minicode/backups
       - MEMORY_BACKUP_ENCRYPTION_KEY=${MEMORY_BACKUP_ENCRYPTION_KEY:-}
       - MEMORY_BACKUP_RPO_HOURS=${MEMORY_BACKUP_RPO_HOURS:-24}
       - MEMORY_BACKUP_RTO_HOURS=${MEMORY_BACKUP_RTO_HOURS:-4}
     volumes:
       - ${MINI_CODE_WORKSPACE:-.}:/workspace
       - minicode-home:/home/minicode/.mini-code
+      - type: bind
+        source: ${MINI_CODE_DATA_ROOT:-D:/MiniCodeData}
+        target: /data/minicode
     working_dir: /workspace
 
-  # ===========================================================================
-  # Optional memory profile — authoritative PostgreSQL + Artifact MinIO + Milvus
-  # Start with: docker compose --profile memory up -d memory-postgres memory-minio
-  #             memory-minio-init memory-etcd memory-milvus memory-indexer
-  # ===========================================================================
-  memory-postgres:
-    profiles: ["memory"]
-    image: postgres:16.4-alpine
-    container_name: minicode-memory-postgres
-    environment:
-      POSTGRES_DB: ${MEMORY_POSTGRES_DB:-minicode}
-      POSTGRES_USER: ${MEMORY_POSTGRES_USER:-minicode}
-      POSTGRES_PASSWORD: ${MEMORY_POSTGRES_PASSWORD:-minicode-dev-only}
-    ports:
-      - "${MEMORY_BIND_HOST:-127.0.0.1}:${MEMORY_POSTGRES_PORT:-55432}:5432"
-    volumes:
-      - minicode-memory-postgres:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 10s
-
-  memory-minio:
-    profiles: ["memory"]
-    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
-    container_name: minicode-memory-minio
-    command: minio server /minio_data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: ${MEMORY_MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_ROOT_PASSWORD: ${MEMORY_MINIO_SECRET_KEY:-minioadmin}
-    ports:
-      - "${MEMORY_BIND_HOST:-127.0.0.1}:${MEMORY_MINIO_PORT:-59000}:9000"
-      - "${MEMORY_BIND_HOST:-127.0.0.1}:${MEMORY_MINIO_CONSOLE_PORT:-59001}:9001"
-    volumes:
-      - minicode-memory-minio:/minio_data
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-      start_period: 20s
-
-  memory-minio-init:
-    profiles: ["memory"]
-    image: minio/minio:RELEASE.2024-12-18T13-15-44Z
-    container_name: minicode-memory-minio-init
-    depends_on:
-      memory-minio:
-        condition: service_healthy
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >-
-        mc alias set local http://memory-minio:9000
-        "$${MEMORY_MINIO_ACCESS_KEY}" "$${MEMORY_MINIO_SECRET_KEY}" &&
-        mc mb --ignore-existing "local/$${ARTIFACT_STORE_BUCKET}"
-    environment:
-      MEMORY_MINIO_ACCESS_KEY: ${MEMORY_MINIO_ACCESS_KEY:-minioadmin}
-      MEMORY_MINIO_SECRET_KEY: ${MEMORY_MINIO_SECRET_KEY:-minioadmin}
-      ARTIFACT_STORE_BUCKET: ${ARTIFACT_STORE_BUCKET:-minicode-artifacts}
-
-  memory-etcd:
-    profiles: ["memory"]
-    image: quay.io/coreos/etcd:v3.5.25
-    container_name: minicode-memory-etcd
-    environment:
-      - ETCD_AUTO_COMPACTION_MODE=revision
-      - ETCD_AUTO_COMPACTION_RETENTION=1000
-      - ETCD_QUOTA_BACKEND_BYTES=4294967296
-      - ETCD_SNAPSHOT_COUNT=50000
-    command: >-
-      etcd --advertise-client-urls=http://memory-etcd:2379
-      --listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
-    volumes:
-      - minicode-memory-etcd:/etcd
-    healthcheck:
-      test: ["CMD", "etcdctl", "endpoint", "health"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-
-  memory-milvus:
-    profiles: ["memory"]
-    image: milvusdb/milvus:v2.6.22
-    container_name: minicode-memory-milvus
-    command: ["milvus", "run", "standalone"]
-    security_opt:
-      - seccomp:unconfined
-    environment:
-      ETCD_ENDPOINTS: memory-etcd:2379
-      MINIO_ADDRESS: memory-minio:9000
-      MINIO_ACCESS_KEY_ID: ${MEMORY_MINIO_ACCESS_KEY:-minioadmin}
-      MINIO_SECRET_ACCESS_KEY: ${MEMORY_MINIO_SECRET_KEY:-minioadmin}
-      MQ_TYPE: woodpecker
-    ports:
-      - "${MEMORY_BIND_HOST:-127.0.0.1}:${MEMORY_MILVUS_PORT:-59530}:19530"
-      - "${MEMORY_BIND_HOST:-127.0.0.1}:${MEMORY_MILVUS_HEALTH_PORT:-59091}:9091"
-    volumes:
-      - minicode-memory-milvus:/var/lib/milvus
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
-      interval: 30s
-      timeout: 20s
-      retries: 3
-      start_period: 90s
-    depends_on:
-      memory-etcd:
-        condition: service_healthy
-      memory-minio:
-        condition: service_healthy
-
-  memory-indexer:
-    profiles: ["memory"]
-    build:
-      context: .
-      dockerfile: Dockerfile
-      args:
-        MINICODE_INSTALL_TARGET: ".[memory]"
-    image: minicode-py:latest
-    container_name: minicode-memory-indexer
-    init: true
-    restart: unless-stopped
-    entrypoint: ["python", "-m", "minicode.paged_memory.admin"]
-    command:
-      - "--cwd"
-      - "/workspace"
-      - "run-indexer"
-      - "--batch-size"
-      - "${MEMORY_INDEXER_BATCH_SIZE:-100}"
-      - "--poll-seconds"
-      - "${MEMORY_INDEXER_POLL_SECONDS:-1.0}"
-    environment:
-      - MEMORY_BACKEND=postgres
-      - MEMORY_DATABASE_URL=${MEMORY_DATABASE_URL:-postgresql://${MEMORY_POSTGRES_USER:-minicode}:${MEMORY_POSTGRES_PASSWORD:-minicode-dev-only}@memory-postgres:5432/${MEMORY_POSTGRES_DB:-minicode}}
-      - MEMORY_INDEXER_ENABLED=true
-      - MILVUS_ENABLED=true
-      - MILVUS_URI=${MILVUS_URI:-http://memory-milvus:19530}
-      - MILVUS_TOKEN=${MILVUS_TOKEN:-}
-      - MILVUS_DATABASE=${MILVUS_DATABASE:-default}
-      - MILVUS_COLLECTION=${MILVUS_COLLECTION:-agent_memory_v2}
-      - MILVUS_DENSE_DIM=${MILVUS_DENSE_DIM:-512}
-      - MILVUS_METRIC_TYPE=${MILVUS_METRIC_TYPE:-COSINE}
-      - MILVUS_CONSISTENCY_LEVEL=${MILVUS_CONSISTENCY_LEVEL:-Strong}
-      - MILVUS_INDEX_TYPE=${MILVUS_INDEX_TYPE:-AUTOINDEX}
-      - MEMORY_EMBEDDING_PROVIDER=${MEMORY_EMBEDDING_PROVIDER:-fastembed}
-      - MEMORY_EMBEDDING_MODEL=${MEMORY_EMBEDDING_MODEL:-BAAI/bge-small-zh-v1.5}
-      - MEMORY_EMBEDDING_REVISION=${MEMORY_EMBEDDING_REVISION:-fastembed-0.8.0-builtin-v1}
-      - MEMORY_EMBEDDING_CACHE_DIR=${MEMORY_EMBEDDING_CACHE_DIR:-/home/minicode/.mini-code/models/fastembed}
-      - MEMORY_EMBEDDING_THREADS=${MEMORY_EMBEDDING_THREADS:-0}
-      - MEMORY_EMBEDDING_BATCH_SIZE=${MEMORY_EMBEDDING_BATCH_SIZE:-64}
-      - MEMORY_EMBEDDING_ALLOW_HASH=${MEMORY_EMBEDDING_ALLOW_HASH:-false}
-      - MEMORY_INDEXER_MAX_RETRIES=${MEMORY_INDEXER_MAX_RETRIES:-8}
-      - MEMORY_INDEXER_RETRY_BACKOFF_SECONDS=${MEMORY_INDEXER_RETRY_BACKOFF_SECONDS:-5}
-    volumes:
-      - ${MINI_CODE_WORKSPACE:-.}:/workspace:ro
-      - minicode-home:/home/minicode/.mini-code
-    working_dir: /workspace
-    depends_on:
-      memory-postgres:
-        condition: service_healthy
-      memory-milvus:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "python", "-c", "import os; os.kill(1, 0)"]
-      interval: 15s
-      timeout: 5s
-      retries: 3
-      start_period: 10s
-
-# =============================================================================
-# Named volumes — persist config, memory, and skills across containers
-# =============================================================================
 volumes:
   minicode-home:
-    driver: local
-  minicode-memory-postgres:
-    driver: local
-  minicode-memory-minio:
-    driver: local
-  minicode-memory-etcd:
-    driver: local
-  minicode-memory-milvus:
     driver: local

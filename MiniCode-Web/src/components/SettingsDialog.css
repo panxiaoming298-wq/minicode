@@ -1,0 +1,108 @@
+.settings-dialog {
+  width: min(1120px, calc(100vw - 80px));
+  height: min(760px, calc(100dvh - 88px));
+  max-width: none;
+  max-height: none;
+  margin: auto;
+  padding: 0;
+  border: 1px solid var(--line-strong);
+  border-radius: 28px;
+  color: var(--text);
+  background: var(--surface);
+  box-shadow: 0 24px 90px -24px rgba(25, 29, 40, .3);
+  overflow: hidden;
+}
+.settings-dialog[open] { display: flex; flex-direction: column; animation: settings-dialog-enter .16s ease-out; }
+.settings-dialog::backdrop { background: rgba(34, 38, 46, .3); }
+.settings-dialog-header { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; padding: 24px 26px 22px 30px; }
+.settings-dialog-header > div { display: flex; align-items: baseline; gap: 12px; }
+.settings-dialog-header h1 { margin: 0; font-size: 23px; font-weight: 600; letter-spacing: -.025em; }
+.settings-dialog-header > div > span { font-size: 12px; color: var(--muted); }
+.settings-dialog-header .icon-button { min-width: 44px; min-height: 44px; border-radius: 12px; }
+.settings-dialog-body { display: grid; flex: 1; min-height: 0; min-width: 0; grid-template-columns: 214px minmax(0, 1fr); gap: 28px; padding: 0 30px 24px 18px; }
+.settings-dialog-sidebar { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.settings-dialog-sidebar nav { display: grid; gap: 5px; }
+.settings-category { display: flex; align-items: center; gap: 12px; min-height: 48px; padding: 11px 16px; border-radius: 12px; color: var(--text-soft); background: transparent; text-align: left; font-size: 14px; white-space: nowrap; }
+.settings-category svg { flex-shrink: 0; }
+.settings-category:hover { background: var(--panel); color: var(--text); }
+.settings-category.is-selected { background: var(--panel-deep); color: var(--text); font-weight: 550; }
+.settings-dialog-local { display: flex; align-items: center; gap: 7px; margin-top: auto; padding: 22px 16px 5px; color: var(--muted); font-size: 11px; }
+.settings-dialog-panel { display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.settings-dialog-panel-heading { flex: 0 0 auto; padding: 7px 0 22px; }
+.settings-dialog-panel-heading h2 { margin: 0 0 6px; font-size: 19px; font-weight: 600; letter-spacing: -.015em; }
+.settings-dialog-panel-heading p { margin: 0; font-size: 12px; line-height: 1.5; color: var(--muted); }
+.settings-dialog-content { flex: 1; min-height: 0; min-width: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; padding-right: 8px; }
+.settings-dialog-settings[hidden] { display: none; }
+.settings-dialog .workspace-page.is-embedded { overflow: visible; background: transparent; }
+.settings-dialog .workspace-page.is-embedded .workspace-page-content { width: 100%; margin: 0; padding: 0; }
+.settings-dialog .settings-page .settings-section { margin-bottom: 26px; }
+.settings-dialog .settings-section :is(input:not([type='checkbox']):not([type='radio']), select) { min-height: 44px; }
+.settings-dialog .settings-form > footer { margin-top: 4px; padding: 16px 0 2px; }
+.settings-dialog .settings-actions .button { min-height: 42px; }
+.settings-dialog .agent-mode-options { grid-template-columns: minmax(0, 1fr); }
+.settings-dialog .agent-mode-option { padding: 16px; border-radius: 12px; }
+.settings-dialog .runtime-settings-advanced { border-top: 0; }
+.settings-account { display: grid; gap: 20px; }
+.settings-account-card { min-width: 0; border: 1px solid var(--line-strong); border-radius: 20px; padding: 24px; background: var(--surface-raised); }
+.settings-account-connection { display: flex; align-items: center; gap: 15px; }
+.settings-account-avatar { display: grid; place-items: center; flex: 0 0 46px; height: 46px; border-radius: 50%; background: var(--panel); color: var(--muted); }
+.settings-account-identity { min-width: 0; flex: 1; }
+.settings-account-identity h3 { margin: 0 0 5px; font-size: 16px; font-weight: 600; }
+.settings-account-identity p { margin: 0; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.settings-account-connection .button { min-height: 42px; flex-shrink: 0; }
+.settings-account-details { display: grid; gap: 15px; margin: 24px 0 0; padding-top: 20px; border-top: 1px solid var(--line); font-size: 13px; }
+.settings-account-details > div { display: flex; gap: 20px; justify-content: space-between; min-width: 0; }
+.settings-account-details dt { flex-shrink: 0; color: var(--muted); }
+.settings-account-details dd { margin: 0; text-align: right; overflow-wrap: anywhere; min-width: 0; }
+.settings-account .provider-balance { padding: 24px; border-radius: 20px; border-color: var(--line-strong); }
+.settings-account .provider-balance-heading { margin-bottom: 22px; }
+.settings-account .provider-balance-heading h3 { font-size: 15px; }
+.settings-account-note h3 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+.settings-account-note p { margin: 0 0 16px; font-size: 13px; line-height: 1.7; color: var(--muted); }
+.settings-dialog .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(210px, .9fr) minmax(0, 1.6fr); }
+.settings-dialog .extensions-page :is(.extension-detail, .skill-catalog-detail) { padding: 20px; }
+.settings-dialog .extensions-page :is(.extension-filters, .skill-catalog-filters, .extension-detail-head, .extension-health) { flex-wrap: wrap; }
+.settings-dialog .extensions-page .extension-health > .button { margin-left: 0; }
+.settings-dialog .extensions-page .capability-management-scope { padding: 12px; }
+.settings-dialog .extensions-page .capability-management-scope label { width: 100%; }
+.settings-dialog .extensions-page .capability-scope-select { flex: 1; }
+.settings-dialog .extensions-page .capability-management-scope select { width: 100%; }
+.settings-dialog .extensions-page .capability-catalog-heading { flex-wrap: wrap; gap: 8px 12px; }
+.settings-dialog .extensions-page .capability-view-tabs { gap: 12px; }
+.rail-footer .rail-settings-trigger { gap: 11px; padding: 10px 9px; min-height: 62px; }
+.rail-settings-trigger > .rail-settings-avatar { flex: 0 0 36px; width: 36px; height: 36px; padding: 9px; border-radius: 50%; background: var(--panel-deep); color: var(--text-soft); }
+.rail-settings-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
+.rail-settings-copy strong { font-size: 13px; font-weight: 550; }
+.rail-settings-copy small { font-size: 11px; color: var(--muted); }
+.rail-settings-chevron { flex-shrink: 0; color: var(--muted); }
+.app-rail.is-collapsed .rail-settings-chevron { display: none; }
+@keyframes settings-dialog-enter { from { opacity: 0; transform: translateY(6px) scale(.99); } to { opacity: 1; transform: none; } }
+@media (max-width: 1000px) and (min-width: 701px) {
+  .settings-dialog { width: calc(100vw - 40px); height: calc(100dvh - 48px); }
+  .settings-dialog-body { grid-template-columns: 180px minmax(0, 1fr); gap: 20px; padding-right: 24px; }
+  .settings-category { padding-inline: 12px; gap: 10px; font-size: 13px; }
+  .settings-dialog .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(180px, .9fr) minmax(0, 1.4fr); }
+}
+@media (max-width: 700px) {
+  .settings-dialog { width: calc(100vw - 24px); height: calc(100dvh - 24px); border-radius: 20px; }
+  .settings-dialog-header { padding: 12px 14px 10px 20px; }
+  .settings-dialog-header h1 { font-size: 20px; }
+  .settings-dialog-body { display: flex; flex-direction: column; gap: 0; padding: 0 16px 16px; }
+  .settings-dialog-sidebar { flex: 0 0 auto; margin: 0 -4px; }
+  .settings-dialog-sidebar nav { display: flex; gap: 4px; overflow-x: auto; padding: 4px 4px 12px; scrollbar-width: thin; }
+  .settings-category { flex: 0 0 auto; min-height: 44px; gap: 7px; padding: 10px 12px; border-radius: 10px; font-size: 12px; }
+  .settings-category svg { width: 16px; height: 16px; }
+  .settings-dialog-local { display: none; }
+  .settings-dialog-panel { flex: 1; }
+  .settings-dialog-panel-heading { padding: 10px 0 18px; }
+  .settings-dialog-panel-heading h2 { font-size: 17px; }
+  .settings-dialog-content { padding-right: 2px; scrollbar-gutter: auto; }
+  .settings-dialog .settings-connection, .settings-dialog .compact-grid { grid-template-columns: minmax(0, 1fr); }
+  .settings-account-card, .settings-account .provider-balance { padding: 18px; border-radius: 16px; }
+  .settings-account-connection { flex-wrap: wrap; gap: 12px; }
+  .settings-account-connection .button { margin-left: 58px; }
+  .settings-account-details > div { gap: 12px; }
+  .settings-dialog .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(0, 1fr); }
+  .settings-dialog .extensions-page :is(.extension-detail, .skill-catalog-detail) { padding: 18px 14px; }
+}
+@media (prefers-reduced-motion: reduce) { .settings-dialog[open] { animation: none; } }

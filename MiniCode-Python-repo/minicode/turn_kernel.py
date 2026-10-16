@@ -2,9 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from math import ceil
+import re
 from typing import Any, Callable, Literal
 
 from minicode.layered_context import ContextBuilder, LayeredContext
+from minicode.output_budget import OutputRecovery
+from minicode.runtime_feedback import (
+    VERIFY_FOLLOWUP, EXPLORE_FOLLOWUP, EMPTY_VERIFY_FOLLOWUP,
+    EMPTY_WIDENING_FOLLOWUP, RESUME_AFTER_TRANSPORT,
+)
 from minicode.task_object import TaskState
 from minicode.types import RuntimeEventCategory
 
@@ -12,9 +18,24 @@ TurnStopReason = Literal[
     "done",
     "max_steps",
     "await_user",
+    "waiting_children",
+    "candidate_submitted",
+    "builder_submitted",
+    "consultation_submitted",
     "blocked",
+    "budget_exhausted",
+    "provider_balance",
+    "provider_error",
+    "consultation_budget_limited",
+    "model_usage_unreconciled",
+    "consultation_input_exhausted",
+    "tool_input_exhausted",
+    "model_output_truncated",
+    "transport_incomplete",
     "verification_failed",
     "widen_needed",
+    "tool_timeout",
+    "canceled",
 ]
 
 TurnStepPhase = Literal["explore", "execute", "verify"]
@@ -36,6 +57,7 @@ class TurnVerificationState:
     evidence_ready: bool = False
     evidence_summary: str = ""
     last_verification_note: str = ""
+    evidence_retry_count: int = 0
 
 
 @dataclass(slots=True)
@@ -83,7 +105,7 @@ class StableTaskPack:
     verification_summary: str = ""
     budget_summary: str = ""
 
-    def to_protected_text(self) -> str:
+    def to_protected_text(self, *, result_is_preview: bool = False) -> str:
         lines: list[str] = []
         if self.task_title:
             lines.append(f"Task: {self.task_title}")
@@ -100,7 +122,9 @@ class StableTaskPack:
         if self.progress_summary:
             lines.append(f"Progress: {self.progress_summary}")
         if self.latest_tool_result_summary:
-            lines.append(f"Latest tool result: {self.latest_tool_result_summary}")
+            from minicode.runtime_progress import RESULT_PREVIEW_LABEL
+            label = RESULT_PREVIEW_LABEL if result_is_preview else "Latest tool result"
+            lines.append(f"{label}: {self.latest_tool_result_summary}")
         if self.verification_summary:
             lines.append(f"Verification: {self.verification_summary}")
         if self.budget_summary:
@@ -135,9 +159,22 @@ class TurnRecurrentState:
     widen_after_step: int | None = None
     empty_response_retry_limit: int = 2
     recoverable_thinking_retry_limit: int = 3
+    # Bound repairs between verified file revisions. The lifetime counter remains
+    # monotonic for audit; reads, prose, no-op writes and widening grant no credit.
+    repair_retry_limit: int = 4
+    repair_retry_total: int = 0
+    repair_retry_checkpoint: int = 0
+    truncated_output_retry_limit: int = 3
+    truncated_output_consecutive_count: int = 0
+    transport_retry_limit: int = 2
+    transport_retry_count: int = 0
+    output_recovery: OutputRecovery = field(default_factory=OutputRecovery)
+    write_revisions: set[str] = field(default_factory=set)
     saw_tool_result: bool = False
     empty_response_retry_count: int = 0
     recoverable_thinking_retry_count: int = 0
+    truncated_output_retry_count: int = 0
+    successful_write_observation_count: int = 0
     tool_error_count: int = 0
     tool_observation_count: int = 0
     successful_tool_observation_count: int = 0
@@ -151,6 +188,11 @@ class TurnRecurrentState:
     verification_state: TurnVerificationState = field(default_factory=TurnVerificationState)
     budget_signals: TurnBudgetSignals = field(default_factory=TurnBudgetSignals)
     stop_reason: TurnStopReason | None = None
+    wait_kind: Literal["input", "approval"] | None = None
+    timed_out: bool = False
+    ambiguous_side_effect: bool = False
+    unsafe_effect_observed: bool = False
+    unsettled_tool: bool = False
     stable_task_pack: StableTaskPack | None = None
     step_policy: TurnStepPolicy = field(default_factory=TurnStepPolicy)
 
@@ -162,27 +204,69 @@ class TurnRecurrentState:
         self._refresh_budget_signals()
         return self.step
 
+    def repair_retries_available(self) -> bool:
+        """Whether this activation may still spend any repair continuation.
+
+        Read-only: no model admission or extra task budget is granted here.
+        """
+        return self.repair_retry_total - self.repair_retry_checkpoint < self.repair_retry_limit
+
     def can_retry_empty_response(self) -> bool:
-        return self.empty_response_retry_count < self.empty_response_retry_limit
+        return (self.empty_response_retry_count < self.empty_response_retry_limit
+                and self.repair_retries_available())
 
     def record_empty_response_retry(self) -> None:
         self.empty_response_retry_count += 1
+        self.repair_retry_total += 1
+
+    def can_retry_truncated_output(self) -> bool:
+        return self.repair_retries_available() and (
+            self.truncated_output_consecutive_count < self.truncated_output_retry_limit)
+
+    def record_truncated_output_retry(self) -> None:
+        self.truncated_output_retry_count += 1
+        self.truncated_output_consecutive_count += 1
+        self.repair_retry_total += 1
 
     def can_retry_recoverable_thinking(self) -> bool:
         return (
             self.recoverable_thinking_retry_count
             < self.recoverable_thinking_retry_limit
+            and self.repair_retries_available()
         )
 
     def record_recoverable_thinking_retry(self) -> None:
         self.recoverable_thinking_retry_count += 1
+        self.repair_retry_total += 1
 
-    def record_tool_result(self, ok: bool, summary: str | None = None) -> None:
+    def record_tool_result(
+        self,
+        ok: bool,
+        summary: str | None = None,
+        *,
+        wait_kind: Literal["input", "approval"] | None = None,
+        timed_out: bool = False,
+        ambiguous_side_effect: bool = False,
+        unsafe_effect: bool = False,
+        unsettled_tool: bool = False,
+        workspace_write: bool = False,
+        write_revision: str | None = None,
+        interrupted_before_execution: bool = False,
+    ) -> None:
         self.saw_tool_result = True
         self.tool_observation_count += 1
         if ok:
             self.successful_tool_observation_count += 1
-        if not ok:
+            if (workspace_write and write_revision and write_revision not in self.write_revisions
+                and not (wait_kind or timed_out or ambiguous_side_effect)):
+                self.write_revisions.add(write_revision)
+                self.successful_write_observation_count += 1
+                self.truncated_output_consecutive_count = 0
+                self.repair_retry_checkpoint = self.repair_retry_total
+        # A native unstarted steering interruption is neither an execution
+        # failure nor successful evidence. Contradictory effect flags fail closed.
+        if not ok and (not interrupted_before_execution
+                       or wait_kind or timed_out or ambiguous_side_effect or unsafe_effect or unsettled_tool or write_revision):
             self.tool_error_count += 1
         if summary:
             normalized = " ".join(summary.split())
@@ -190,6 +274,14 @@ class TurnRecurrentState:
             if ok:
                 self.verification_state.evidence_summary = normalized[:200]
                 self.verification_state.evidence_ready = True
+        if wait_kind is not None:
+            self.wait_kind = wait_kind
+        self.timed_out = self.timed_out or timed_out
+        self.ambiguous_side_effect = (
+            self.ambiguous_side_effect or ambiguous_side_effect
+        )
+        self.unsafe_effect_observed = self.unsafe_effect_observed or unsafe_effect
+        self.unsettled_tool = self.unsettled_tool or unsettled_tool
         self._refresh_budget_signals()
 
     def set_progress_summary(self, summary: str) -> None:
@@ -220,20 +312,25 @@ class TurnRecurrentState:
     def final_task_state(self) -> TaskState:
         if self.stop_reason == "done":
             return (
-                TaskState.COMPLETED
-                if self.tool_error_count == 0
-                else TaskState.FAILED
+                TaskState.FAILED
+                if self.timed_out or self.ambiguous_side_effect
+                else TaskState.COMPLETED
             )
-        if self.stop_reason == "await_user":
+        if self.stop_reason in {"await_user", "candidate_submitted", "builder_submitted", "consultation_submitted"}:
             return TaskState.PAUSED
         if self.stop_reason in {
             "max_steps",
             "blocked",
             "verification_failed",
             "widen_needed",
+            "tool_timeout",
+            "canceled",
         }:
             return TaskState.FAILED
-        return TaskState.COMPLETED if self.tool_error_count == 0 else TaskState.FAILED
+        # A missing terminal reason is a protocol failure, even when no tool
+        # error happened.  Coda consumers must never infer success from a
+        # quiet/exceptional exit.
+        return TaskState.FAILED
 
     def _refresh_budget_signals(self) -> None:
         remaining_steps = None
@@ -259,11 +356,14 @@ class AssistantTurnDecision:
     protect_final_answer: bool = False
     stop_reason: TurnStopReason | None = None
     runtime_event_category: RuntimeEventCategory | None = None
+    # Only pure flow guidance may be omitted from handoff freshness checks.
+    # Verification evidence and new constraints deliberately keep the default.
+    feedback_kind: Literal["continuation"] | None = None
 
 
 @dataclass(slots=True)
 class ToolTurnDecision:
-    kind: Literal["continue", "await_user"]
+    kind: Literal["continue", "await_user", "stop"]
     assistant_content: str | None = None
     stop_reason: TurnStopReason | None = None
     progress_summary: str = ""
@@ -361,7 +461,7 @@ def _derive_widening_signal(
     return False, "", ""
 
 
-def derive_turn_step_policy(turn_state: TurnRecurrentState) -> TurnStepPolicy:
+def derive_turn_step_policy(turn_state: TurnRecurrentState, *, read_only: bool = False) -> TurnStepPolicy:
     """Derive the current per-step policy from budget, profile, and progress."""
 
     step = max(turn_state.step, 1)
@@ -412,6 +512,17 @@ def derive_turn_step_policy(turn_state: TurnRecurrentState) -> TurnStepPolicy:
     else:
         guidance = "verify changes, test evidence, and finalize only with support"
         verification_focus = "strict" if turn_state.verification_state.strict else "normal"
+
+    if read_only:
+        # Scope changes the guidance, never evidence requirements or the stop
+        # policy. A read-only finding is not verification of the primary's edits.
+        guidance = {
+            "explore": "inspect evidence relevant to the assigned question; avoid unrelated exploration",
+            "execute": "resolve remaining evidence gaps; once supported, return findings without extra tool calls",
+            "verify": "check the assigned claims against evidence, report limitations, and finalize the read-only report",
+        }[phase]
+        if turn_state.widening_active:
+            guidance += "; consider alternative explanations within the assignment"
 
     policy = TurnStepPolicy(
         phase=phase,
@@ -495,29 +606,33 @@ def _step_aware_followup_nudge(
     if step_policy is None:
         return nudge_after_tool_result if saw_tool_result else nudge_continue
     if step_policy.phase == "verify":
-        return (
-            "You are in verification mode. Use the current evidence to run the most "
-            "relevant validation step, summarize the result, and only then finalize "
-            "or explain the remaining blocker."
-        )
+        return VERIFY_FOLLOWUP
     if step_policy.phase == "explore" and not saw_tool_result:
-        return (
-            "You are still in exploration mode. Inspect the most relevant files, "
-            "tests, or symbols first so the next step is grounded in evidence."
-        )
+        return EXPLORE_FOLLOWUP
     return nudge_after_tool_result if saw_tool_result else nudge_continue
 
 
 def _content_mentions_evidence(content: str, evidence_summary: str) -> bool:
+    """Recognize a reference to evidence, not certify the claim made about it.
+
+    Structured node/final verification remains responsible for correctness.
+    English substrings (e.g. ``test`` inside ``latest``) are not references, and
+    ordinary Chinese validation language must not need an English paraphrase.
+    """
+    # Protocol markers are control syntax, never a citation of evidence. In
+    # particular, a bare <verification_passed> must not satisfy this guard just
+    # because its spelling contains the English word "verification".
+    content = re.sub(r"<verification_(?:passed|failed)>|</?(?:progress|final)>", "", content, flags=re.I)
     normalized_content = " ".join(content.lower().split())
     if not normalized_content:
         return False
-    evidence_markers = (
+    english_markers = (
         "verified",
         "verification",
         "validated",
         "test",
         "tests",
+        "testing",
         "checked",
         "inspected",
         "confirmed",
@@ -527,8 +642,10 @@ def _content_mentions_evidence(content: str, evidence_summary: str) -> bool:
         "output shows",
         "log shows",
         "diff shows",
-        "I ran",
-        "I checked",
+        "i ran",
+        "i checked",
+    )
+    chinese_markers = (
         "根据",
         "来源",
         "报道",
@@ -537,8 +654,20 @@ def _content_mentions_evidence(content: str, evidence_summary: str) -> bool:
         "证据",
         "结果显示",
         "网页显示",
+        "测试",
+        "验证",
+        "检查",
+        "验收",
+        "核验",
+        "校验",
+        "日志显示",
+        "输出显示",
+        "差异显示",
     )
-    if any(marker in normalized_content for marker in evidence_markers):
+    if any(marker in normalized_content for marker in chinese_markers) or any(
+        re.search(r"(?<![a-z])" + re.escape(marker) + r"(?![a-z])", normalized_content)
+        for marker in english_markers
+    ):
         return True
     evidence_tokens = [
         token.strip(".,:;()[]{}'\"")
@@ -730,6 +859,82 @@ def finalize_work_chain_task(
     )
 
 
+def decide_truncated_model_output(
+    *, turn_state: TurnRecurrentState, stop_reason: str | None, tool_batch: bool = False,
+) -> AssistantTurnDecision | None:
+    """Provider termination outranks nonempty text, progress and evidence claims.
+
+    A truncated response is never a result, and a truncated TOOL BATCH is never
+    executed: the proposal may be only a prefix, so no call from it reaches a tool,
+    hook, approval or submission. That refusal is not the same decision as ending
+    the run, though, and conflating them is what made an otherwise healthy run die
+    the moment the provider hit its output ceiling.
+
+    Recovery stays in this activation, retaining completed tool effects. Known
+    automatic allowances can grow, and each retry requests a smaller proposal.
+    Consecutive failures are bounded; only new native file revisions refresh the
+    recovery window. Every request still passes the unchanged task budget gate.
+    """
+    if stop_reason not in {"length", "max_tokens"}:
+        return None
+    if turn_state.can_retry_truncated_output() and turn_state.has_remaining_steps():
+        turn_state.record_truncated_output_retry()
+        increased = turn_state.output_recovery.increase()
+        attempt = turn_state.truncated_output_consecutive_count
+        sizing = (
+            "If a tool is needed, propose only ONE small, complete tool call using already authorized tools. "
+            "Never continue raw partial JSON, repeat prior analysis or replay already completed commands. "
+        )
+        if tool_batch:
+            sizing += (
+                "For file implementation tasks where editing is authorized, prefer targeted edits; "
+                "create a new large file as a small valid skeleton, then extend it with targeted edits. "
+                "write_file replaces the entire file: never use it to append a later chunk. "
+            )
+        if attempt >= 2:
+            sizing += "Reduce the next result to one small section or one authorized operation. "
+        if attempt >= 3:
+            sizing += "Keep the next report or tool arguments under roughly 512 tokens; continue any remaining work in subsequent steps. "
+        if increased:
+            sizing += f"Automatic output allowance increased from {increased[0]} to {increased[1]} tokens, subject to admission. "
+        context_recovery = turn_state.output_recovery.latest.get("context_recovery_requested") is True
+        if context_recovery:
+            sizing += ("The previous output filled the remaining context window. Make room using a fresh "
+                       "native handoff note and context rotation when available before resuming business work; "
+                       "do not repeat the same oversized request or discard required evidence. ")
+        if tool_batch:
+            guidance = (
+                f"The provider truncated your previous response (stop_reason={stop_reason}) "
+                "while you were proposing tool calls, so that ENTIRE batch was refused: no "
+                "call in it was executed, and it is not a completed result. Continue "
+                "within the existing budget. " + sizing + "Finish the missing result "
+                "concisely without repeating prior analysis. State the exact blocker if "
+                "one exists; never claim unseen work completed."
+            )
+        else:
+            guidance = (
+                f"The provider truncated your previous response (stop_reason={stop_reason}); "
+                "it is not a completed result. Continue within the existing budget. "
+                + sizing + "Finish the missing result concisely without repeating prior analysis, or "
+                "state the exact blocker. Use the native handoff tool when one is provided; "
+                "the final report must be self-contained and include all required findings. "
+                "Do not claim unseen work completed."
+            )
+        status = "本次输出达到长度限制，正在保留已有进度并缩小下一步输出。"
+        if increased:
+            status += f"自动输出额度已调整为 {increased[1]:,} Token，仍受任务预算限制。"
+        if context_recovery:
+            status += "正在为思考与输出腾出上下文空间，总窗口上限保持不变。"
+        if tool_batch:
+            status += "本次不完整的工具调用未执行。"
+        return AssistantTurnDecision(kind="retry", runtime_event_category="recovery",
+                                     user_content=guidance, assistant_content=status, feedback_kind="continuation")
+    detail = ("No tools from this incomplete response were executed."
+              if tool_batch else "The bounded continuation is exhausted or no turn steps remain.")
+    return AssistantTurnDecision(kind="fallback", stop_reason="model_output_truncated",
+        assistant_content=f"Model output was truncated (stop_reason={stop_reason}). {detail} No completed result was accepted.")
+
+
 def decide_assistant_turn(
     *,
     turn_state: TurnRecurrentState,
@@ -749,12 +954,32 @@ def decide_assistant_turn(
     nudge_after_empty_response: str,
     nudge_after_empty_no_tools: str,
     step_policy: TurnStepPolicy | None = None,
+    transport_complete: bool = True,
 ) -> AssistantTurnDecision:
     """Decide how the loop should react to an assistant-only step."""
+
+    if not transport_complete:
+        # Recover only the model response in this activation: tool receipts and
+        # completed effects remain intact. Incomplete text is never a final.
+        if (turn_state.transport_retry_count < turn_state.transport_retry_limit
+                and turn_state.repair_retries_available() and turn_state.has_remaining_steps()):
+            turn_state.transport_retry_count += 1
+            turn_state.repair_retry_total += 1
+            return AssistantTurnDecision(kind="retry", runtime_event_category="recovery",
+                assistant_content="模型响应传输不完整，正在重新请求完整结果。",
+                user_content=RESUME_AFTER_TRANSPORT, feedback_kind="continuation")
+        return AssistantTurnDecision(kind="fallback", stop_reason="transport_incomplete",
+            assistant_content="Model response transport was incomplete. Bounded recovery is exhausted "
+                "or no turn steps remain. No completed result was accepted; prior tool progress is retained.")
+
+    truncated = decide_truncated_model_output(turn_state=turn_state, stop_reason=stop_reason)
+    if truncated is not None:
+        return truncated
 
     if treat_as_progress:
         return AssistantTurnDecision(
             kind="progress",
+            feedback_kind="continuation",
             assistant_content=step_content,
             user_content=_step_aware_followup_nudge(
                 step_policy=step_policy,
@@ -780,17 +1005,16 @@ def decide_assistant_turn(
                 else resume_after_max_tokens
             ),
             runtime_event_category="recovery",
+            feedback_kind="continuation",
         )
 
     if is_empty and turn_state.can_retry_empty_response():
         turn_state.record_empty_response_retry()
         retry_nudge = (
-            "Your last response was empty during verification mode. Resume with a "
-            "single concrete validation step or state the exact blocker."
+            EMPTY_VERIFY_FOLLOWUP
             if step_policy is not None and step_policy.phase == "verify"
             else (
-                "Your last response was empty after the current line of attack stalled. "
-                "Resume with one wider search step or explicitly compare the next two options."
+                EMPTY_WIDENING_FOLLOWUP
                 if step_policy is not None and step_policy.allow_widening
                 else (
                     nudge_after_empty_response
@@ -802,6 +1026,7 @@ def decide_assistant_turn(
         return AssistantTurnDecision(
             kind="retry",
             user_content=retry_nudge,
+            feedback_kind="continuation",
         )
 
     if is_empty:
@@ -855,16 +1080,26 @@ def decide_assistant_turn(
         step_policy is not None
         and step_policy.phase == "verify"
         and turn_state.verification_state.requires_evidence
-        and not _content_mentions_evidence(
-            step_content,
-            turn_state.verification_state.evidence_summary or turn_state.latest_tool_result_summary,
-        )
+        and not turn_state.has_verification_evidence()
     ):
+        if turn_state.verification_state.evidence_retry_count >= 1:
+            return AssistantTurnDecision(
+                kind="fallback",
+                assistant_content=(
+                    "Verification guard stopped the turn: the final answer still "
+                    "has no successful tool evidence after one clarification. "
+                    "No successful delivery is inferred; the existing tool results are retained."
+                ),
+                stop_reason="verification_failed",
+            )
+        # Do not reset after another read: that would allow the same guard loop
+        # to consume the remaining budget indefinitely. One retry per activation.
+        turn_state.verification_state.evidence_retry_count += 1
         return AssistantTurnDecision(
             kind="progress",
             assistant_content=(
-                "Verification guard: final answer withheld until it cites concrete "
-                "evidence from this run."
+                "Verification guard: final answer withheld until it obtains concrete "
+                "evidence from this run (clarification 1/1)."
             ),
             user_content=build_verification_evidence_nudge(
                 turn_state.verification_state.evidence_summary
@@ -872,6 +1107,14 @@ def decide_assistant_turn(
             ),
             runtime_event_category="guard",
         )
+
+    if (step_policy is not None and step_policy.phase == "verify"
+            and turn_state.verification_state.requires_evidence
+            and not _content_mentions_evidence(step_content, turn_state.verification_state.evidence_summary)):
+        # Wording is presentation, never an acceptance criterion. Attach the
+        # observed receipt without spending another model call or discarding a
+        # completed result. Runtime's structured acceptance gate still applies.
+        step_content += "\n\n本轮工具记录：" + turn_state.verification_state.evidence_summary
 
     return AssistantTurnDecision(
         kind="final",
@@ -886,15 +1129,55 @@ def decide_tool_turn(
     tool_name: str,
     result_output: str,
     await_user: bool,
+    runtime_stop_reason: str | None = None,
+    result_ok: bool = True,
+    ambiguous_side_effect: bool = False,
 ) -> ToolTurnDecision:
     """Keep tool-result ask-user handling on the same typed decision surface."""
 
+    if ambiguous_side_effect:
+        return ToolTurnDecision(
+            kind="stop", stop_reason="blocked",
+            assistant_content=result_output + "\n\nOperation outcome is uncertain; automatic replay stopped. "
+                              "Inspect the existing output or remote status before another attempt.",
+            progress_summary=f"unresolved side effects after {tool_name}; task remains incomplete",
+        )
+
+    if runtime_stop_reason == "consultation_input_exhausted":
+        return ToolTurnDecision(
+            kind="stop", assistant_content=result_output,
+            stop_reason="consultation_input_exhausted",
+            progress_summary="consultation input correction exhausted; task remains incomplete",
+        )
+    if runtime_stop_reason == "tool_input_exhausted" and not result_ok:
+        return ToolTurnDecision(
+            kind="stop", assistant_content=result_output, stop_reason="tool_input_exhausted",
+            progress_summary=f"unchanged invalid arguments for {tool_name}; task remains incomplete",
+        )
     if await_user:
         return ToolTurnDecision(
             kind="await_user",
             assistant_content=result_output,
             stop_reason="await_user",
             progress_summary=f"awaiting user after {tool_name}",
+        )
+    if result_ok and tool_name == "submit_candidate" and runtime_stop_reason == "candidate_submitted":
+        return ToolTurnDecision(
+            kind="stop", stop_reason="candidate_submitted",
+            assistant_content="Candidate submitted for Runtime verification; final delivery is still pending.",
+            progress_summary="primary handed off its candidate; Runtime acceptance remains required",
+        )
+    if result_ok and tool_name == "submit_builder_candidate" and runtime_stop_reason == "builder_submitted":
+        return ToolTurnDecision(
+            kind="stop", stop_reason="builder_submitted",
+            assistant_content="Builder candidate submitted; patch export, parent acceptance and final verification remain pending.",
+            progress_summary="Builder handed off its isolated candidate for parent review",
+        )
+    if result_ok and tool_name == "submit_consultation" and runtime_stop_reason == "consultation_submitted":
+        return ToolTurnDecision(
+            kind="stop", stop_reason="consultation_submitted",
+            assistant_content="Consultation report submitted; Runtime verification and parent delivery remain pending.",
+            progress_summary="helper handed off its report; Runtime verification remains required",
         )
     return ToolTurnDecision(
         kind="continue",

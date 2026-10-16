@@ -13,12 +13,12 @@ from __future__ import annotations
 import copy
 import logging
 from collections import deque
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from threading import Lock
-from typing import Any, Callable, Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from minicode.types import ChatMessage, RuntimeEvent
-
 
 logger = logging.getLogger("minicode.turn_events")
 
@@ -26,13 +26,52 @@ logger = logging.getLogger("minicode.turn_events")
 TurnEventKind = Literal[
     "tool_start",
     "tool_result",
+    "tool_input",
+    "tool_recovery",
+    "tool_images",
+    "tool_rejected",
     "assistant",
     "progress",
     "runtime",
     "assistant_stream",
+    "assistant_start",
+    "assistant_status",
     "thinking",
+    "model_status",
     "done",
 ]
+TurnWaitKind = Literal["input", "approval"]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentTurnOutcome:
+    """Lossless terminal handoff from AgentLoop to a governed Worker."""
+
+    messages: tuple[ChatMessage, ...]
+    stop_reason: str
+    step: int = 0
+    tool_error_count: int = 0
+    wait_kind: TurnWaitKind | None = None
+    timed_out: bool = False
+    ambiguous_side_effect: bool = False
+    unsafe_effect_observed: bool = False
+    unsettled_tool: bool = False
+
+    @classmethod
+    def from_event(cls, event: TurnEvent) -> AgentTurnOutcome:
+        if event.kind != "done":
+            raise ValueError("AgentTurnOutcome requires a done TurnEvent")
+        return cls(
+            messages=event.messages,
+            stop_reason=event.stop_reason,
+            step=event.step or 0,
+            tool_error_count=event.tool_error_count,
+            wait_kind=event.wait_kind,
+            timed_out=event.timed_out,
+            ambiguous_side_effect=event.ambiguous_side_effect,
+            unsafe_effect_observed=event.unsafe_effect_observed,
+            unsettled_tool=event.unsettled_tool,
+        )
 
 
 def _snapshot_value(value: Any) -> Any:
@@ -61,8 +100,25 @@ class TurnEvent:
     is_error: bool = False
     content: str = ""
     runtime_event: RuntimeEvent | None = None
+    node_id: str = ""
+    attempt_id: str = ""
+    tool_call_id: str = ""
+    tool_input_status: dict[str, Any] | None = None
+    tool_recovery: dict[str, Any] | None = None
+    images: tuple[dict[str, Any], ...] = ()
+    message_id: str = ""
+    replaces_message_id: str = ""
+    phase: Literal["commentary", "final_answer"] | None = None
+    delivery_state: Literal["pending", "accepted", "rejected"] | None = None
     messages: tuple[ChatMessage, ...] = ()
     stop_reason: str = ""
+    tool_error_count: int = 0
+    wait_kind: TurnWaitKind | None = None
+    timed_out: bool = False
+    ambiguous_side_effect: bool = False
+    unsafe_effect_observed: bool = False
+    unsettled_tool: bool = False
+    progress_status: Literal["running", "complete", "failed", "stopped"] | None = None
 
     @classmethod
     def tool_started(
@@ -71,13 +127,25 @@ class TurnEvent:
         step: int | None,
         tool_name: str,
         tool_input: Any,
-    ) -> "TurnEvent":
+        tool_call_id: str = "",
+    ) -> TurnEvent:
         return cls(
             kind="tool_start",
             step=step,
             tool_name=tool_name,
             tool_input=_snapshot_value(tool_input),
+            tool_call_id=tool_call_id,
         )
+
+    @classmethod
+    def tool_rejected(
+        cls, *, step: int | None, tool_name: str, tool_input: Any,
+        output: str, tool_call_id: str, reason: str,
+    ) -> TurnEvent:
+        """A real batch admission decision, not an executed tool or turn stop."""
+        return cls(kind="tool_rejected", step=step, tool_name=tool_name,
+            tool_input=_snapshot_value(tool_input), output=output, is_error=True,
+            tool_call_id=tool_call_id, content=reason)
 
     @classmethod
     def tool_finished(
@@ -87,22 +155,29 @@ class TurnEvent:
         tool_name: str,
         output: str,
         is_error: bool,
-    ) -> "TurnEvent":
+        tool_call_id: str = "",
+    ) -> TurnEvent:
         return cls(
             kind="tool_result",
             step=step,
             tool_name=tool_name,
             output=output,
             is_error=is_error,
+            tool_call_id=tool_call_id,
         )
 
     @classmethod
-    def assistant_message(cls, *, step: int | None, content: str) -> "TurnEvent":
-        return cls(kind="assistant", step=step, content=content)
+    def assistant_message(cls, *, step: int | None, content: str, public: bool = False) -> TurnEvent:
+        return cls(kind="assistant", step=step, content=content,
+                   phase="final_answer" if public else None)
 
     @classmethod
-    def progress_message(cls, *, step: int | None, content: str) -> "TurnEvent":
-        return cls(kind="progress", step=step, content=content)
+    def progress_message(
+        cls, *, step: int | None, content: str, public: bool = False,
+        progress_status: Literal["running", "complete", "failed", "stopped"] | None = None,
+    ) -> TurnEvent:
+        return cls(kind="progress", step=step, content=content,
+                   phase="commentary" if public else None, progress_status=progress_status)
 
     @classmethod
     def runtime_message(
@@ -110,7 +185,7 @@ class TurnEvent:
         *,
         step: int | None,
         event: RuntimeEvent,
-    ) -> "TurnEvent":
+    ) -> TurnEvent:
         return cls(
             kind="runtime",
             step=step,
@@ -120,11 +195,11 @@ class TurnEvent:
         )
 
     @classmethod
-    def assistant_stream_chunk(cls, *, step: int | None, content: str) -> "TurnEvent":
+    def assistant_stream_chunk(cls, *, step: int | None, content: str) -> TurnEvent:
         return cls(kind="assistant_stream", step=step, content=content)
 
     @classmethod
-    def thinking_chunk(cls, *, step: int | None, content: str) -> "TurnEvent":
+    def thinking_chunk(cls, *, step: int | None, content: str) -> TurnEvent:
         return cls(kind="thinking", step=step, content=content)
 
     @classmethod
@@ -134,13 +209,25 @@ class TurnEvent:
         step: int | None,
         messages: list[ChatMessage],
         stop_reason: str,
-    ) -> "TurnEvent":
+        tool_error_count: int = 0,
+        wait_kind: TurnWaitKind | None = None,
+        timed_out: bool = False,
+        ambiguous_side_effect: bool = False,
+        unsafe_effect_observed: bool = False,
+        unsettled_tool: bool = False,
+    ) -> TurnEvent:
         snapshot = _snapshot_value(messages)
         return cls(
             kind="done",
             step=step,
             messages=tuple(snapshot),
             stop_reason=stop_reason,
+            tool_error_count=tool_error_count,
+            wait_kind=wait_kind,
+            timed_out=timed_out,
+            ambiguous_side_effect=ambiguous_side_effect,
+            unsafe_effect_observed=unsafe_effect_observed,
+            unsettled_tool=unsettled_tool,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -210,7 +297,7 @@ class TurnEventQueue:
                 event = self._events.popleft()
             try:
                 handler(event)
-            except Exception:  # noqa: BLE001
+            except Exception:
                 # A UI reducer must not wedge the TUI event loop.  The event
                 # is considered consumed after this diagnostic is recorded.
                 logger.debug(
@@ -231,7 +318,9 @@ class TurnEventQueue:
 __all__ = [
     "AgentTurnCallbacks",
     "AgentTurnEventSink",
-    "TurnEventQueue",
+    "AgentTurnOutcome",
     "TurnEvent",
     "TurnEventKind",
+    "TurnEventQueue",
+    "TurnWaitKind",
 ]

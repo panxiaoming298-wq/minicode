@@ -1,10 +1,4 @@
-"""Tiered context and lossless out-of-window memory.
-
-The package keeps authoritative records separate from derived retrieval data.
-It is intentionally optional at import time: local SQLite/file adapters work
-without third-party dependencies, while PostgreSQL, S3 and Milvus adapters are
-loaded only when selected by configuration.
-"""
+"""SQLite authority, local artifacts and lossless paged context."""
 
 from .archive import EventArchiveManager
 from .config import PagedMemoryConfig

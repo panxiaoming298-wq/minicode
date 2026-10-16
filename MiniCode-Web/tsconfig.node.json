@@ -7,5 +7,5 @@
     "moduleResolution": "Bundler",
     "tsBuildInfoFile": "./node_modules/.cache/tsconfig.node.tsbuildinfo"
   },
-  "include": ["vite.config.ts", "vitest.config.ts", "playwright.config.ts"]
+  "include": ["vite.config.ts"]
 }

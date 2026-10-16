@@ -2,22 +2,33 @@ from __future__ import annotations
 
 import subprocess
 from minicode.tooling import ToolDefinition, ToolResult
+from minicode.tools._validation import validate_contract
+
+
+GIT_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "action": {"type": "string", "enum": ["status", "diff", "log", "commit", "review"],
+                   "description": "Git action to perform"},
+        "message": {"type": "string", "description": "Nonblank commit message, required for commit action"},
+        "max_lines": {"type": "integer", "minimum": 1, "default": 50,
+                      "description": "Maximum diff lines or log commits (positive integer, default: 50)"},
+    },
+    "required": ["action"],
+}
 
 
 def _validate(input_data: dict) -> dict:
-    action = input_data.get("action")
-    if not isinstance(action, str) or not action:
-        raise ValueError("action is required")
-    if action not in ("status", "diff", "log", "commit", "review"):
-        raise ValueError("action must be one of: status, diff, log, commit, review")
+    validate_contract(input_data, GIT_INPUT)
+    action = input_data["action"]
     if action == "commit":
         message = input_data.get("message")
         if not isinstance(message, str) or not message.strip():
-            raise ValueError("message is required for commit action")
+            raise ValueError("$.message: a nonblank message is required for commit action")
     return {
         "action": action,
         "message": input_data.get("message", ""),
-        "max_lines": int(input_data.get("max_lines", 50)),
+        "max_lines": input_data.get("max_lines", 50),
     }
 
 
@@ -198,19 +209,7 @@ def _run_review(cwd: str, max_lines: int) -> ToolResult:
 git_tool = ToolDefinition(
     name="git",
     description="Git workflow tool. Actions: status (show working tree status), diff (show unstaged changes), log (show recent commits), commit (create a git commit with message), review (review recent changes and working tree).",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["status", "diff", "log", "commit", "review"],
-                "description": "Git action to perform",
-            },
-            "message": {"type": "string", "description": "Commit message (required for commit action)"},
-            "max_lines": {"type": "number", "description": "Maximum output lines (default: 50)"},
-        },
-        "required": ["action"],
-    },
+    input_schema=GIT_INPUT,
     validator=_validate,
     run=_run,
 )

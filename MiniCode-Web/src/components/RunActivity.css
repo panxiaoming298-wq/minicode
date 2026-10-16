@@ -1,0 +1,40 @@
+.run-activity-layer { position: absolute; inset: 0; z-index: 4; pointer-events: none; }
+.run-activity-dock { position: absolute; bottom: 12px; left: 0; right: 0; display: flex; flex-direction: column; justify-content: center; align-items: center; gap: 8px; padding: 0 16px; }
+.run-activity-status-row { display: flex; max-width: 100%; align-items: center; justify-content: center; gap: 8px; }
+.run-activity-layer.has-file-changes .run-activity-panel { bottom: 110px; max-height: calc(100% - 122px); }
+.run-column .conversation-viewport.has-file-changes .stream-content { padding-bottom: 126px; }
+.run-activity-toggle { display: inline-flex; min-width: 0; min-height: 36px; align-items: center; gap: 8px; padding: 7px 12px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface-raised); color: var(--text-soft); box-shadow: 0 2px 10px var(--line); font-size: 12px; pointer-events: auto; }
+.run-activity-toggle:hover, .run-activity-toggle[aria-expanded="true"] { color: var(--text); border-color: var(--muted); }
+.run-activity-toggle > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.run-activity-toggle > svg { flex: 0 0 auto; }
+.run-activity-toggle.needs-attention { color: var(--warning); }
+.run-activity-spinner { width: 20px; height: 20px; animation: run-activity-rotate 1.2s linear infinite; }
+@keyframes run-activity-rotate { to { transform: rotate(360deg); } }
+.run-activity-dock .new-items-button { position: static; margin: 0; min-width: 36px; justify-content: center; flex-shrink: 0; font-weight: 500; pointer-events: auto; }
+.run-activity-dock .run-activity-toggle + .new-items-button { width: 36px; padding: 7px; background: var(--surface-raised); color: var(--text); }
+.run-column .conversation-viewport.has-run-activity .stream-content { padding-bottom: 76px; }
+.run-activity-panel { position: absolute; bottom: 60px; left: 50%; transform: translateX(-50%); width: min(360px, calc(100% - 32px)); max-height: calc(100% - 72px); overflow-y: auto; overscroll-behavior: contain; padding: 14px 16px; border: 1px solid var(--line-strong); border-radius: 14px; background: var(--surface-raised); color: var(--text); box-shadow: var(--shadow-soft); font-size: 12px; pointer-events: auto; }
+.run-activity-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.run-activity-panel > header strong { font-size: 13px; font-weight: 550; }
+.run-activity-panel > header .icon-button { flex-shrink: 0; }
+.run-activity-detail { margin: 5px 0 8px; color: var(--muted); line-height: 1.7; overflow-wrap: anywhere; }
+.run-activity-plan-heading { display: flex; justify-content: space-between; gap: 12px; padding-top: 12px; margin-top: 12px; border-top: 1px solid var(--line); color: var(--muted); font-size: 11px; }
+.run-activity-plan-heading > :last-child { font-variant-numeric: tabular-nums; }
+.run-activity-plan { display: grid; gap: 14px; padding: 0; margin: 14px 0 4px; list-style: none; }
+.run-activity-plan > li { display: flex; align-items: start; gap: 10px; }
+.run-activity-node-mark { display: flex; justify-content: center; align-items: center; flex: 0 0 16px; height: 16px; margin-top: 2px; border: 1px solid var(--line-strong); border-radius: 50%; color: var(--muted); }
+.activity-node-succeeded .run-activity-node-mark { border-color: var(--success); color: var(--success); }
+.activity-node-running .run-activity-node-mark, .activity-node-verifying .run-activity-node-mark { border-color: var(--accent); background: var(--accent); box-shadow: inset 0 0 0 4px var(--surface-raised); }
+.activity-node-failed_terminal .run-activity-node-mark, .activity-node-waiting_input .run-activity-node-mark, .activity-node-waiting_approval .run-activity-node-mark { border-color: var(--warning); }
+.run-activity-objective { display: block; line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }
+.run-activity-node-state { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; line-height: 1.5; }
+.run-activity-action { min-height: 36px; padding: 6px 0; margin-top: 8px; background: transparent; color: var(--text); text-decoration: underline; text-underline-offset: 3px; font-size: 12px; }
+@media (max-width: 720px) {
+  /* RunProgress already exposes the approval link. Keep the card's controls clickable. */
+  .run-activity-layer.has-pending-approval .run-activity-dock { display: none; }
+  .run-activity-layer.has-pending-question .run-activity-dock { display: none; }
+  .run-activity-toggle, .run-activity-dock .new-items-button { min-height: 40px; }
+  .run-activity-dock .run-activity-toggle + .new-items-button { width: 40px; }
+  .run-activity-panel { bottom: 64px; max-height: calc(100% - 76px); }
+}
+@media (prefers-reduced-motion: reduce) { .run-activity-spinner { animation: none; } }

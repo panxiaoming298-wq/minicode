@@ -1,0 +1,8 @@
+.task-memory-receipt {
+  overflow-wrap: anywhere;
+}
+
+.task-memory-receipt .compact-metrics dd {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}

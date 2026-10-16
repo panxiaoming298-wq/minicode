@@ -1,0 +1,22 @@
+.candidate-recovery-card {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  margin-top: 12px;
+  border: 1px solid var(--border-subtle, #deded9);
+  border-radius: 10px;
+  font-size: 12px;
+}
+.candidate-recovery-card small {
+  color: var(--text-secondary, #66665f);
+  overflow-wrap: anywhere;
+}
+.candidate-recovery-card p { margin: 0; line-height: 1.6; }
+.candidate-recovery-path {
+  display: block;
+  overflow-wrap: anywhere;
+  user-select: all;
+  font-size: 11px;
+  line-height: 1.7;
+}
+.candidate-recovery-card .button { justify-self: start; }

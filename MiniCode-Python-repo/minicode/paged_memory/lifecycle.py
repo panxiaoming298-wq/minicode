@@ -11,6 +11,8 @@ import sqlite3
 import tarfile
 import tempfile
 import time
+from contextlib import nullcontext
+from dataclasses import replace
 from collections.abc import Mapping, Sequence
 from pathlib import Path, PurePosixPath
 from typing import Any
@@ -26,7 +28,6 @@ from .models import (
     ArtifactRecord,
     ArtifactStatus,
     DependencyType,
-    MemoryStatus,
     MemoryType,
     RetentionRule,
     TaskRetentionPolicy,
@@ -45,6 +46,14 @@ class RetentionDenied(RuntimeError):
 
 class BackupVerificationError(RuntimeError):
     pass
+
+
+def _io_path(path: Path) -> Path:
+    """Use the Windows extended namespace for deep backup/restore payloads."""
+    value = str(path.resolve())
+    if os.name == 'nt' and not value.startswith('\\\\?\\'):
+        value = '\\\\?\\UNC\\' + value[2:] if value.startswith('\\\\') else '\\\\?\\' + value
+    return Path(value)
 
 
 class RetentionPolicyEngine:
@@ -106,13 +115,11 @@ class LifecycleManager:
         *,
         authority: Any,
         artifact_store: Any,
-        vector_index: Any | None = None,
         spool_store: Any | None = None,
         config: PagedMemoryConfig | None = None,
     ) -> None:
         self.authority = authority
         self.artifact_store = artifact_store
-        self.vector_index = vector_index
         self.spool_store = spool_store
         self.config = config or PagedMemoryConfig()
         self.retention_policy = RetentionPolicyEngine(self.config.retention_rules)
@@ -186,16 +193,6 @@ class LifecycleManager:
             )
             memories = self.authority.all_memories(tenant_id=tenant_id, task_id=task_id)
             errors: list[str] = []
-            if self.config.milvus_enabled and self.vector_index is None:
-                raise RetentionDenied(
-                    "real deletion is blocked while the configured vector index is unavailable"
-                )
-            if self.vector_index is not None and memories:
-                try:
-                    self.vector_index.delete([memory.id for memory in memories])
-                    destructive_progress = True
-                except Exception as exc:  # noqa: BLE001 - collect cross-store failures.
-                    errors.append(f"vector deletion failed: {type(exc).__name__}")
             invalidator = getattr(self.authority, "working_set_invalidate", None)
             if callable(invalidator) and memories:
                 invalidator(
@@ -349,21 +346,39 @@ class LifecycleManager:
             else:
                 expected_hash = str(event.content_json.get("content_hash", ""))
                 if not expected_hash:
-                    expected_hash = content_hash_text(
-                        event.content_text or stable_json(event.content_json)
-                    )
+                    text = event.content_text
+                    # Empty tool output is a valid source; older structured
+                    # events can instead carry the digest of their JSON body.
+                    if not text and event.content_hash != content_hash_text(""):
+                        text = stable_json(event.content_json)
+                    expected_hash = content_hash_text(text)
             if event.content_hash != expected_hash:
                 event_hash_mismatches.append(event.id)
         for memory in memories:
             is_artifact_chunk = memory.memory_type == MemoryType.ARTIFACT_CHUNK
+            is_event_chunk = "event_chunk" in memory.facets and not is_artifact_chunk
             if memory.source_event_id:
                 source = event_by_id.get(memory.source_event_id)
                 if source is None or (
-                    not is_artifact_chunk and source.content_hash != memory.content_hash
+                    not is_artifact_chunk and not is_event_chunk
+                    and source.content_hash != memory.content_hash
                 ):
                     invalid_sources.append(
                         f"memory:{memory.id}:event:{memory.source_event_id}"
                     )
+                elif is_event_chunk:
+                    source_range = memory.source_range
+                    data = source.content_text.encode("utf-8")
+                    if (source.artifact_uri or memory.artifact_id
+                        or source_range.unit != "BYTE" or source_range.start < 0
+                        or source_range.end <= source_range.start or source_range.end > len(data)):
+                        invalid_sources.append(f"memory:{memory.id}:event-range:{source.id}")
+                    elif verify_payload_hashes and content_hash_bytes(
+                        data[source_range.start:source_range.end]
+                    ) != memory.content_hash:
+                        memory_hash_mismatches.append(memory.id)
+            elif is_event_chunk:
+                invalid_sources.append(f"memory:{memory.id}:event:missing-id")
             if memory.artifact_id:
                 artifact = artifact_by_id.get(memory.artifact_id)
                 if artifact is None:
@@ -548,52 +563,6 @@ class LifecycleManager:
                     invalid_sources.append(
                         f"state:{state.version}:decision:{key}:{decision_id or 'missing-id'}"
                     )
-        vector_index_unavailable = bool(
-            self.config.milvus_enabled and self.vector_index is None
-        )
-        missing_vector_ids: list[str] = []
-        orphan_vector_ids: list[str] = []
-        vector_hash_mismatch_ids: list[str] = []
-        vector_descriptor: dict[str, Any] | None = None
-        if self.vector_index is not None:
-            descriptor = getattr(self.vector_index, "index_descriptor", None)
-            if descriptor is not None:
-                to_dict = getattr(descriptor, "to_dict", None)
-                vector_descriptor = (
-                    to_dict() if callable(to_dict) else {"index_id": str(descriptor)}
-                )
-            list_entries = getattr(self.vector_index, "list_entries", None)
-            if not callable(list_entries):
-                vector_index_unavailable = True
-            else:
-                expected_entries = {
-                    memory.id: memory.content_hash
-                    for memory in memories
-                    if memory.status in {MemoryStatus.ACTIVE, MemoryStatus.OPEN}
-                }
-                try:
-                    actual_entries = dict(
-                        list_entries(
-                            tenant_id=tenant_id,
-                            task_id=task_id,
-                            statuses=(
-                                MemoryStatus.ACTIVE.value,
-                                MemoryStatus.OPEN.value,
-                            ),
-                        )
-                    )
-                    expected_ids = set(expected_entries)
-                    actual_ids = set(actual_entries)
-                    missing_vector_ids = sorted(expected_ids - actual_ids)
-                    orphan_vector_ids = sorted(actual_ids - expected_ids)
-                    vector_hash_mismatch_ids = sorted(
-                        memory_id
-                        for memory_id in expected_ids & actual_ids
-                        if actual_entries[memory_id] != expected_entries[memory_id]
-                    )
-                except Exception:  # noqa: BLE001 - reconciliation reports SDK outages.
-                    vector_index_unavailable = True
-
         valid = not (
             missing_registry
             or missing_objects
@@ -604,10 +573,6 @@ class LifecycleManager:
             or event_hash_mismatches
             or checkpoint_hash_mismatches
             or invalid_archives
-            or vector_index_unavailable
-            or missing_vector_ids
-            or orphan_vector_ids
-            or vector_hash_mismatch_ids
         )
         return {
             "valid": valid,
@@ -628,22 +593,12 @@ class LifecycleManager:
             "event_hash_mismatches": event_hash_mismatches,
             "checkpoint_hash_mismatches": checkpoint_hash_mismatches,
             "invalid_archives": invalid_archives,
-            "vector_index_unavailable": vector_index_unavailable,
-            "vector_descriptor": vector_descriptor,
-            "missing_vector_ids": missing_vector_ids,
-            "orphan_vector_ids": orphan_vector_ids,
-            "vector_hash_mismatch_ids": vector_hash_mismatch_ids,
         }
 
     @staticmethod
     def _uri_in_tenant_scope(uri: str, tenant_id: str) -> bool:
         if uri.startswith(("file:", "spool:")):
             relative = uri.split(":", 1)[1]
-        elif uri.startswith("s3://"):
-            path = uri.removeprefix("s3://")
-            _, separator, relative = path.partition("/")
-            if not separator:
-                return False
         else:
             return False
         parts = PurePosixPath(relative).parts
@@ -669,11 +624,7 @@ class LifecycleManager:
         for uri, modified_at in self.artifact_store.list_objects():
             if not self._uri_in_tenant_scope(uri, tenant_id):
                 continue
-            relative = (
-                uri.split("/", 3)[-1]
-                if uri.startswith("s3://")
-                else uri.split(":", 1)[-1]
-            )
+            relative = uri.split(":", 1)[-1]
             artifact_id = PurePosixPath(relative).stem
             if uri in referenced or (
                 callable(reference_checker)
@@ -735,31 +686,40 @@ class LifecycleManager:
         }
 
     def create_local_backup(self, *, destination: str | Path | None = None) -> Path:
+        from minicode.store_lock import store_lock
+        sessions = Path(self.config.data_root) / 'sessions' if self.config.data_root else None
+        guard = store_lock(sessions / '.store.lock') if sessions and sessions.exists() else nullcontext()
+        with guard:
+            return self._create_local_backup(destination=destination)
+
+    def _create_local_backup(self, *, destination: str | Path | None = None) -> Path:
         """Create a verified local authority+artifact bundle.
 
-        PostgreSQL/remote object stores must use their platform snapshot tools;
-        this method deliberately refuses to present a partial local export as a
-        disaster-recovery backup.
+        Includes the SQLite database, local payloads and session metadata.
         """
         if not isinstance(self.authority, SqliteMemoryStore):
             raise NotImplementedError(
-                "use pg_dump/PITR for PostgreSQL authority backups"
+                "backup requires the SQLite authority"
             )
         if not isinstance(self.artifact_store, FileArtifactStore):
             raise NotImplementedError(
-                "use bucket versioning/replication for S3 or MinIO backups"
+                "backup requires a local file artifact store"
             )
         backup_root = Path(destination or self.config.backup_root).resolve()
+        for protected in (self.config.artifact_root, self.config.local_spool_root):
+            if backup_root.is_relative_to(Path(protected).resolve()):
+                raise ValueError('backup destination must be outside artifact/spool storage')
         backup_root.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
         encrypted = bool(self.config.backup_encryption_key)
         suffix = ".tar.gz.enc" if encrypted else ".tar.gz"
-        target = backup_root / f"minicode-memory-{stamp}-{os.getpid()}{suffix}"
-        temporary = target.with_name(f".{target.name}.tmp")
+        target = backup_root / f"minicode-memory-{stamp}-{new_id('backup')[-12:]}{suffix}"
+        temporary = target.with_name(f".{target.name}.tmp{suffix}")
 
-        with tempfile.TemporaryDirectory(prefix="minicode-backup-") as temporary_dir:
+        with tempfile.TemporaryDirectory(prefix=".staging-", dir=_io_path(backup_root)) as temporary_dir:
             staging = Path(temporary_dir)
-            self.authority.backup_to(staging / "state.db")
+            database_path = 'database/state.db' if self.config.data_root else 'state.db'
+            self.authority.backup_to(staging / database_path)
             artifact_target = staging / "artifacts"
             if self.artifact_store.root.exists():
                 shutil.copytree(self.artifact_store.root, artifact_target)
@@ -769,9 +729,15 @@ class LifecycleManager:
                 and self.spool_store.root.exists()
             ):
                 shutil.copytree(self.spool_store.root, staging / "spool")
+            sessions = Path(self.config.data_root) / 'sessions' if self.config.data_root else None
+            if sessions and sessions.exists():
+                if backup_root.is_relative_to(sessions.resolve()):
+                    raise ValueError('backup destination must be outside session storage')
+                shutil.copytree(sessions, staging / 'sessions', ignore=shutil.ignore_patterns('.store.lock'))
             files = self._hash_tree(staging)
             manifest = {
-                "schema_version": 1,
+                "schema_version": 2,
+                "database_path": database_path,
                 "created_at": now_epoch(),
                 "authority": "sqlite",
                 "artifact_store": "file",
@@ -789,12 +755,15 @@ class LifecycleManager:
                 payload = self._encrypt_backup(
                     payload, self.config.backup_encryption_key
                 )
-            with temporary.open("xb") as handle:
-                handle.write(payload)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temporary, target)
-        self.verify_local_backup(target)
+            try:
+                with temporary.open("xb") as handle:
+                    handle.write(payload)
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                self.verify_local_backup(temporary)
+                os.replace(temporary, target)
+            finally:
+                temporary.unlink(missing_ok=True)
         return target
 
     def verify_local_backup(self, backup: str | Path) -> dict[str, Any]:
@@ -802,7 +771,9 @@ class LifecycleManager:
         payload = path.read_bytes()
         if path.name.endswith(".enc"):
             payload = self._decrypt_backup(payload, self.config.backup_encryption_key)
-        with tempfile.TemporaryDirectory(prefix="minicode-verify-") as temporary_dir:
+        scratch = Path(self.config.backup_root)
+        scratch.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=".verify-", dir=_io_path(scratch)) as temporary_dir:
             staging = Path(temporary_dir)
             self._extract_tar(payload, staging)
             manifest_path = staging / "manifest.json"
@@ -813,7 +784,10 @@ class LifecycleManager:
             actual = self._hash_tree(staging, exclude=("manifest.json",))
             if dict(expected) != actual:
                 raise BackupVerificationError("backup file manifest/hash mismatch")
-            database = staging / "state.db"
+            database_path = manifest.get('database_path', 'state.db')
+            if database_path not in {'state.db', 'database/state.db'}:
+                raise BackupVerificationError('unsupported backup database path')
+            database = staging / database_path
             connection = sqlite3.connect(database)
             try:
                 check = connection.execute("PRAGMA integrity_check").fetchone()
@@ -873,16 +847,31 @@ class LifecycleManager:
         payload = path.read_bytes()
         if path.name.endswith(".enc"):
             payload = self._decrypt_backup(payload, self.config.backup_encryption_key)
-        self._extract_tar(payload, target)
+        self._extract_tar(payload, _io_path(target))
+        marker_path = target / 'sessions' / '.history-backend.json'
+        if marker_path.is_file():
+            marker = json.loads(marker_path.read_text(encoding='utf-8'))
+            if marker.get('backend') == 'sqlite':
+                from minicode.history_storage import _digest, sqlite_artifact_identity
+                from minicode.session_contract import atomic_write_json
+                manifest = json.loads((target / 'manifest.json').read_text(encoding='utf-8'))
+                database = target / manifest.get('database_path', 'state.db')
+                marker['databaseId'] = _digest({'path': os.path.normcase(os.path.abspath(database))})
+                marker['artifactStoreId'] = sqlite_artifact_identity(replace(
+                    self.config, artifact_store_type='file', artifact_root=str(target / 'artifacts')))
+                atomic_write_json(marker_path, marker)
         return target
 
     def restore_drill(self, backup: str | Path) -> dict[str, Any]:
         started = now_epoch()
+        scratch = Path(self.config.backup_root)
+        scratch.mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
-            prefix="minicode-restore-drill-"
+            prefix=".restore-drill-", dir=_io_path(scratch)
         ) as temporary_dir:
             restored = self.restore_local_backup(backup, target_directory=temporary_dir)
-            database = restored / "state.db"
+            manifest = json.loads((restored / 'manifest.json').read_text(encoding='utf-8'))
+            database = restored / manifest.get('database_path', 'state.db')
             connection = sqlite3.connect(database)
             try:
                 events = connection.execute(

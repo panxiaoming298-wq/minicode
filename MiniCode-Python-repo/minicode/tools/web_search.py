@@ -2,15 +2,32 @@ from __future__ import annotations
 
 import html as html_module
 import re
-import urllib.error
+import threading
+import time
 import urllib.parse
-import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import UTC, datetime
+from html.parser import HTMLParser
 from xml.etree import ElementTree
 
 from minicode.tooling import ToolDefinition, ToolResult
+from minicode.tools._validation import validate_contract
+from minicode.web_transport import WebRequestError, request_scope, request_text
 
 MAX_RESULTS = 10
-_USER_AGENT = "MiniCode-Python/0.5.0 (local coding assistant)"
+WEB_SEARCH_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "query": {"type": "string", "minLength": 1, "description": "The nonblank search query"},
+        "num_results": {"type": "integer", "minimum": 1, "maximum": MAX_RESULTS, "default": 5,
+                        "description": "Number of results to return (integer 1-10, default: 5)"},
+        "domains": {"type": "array", "maxItems": 5, "items": {"type": "string", "minLength": 1},
+                    "description": "Optional source domains, e.g. docs.python.org; includes their subdomains"},
+        "freshness": {"type": "string", "enum": ["any", "day", "week", "month", "year"], "default": "any",
+                      "description": "Optional publication-age filter; use any for historical questions"},
+    },
+    "required": ["query"],
+}
 _NEWS_QUERY_MARKERS = (
     "近况",
     "最新",
@@ -21,10 +38,8 @@ _NEWS_QUERY_MARKERS = (
     "实时",
     "today",
     "latest",
-    "current",
     "recent",
     "news",
-    "update",
 )
 _SCHEDULE_QUERY_MARKERS = (
     "下一场",
@@ -36,16 +51,7 @@ _SCHEDULE_QUERY_MARKERS = (
     "calendar",
     "next race",
     "race date",
-    "grand prix",
     "fixture",
-)
-_CRISTIANO_QUERY_MARKERS = ("c罗", "cristiano", "克里斯蒂亚诺")
-_CRISTIANO_RESULT_ALIASES = (
-    "c罗",
-    "cristiano",
-    "ronaldo",
-    "克里斯蒂亚诺",
-    "罗纳尔多",
 )
 _LOW_VALUE_CURRENT_RESULT_MARKERS = (
     "高德地图",
@@ -161,6 +167,8 @@ _SHORT_ENTITY_TERMS = {
 }
 _TERM_ALIASES = {
     "f1": ("f1", "formula 1", "formula one"),
+    "c罗": ("c罗", "cristiano", "克里斯蒂亚诺"),
+    "cristiano": ("cristiano", "c罗", "克里斯蒂亚诺"),
 }
 _CONTEXT_TERM_ALIASES = {
     "calendar": ("calendar", "schedule", "赛程", "日程"),
@@ -171,29 +179,8 @@ _CONTEXT_TERM_ALIASES = {
     "schedule": ("schedule", "calendar", "赛程", "日程"),
     "upcoming": ("upcoming", "next", "下一", "预约"),
 }
-_HIGH_CONFIDENCE_SOURCE_MARKERS = (
-    "associated press",
-    "apnews.com",
-    "reuters",
-    "bbc",
-    "cnn",
-    "espn",
-    "fox sports",
-    "sports illustrated",
-    "usa today",
-    "the guardian",
-    "yahoo sports",
-    "sky sports",
-    "the athletic",
-    "fifa",
-    "uefa",
-    "formula1.com",
-    "fia.com",
-    "新华社",
-    "央视",
-    "新浪体育",
-    "懂球帝",
-)
+_REFERENCE_DOMAINS = ("apnews.com", "reuters.com", "bbc.com", "bbc.co.uk", "espn.com",
+    "theguardian.com", "fifa.com", "uefa.com", "formula1.com", "fia.com", "python.org")
 
 
 class _SearchProviderError(RuntimeError):
@@ -201,35 +188,32 @@ class _SearchProviderError(RuntimeError):
 
 
 def _validate(input_data: dict) -> dict:
-    query = input_data.get("query")
-    if not isinstance(query, str) or not query.strip():
-        raise ValueError("query is required and must be non-empty")
-    num_results = int(input_data.get("num_results", 5))
-    if num_results < 1 or num_results > MAX_RESULTS:
-        raise ValueError(f"num_results must be between 1 and {MAX_RESULTS}")
-    return {"query": query.strip(), "num_results": num_results}
+    validate_contract(input_data, WEB_SEARCH_INPUT)
+    query = input_data["query"]
+    if not query.strip():
+        raise ValueError("$.query: must be nonblank")
+    num_results = input_data.get("num_results", 5)
+    domains = []
+    for domain in input_data.get("domains", []):
+        host = domain.strip().lower().rstrip(".")
+        try:
+            host = host.encode("idna").decode("ascii")
+        except UnicodeError as error:
+            raise ValueError("$.domains: expected a domain name") from error
+        if not re.fullmatch(r"(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,63}", host):
+            raise ValueError("$.domains: use bare domain names without paths, ports or credentials")
+        if host not in domains:
+            domains.append(host)
+    return {"query": query.strip(), "num_results": num_results,
+            "domains": domains, "freshness": input_data.get("freshness", "any")}
 
 
 MAX_SEARCH_RESPONSE_BYTES = 2_000_000
 
 
 def _request_text(url: str, *, accept: str, timeout: int = 15) -> str:
-    from minicode.tools.web_fetch import _LimitedRedirectHandler, _build_safe_opener, _is_safe_url
-
-    safe, reason = _is_safe_url(url)
-    if not safe:
-        raise _SearchProviderError(reason)
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": _USER_AGENT, "Accept": accept},
-    )
-    with _build_safe_opener(_LimitedRedirectHandler()).open(request, timeout=timeout) as response:
-        payload = response.read(MAX_SEARCH_RESPONSE_BYTES + 1)
-        if len(payload) > MAX_SEARCH_RESPONSE_BYTES:
-            raise _SearchProviderError(
-                f"Search provider response exceeded {MAX_SEARCH_RESPONSE_BYTES} bytes"
-            )
-        return payload.decode("utf-8", errors="replace")
+    return request_text(url, headers={"Accept": accept}, timeout=min(timeout, 10),
+                        max_bytes=MAX_SEARCH_RESPONSE_BYTES)
 
 
 def _clean_markup(value: str, limit: int = 240) -> str:
@@ -239,55 +223,22 @@ def _clean_markup(value: str, limit: int = 240) -> str:
 
 
 def _is_news_query(query: str) -> bool:
-    lowered = query.casefold()
-    return any(marker in lowered for marker in _NEWS_QUERY_MARKERS)
+    return _has_markers(query, _NEWS_QUERY_MARKERS)
 
 
 def _is_schedule_query(query: str) -> bool:
+    return _has_markers(query, _SCHEDULE_QUERY_MARKERS)
+
+
+def _has_markers(query: str, markers: tuple[str, ...]) -> bool:
     lowered = query.casefold()
-    return any(marker in lowered for marker in _SCHEDULE_QUERY_MARKERS)
-
-
-def _canonical_news_query(query: str) -> str:
-    """Add an unambiguous football context for Cristiano Ronaldo news lookups."""
-
-    lowered = query.casefold()
-    is_cristiano_query = any(marker in lowered for marker in _CRISTIANO_QUERY_MARKERS)
-    if not is_cristiano_query:
-        return query
-
-    normalized = re.sub(r"c罗", "Cristiano Ronaldo", query, flags=re.IGNORECASE)
-    normalized = re.sub(
-        r"克里斯蒂亚诺(?:[·\s]*罗纳尔多)?",
-        "Cristiano Ronaldo",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    normalized = re.sub(
-        r"\bcristiano(?:\s+ronaldo)?\b",
-        "Cristiano Ronaldo",
-        normalized,
-        flags=re.IGNORECASE,
-    )
-    for marker in _NEWS_QUERY_MARKERS:
-        normalized = re.sub(re.escape(marker), " ", normalized, flags=re.IGNORECASE)
-    normalized = " ".join(normalized.split())
-    context = normalized.casefold()
-    additions: list[str] = []
-    if not any(marker in context for marker in ("al nassr", "al-nassr", "利雅得胜利")):
-        additions.append("Al Nassr")
-    if not any(marker in context for marker in ("portugal", "葡萄牙")):
-        additions.append("Portugal")
-    if not any(marker in context for marker in ("football", "soccer", "足球")):
-        additions.append("football")
-    return " ".join([normalized, *additions]).strip()
+    return any(re.search(r"\b" + re.escape(marker) + r"\b", lowered) if marker.isascii()
+               else marker in lowered for marker in markers)
 
 
 def _provider_query(query: str) -> str:
-    if _is_news_query(query):
-        return _canonical_news_query(query)
-    if _is_schedule_query(query) and "official" not in query.casefold():
-        return f"{query} official"
+    # Preserve the question. Adding a club, country or "official" silently
+    # changes historical and general queries; intent controls guidance only.
     return query
 
 
@@ -295,8 +246,9 @@ def _subject_terms(query: str) -> list[str]:
     """Extract distinct entity/topic terms, retaining short names such as F1."""
 
     lowered = query.casefold()
+    lowered = re.sub(r"\bsite:\S+|\bwhen:\S+|(?<!\S)-\S+", " ", lowered)
     for marker in sorted((*_NEWS_QUERY_MARKERS, *_QUERY_WEAK_PHRASES), key=len, reverse=True):
-        lowered = lowered.replace(marker, " ")
+        lowered = re.sub(r"\b" + re.escape(marker) + r"\b", " ", lowered) if marker.isascii() else lowered.replace(marker, " ")
     candidates = re.findall(r"[a-z0-9][a-z0-9+._-]+|[\u3400-\u9fff]{2,}", lowered)
     terms: list[str] = []
     if "c罗" in query.casefold():
@@ -377,9 +329,9 @@ def _context_term_matches(term: str, normalized_text: str) -> bool:
     return False
 
 
-def _source_authority_score(raw_searchable: str) -> int:
-    lowered = raw_searchable.casefold()
-    return 2 if any(marker in lowered for marker in _HIGH_CONFIDENCE_SOURCE_MARKERS) else 0
+def _source_authority_score(url: str) -> int:
+    hostname = (urllib.parse.urlsplit(url).hostname or "").casefold()
+    return 2 if any(hostname == host or hostname.endswith("." + host) for host in _REFERENCE_DOMAINS) else 0
 
 
 def _is_entity_anchor(term: str) -> bool:
@@ -391,14 +343,12 @@ def _is_entity_anchor(term: str) -> bool:
 
 
 def _overall_relevance(results: list[dict[str, str]]) -> str:
-    return "strong" if any(result.get("_relevance") == "strong" for result in results) else "moderate"
+    return "strong" if results and all(result.get("_relevance") == "strong" for result in results) else "moderate"
 
 
 def _filter_relevant_results(query: str, results: list[dict[str, str]]) -> list[dict[str, str]]:
     """Require entity/topic overlap instead of accepting a shared year or intent word."""
 
-    lowered_query = query.casefold()
-    require_cristiano = any(marker in lowered_query for marker in _CRISTIANO_QUERY_MARKERS)
     subject_terms = _subject_terms(query)
     context_terms = _context_terms(query)
     quoted_phrases = _quoted_phrases(query)
@@ -413,9 +363,7 @@ def _filter_relevant_results(query: str, results: list[dict[str, str]]) -> list[
         )
         searchable = raw_searchable.casefold()
         normalized_searchable = _normalize_search_text(raw_searchable)
-        if require_cristiano and not any(alias in searchable for alias in _CRISTIANO_RESULT_ALIASES):
-            continue
-        if quoted_phrases and not any(phrase in normalized_searchable for phrase in quoted_phrases):
+        if quoted_phrases and not all(phrase in normalized_searchable for phrase in quoted_phrases):
             continue
         if (
             time_sensitive_intent
@@ -428,20 +376,21 @@ def _filter_relevant_results(query: str, results: list[dict[str, str]]) -> list[
             term for term in context_terms if _context_term_matches(term, normalized_searchable)
         ]
         matched_anchors = [term for term in entity_anchors if term in matched_terms]
-        if require_cristiano:
-            relevance = "strong"
-            if not matched_terms:
-                matched_terms = ["Cristiano Ronaldo"]
-        elif entity_anchors:
+        if entity_anchors:
             if not matched_anchors:
                 continue
-            relevance = "strong"
+            # F1 or a person's name alone is a lead, not evidence for all the
+            # other entities in a multi-part question.
+            if len(subject_terms) > 1 and len(matched_terms) < min(2, len(subject_terms)):
+                relevance = "moderate"
+            else:
+                relevance = "strong" if len(matched_terms) / len(subject_terms) >= 0.6 else "moderate"
         elif len(subject_terms) == 1:
             if not matched_terms:
                 continue
             relevance = "strong"
         elif subject_terms:
-            required_matches = 2 if len(subject_terms) <= 5 else 3
+            required_matches = 2
             if len(matched_terms) < required_matches:
                 continue
             relevance = (
@@ -453,12 +402,24 @@ def _filter_relevant_results(query: str, results: list[dict[str, str]]) -> list[
             # A query made only of dates/intent words is too ambiguous to certify.
             continue
 
+        if _is_schedule_query(query) and not matched_context_terms:
+            relevance = "moderate"
+        from minicode.web_http import _is_safe_url
+        if not _is_safe_url(str(result.get("url", "")))[0]:
+            continue
+
+        # Keep source text inside its field: embedded newlines must not become
+        # tool metadata, and verbose API snippets must not consume the context.
         annotated = dict(result)
+        for field, limit in (("title", 250), ("snippet", 1500), ("source", 100), ("published", 100)):
+            if field in annotated:
+                annotated[field] = _clean_markup(str(annotated[field]), limit)
         annotated["_relevance"] = relevance
         annotated["_matched_terms"] = ", ".join(matched_terms)
         annotated["_matched_context_terms"] = ", ".join(matched_context_terms)
         annotated["_ranking_score"] = str(
-            len(matched_context_terms) * 2 + _source_authority_score(raw_searchable)
+            len(matched_context_terms) * 2 + len(matched_terms) * 3
+            + _source_authority_score(result.get("source_url") or result.get("url", ""))
         )
         filtered.append(annotated)
     filtered.sort(
@@ -471,22 +432,17 @@ def _filter_relevant_results(query: str, results: list[dict[str, str]]) -> list[
     return filtered
 
 
-def _has_cross_source_dated_evidence(results: list[dict[str, str]]) -> bool:
-    dated_results = [result for result in results if result.get("published") and result.get("source")]
-    sources = {result["source"].casefold().strip() for result in dated_results}
-    trusted = any(
-        marker in f"{result.get('source', '')} {result.get('title', '')}".casefold()
-        for result in dated_results
-        for marker in _HIGH_CONFIDENCE_SOURCE_MARKERS
-    )
-    return len(dated_results) >= 3 and len(sources) >= 2 and trusted
-
-
-def _search_google_news_rss(query: str, max_results: int) -> list[dict[str, str]]:
+def _search_google_news_rss(query: str, max_results: int, *, freshness: str = "any") -> list[dict[str, str]]:
     is_chinese = bool(re.search(r"[\u3400-\u9fff]", query))
     locale = "hl=zh-CN&gl=CN&ceid=CN:zh-Hans" if is_chinese else "hl=en-US&gl=US&ceid=US:en"
+    if freshness != "any":
+        query += " when:" + {"day": "1d", "week": "7d", "month": "30d", "year": "1y"}[freshness]
     url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(query) + "&" + locale
     payload = _request_text(url, accept="application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8")
+    return _parse_google_news_rss(payload, max_results)
+
+
+def _parse_google_news_rss(payload: str, max_results: int) -> list[dict[str, str]]:
     try:
         root = ElementTree.fromstring(payload)
     except ElementTree.ParseError as error:
@@ -506,6 +462,8 @@ def _search_google_news_rss(query: str, max_results: int) -> list[dict[str, str]
                 result["source"] = source
             if published:
                 result["published"] = published
+            if source_node is not None and source_node.get("url"):
+                result["source_url"] = source_node.get("url", "")
             results.append(result)
         if len(results) >= max_results:
             break
@@ -517,6 +475,10 @@ def _search_google_news_rss(query: str, max_results: int) -> list[dict[str, str]
 def _search_bing_rss(query: str, max_results: int) -> list[dict[str, str]]:
     url = "https://www.bing.com/search?format=rss&q=" + urllib.parse.quote(query)
     payload = _request_text(url, accept="application/rss+xml,application/xml,text/xml;q=0.9,*/*;q=0.8")
+    return _parse_bing_rss(payload, max_results)
+
+
+def _parse_bing_rss(payload: str, max_results: int) -> list[dict[str, str]]:
     try:
         root = ElementTree.fromstring(payload)
     except ElementTree.ParseError as error:
@@ -553,29 +515,52 @@ def _unwrap_duckduckgo_url(value: str) -> str:
 def _parse_duckduckgo_results(payload: str, max_results: int) -> list[dict[str, str]]:
     """Parse DuckDuckGo's HTML result page when it is actually available."""
 
-    results: list[dict[str, str]] = []
-    result_pattern = re.compile(
-        r'<a[^>]*class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>.*?'
-        r'<a[^>]*class="result__snippet"[^>]*>(.*?)</a>',
-        re.DOTALL,
-    )
-    for match in result_pattern.finditer(payload):
-        url = _unwrap_duckduckgo_url(match.group(1))
-        title = _clean_markup(match.group(2), 200)
-        snippet = _clean_markup(match.group(3))
-        if url.startswith(("http://", "https://")) and title:
-            results.append({"title": title, "url": url, "snippet": snippet})
-        if len(results) >= max_results:
-            break
-    return results
+    class Results(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.results = []
+            self.current = None
+            self.field = ""
+            self.depth = 0
+
+        def handle_starttag(self, tag, attrs):
+            attributes = dict(attrs)
+            classes = (attributes.get("class") or "").split()
+            if tag == "a" and "result__a" in classes:
+                self.current = {"url": _unwrap_duckduckgo_url(attributes.get("href") or ""), "title": "", "snippet": ""}
+                self.results.append(self.current)
+                self.field, self.depth = "title", 1
+            elif "result__snippet" in classes and self.current is not None:
+                self.field, self.depth = "snippet", 1
+            elif self.field and tag not in {"br", "img", "input", "meta", "link", "hr", "wbr"}:
+                self.depth += 1
+
+        def handle_endtag(self, tag):
+            if self.field:
+                self.depth -= 1
+                if self.depth <= 0:
+                    self.field = ""
+
+        def handle_data(self, text):
+            if self.field and self.current is not None:
+                self.current[self.field] += text + " "
+
+    parser = Results()
+    parser.feed(payload)
+    parser.close()
+    return [{"url": item["url"], "title": _clean_markup(item["title"], 250),
+             "snippet": _clean_markup(item["snippet"], 1000)}
+            for item in parser.results if item["title"].strip() and item["url"].startswith(("http://", "https://"))][:max_results]
 
 
-def _search_duckduckgo(query: str, max_results: int) -> list[dict[str, str]]:
+def _search_duckduckgo(query: str, max_results: int, *, freshness: str = "any") -> list[dict[str, str]]:
     url = "https://html.duckduckgo.com/html/?q=" + urllib.parse.quote(query)
+    if freshness != "any":
+        url += "&df=" + {"day": "d", "week": "w", "month": "m", "year": "y"}[freshness]
     payload = _request_text(url, accept="text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
     lowered = payload.lower()
     if "complete the following challenge" in lowered or "select all squares containing a duck" in lowered:
-        raise _SearchProviderError("DuckDuckGo 要求人机验证")
+        raise WebRequestError("human_verification", "DuckDuckGo 要求人机验证")
     results = _parse_duckduckgo_results(payload, max_results)
     if not results:
         raise _SearchProviderError("DuckDuckGo 没有返回可用结果")
@@ -617,6 +602,12 @@ def _format_results(
         lines.extend([f"{index}. {result['title']}", f"   URL: {result['url']}"])
         if result.get("source"):
             lines.append(f"   Source: {result['source']}")
+        if result.get("source_url"):
+            lines.append(f"   Source homepage: {result['source_url']}")
+        if result.get("_provider"):
+            lines.append(f"   Search provider: {result['_provider']}")
+        if result.get("_relevance"):
+            lines.append(f"   Relevance: {result['_relevance']}")
         if result.get("published"):
             lines.append(f"   Published: {result['published']}")
         if result.get("_matched_terms"):
@@ -629,14 +620,15 @@ def _format_results(
         lines.append(f"Irrelevant results discarded: {filtered_out}")
     if provider == "Bing RSS" and any(result.get("published") for result in results):
         lines.append("DATE_NOTE: Bing RSS dates can be indexing dates; verify event dates in the page body.")
+    lines.append("EVIDENCE_LEVEL: search leads; relevance is not factual verification or proof of freshness.")
+    if "Google News RSS" in provider:
+        lines.append("SOURCE_NOTE: Google News links are aggregator redirects, not original article bodies. "
+                     "Use the named publisher/title to locate original text if a redirect is unreadable.")
     if _is_news_query(query):
-        if _has_cross_source_dated_evidence(results):
-            lines.append("EVIDENCE_READY: cross-source dated news results")
         lines.extend(
             [
                 "SEARCH_GUIDANCE: This is a current/news query. Treat snippets as leads, not final proof.",
-                "If EVIDENCE_READY is present, answer from the named, dated headlines and label headline-level details.",
-                "Otherwise fetch the strongest source first; expand to 2-3 sources only for missing or conflicting facts.",
+                "Fetch the strongest source first; expand to 2-3 sources for missing or conflicting facts.",
                 "Do not repeat equivalent searches.",
             ]
         )
@@ -647,89 +639,176 @@ def _format_results(
                 "Fetch the strongest result once and answer if its page contains the event date/time; search again only on conflict.",
             ]
         )
+    else:
+        lines.append("SEARCH_GUIDANCE: Read the strongest original source with web_fetch before asserting details. "
+                     "For historical queries distinguish article publication dates from event dates.")
     return "\n".join(lines)
 
 
 def _run(input_data: dict, context) -> ToolResult:
+    from minicode.tools._web_search_api import providers as api_providers
+    from minicode.tools._web_search_api import settings
+
     query = input_data["query"]
     num_results = input_data["num_results"]
-    failures: list[str] = []
+    domains = input_data.get("domains", [])
+    freshness = input_data.get("freshness", "any")
+    try:
+        config = settings(getattr(context, "_runtime", None))
+    except WebRequestError as error:
+        return ToolResult(ok=False, failureKind="invalid_input", output=f"WEB_SEARCH_CONFIG_ERROR\n{error}")
+
+    deadline = time.monotonic() + 25
+    stop = threading.Event()
+    parent_cancel = getattr(context, "cancellation_event", None)
+
+    class Cancellation:
+        def is_set(self):
+            return stop.is_set() or parent_cancel is not None and parent_cancel.is_set()
+
+    cancellation = Cancellation()
+    diagnostics: list[str] = []
+    candidates: list[dict[str, str]] = []
     provider_query = _provider_query(query)
+    # Public sources receive explicit source restrictions, but topic terms and
+    # years remain intact. API adapters have native domain/freshness controls.
+    public_query = provider_query + (" (" + " OR ".join("site:" + domain for domain in domains) + ")" if domains else "")
+    site_domains, excluded_domains = _query_domain_filters(query)
+    required_domains = domains or site_domains
 
-    providers = (
-        (
-            ("Google News RSS", _search_google_news_rss),
-            ("Bing RSS", _search_bing_rss),
-            ("DuckDuckGo HTML", _search_duckduckgo),
-        )
-        if _is_news_query(query)
-        else (
-            ("Bing RSS", _search_bing_rss),
-            ("DuckDuckGo HTML", _search_duckduckgo),
-        )
-    )
-    best_moderate_result: ToolResult | None = None
-    for provider_name, provider in providers:
+    def search(provider_name, provider, sent_query, group_cancel):
+        started = time.monotonic()
         try:
-            results = provider(provider_query, num_results)
+            with request_scope(deadline, group_cancel):
+                results = provider(sent_query, min(20, max(10, num_results * 2)))
             relevant_results = _filter_relevant_results(query, results)
-            if not relevant_results:
-                raise _SearchProviderError(f"{provider_name} 返回的结果与查询主题无关")
-            candidate = ToolResult(
-                ok=True,
-                output=_format_results(
-                    query,
-                    provider_name,
-                    relevant_results,
-                    filtered_out=len(results) - len(relevant_results),
-                    provider_query=provider_query,
-                ),
-            )
-            if _overall_relevance(relevant_results) == "strong":
-                return candidate
-            if best_moderate_result is None:
-                best_moderate_result = candidate
-        except (urllib.error.URLError, TimeoutError, _SearchProviderError) as error:
-            failures.append(f"- {provider_name}: {_short_error(error)}")
-        except Exception as error:  # noqa: BLE001 - isolate one public provider from the next
-            failures.append(f"- {provider_name}: {_short_error(error)}")
+            relevant_results = [item for item in relevant_results if _matches_domains(item, required_domains)
+                                and not (excluded_domains and _matches_domains(item, excluded_domains))]
+            for item in relevant_results:
+                item["_provider"] = provider_name
+            status = "ok" if relevant_results else "irrelevant_results" if results else "no_results"
+            return relevant_results, f"- {provider_name}: {status}; received={len(results)}, accepted={len(relevant_results)}; {time.monotonic()-started:.2f}s"
+        except Exception as error:  # noqa: BLE001 - isolate provider failures so other sources remain available
+            code = getattr(error, "code", "provider_error")
+            return [], f"- {provider_name}: {code}; {_short_error(error)}; {time.monotonic()-started:.2f}s"
 
-    if best_moderate_result is not None:
-        return best_moderate_result
+    def collect(group, sent_query):
+        # Each live request owns a killable process. Stop signals are observed
+        # before shutdown(wait=True), so no HTTP work survives this tool.
+        group_stop = threading.Event()
+        class GroupCancellation:
+            def is_set(self):
+                return cancellation.is_set() or group_stop.is_set()
+        with ThreadPoolExecutor(max_workers=min(3, len(group)), thread_name_prefix="minicode-search") as pool:
+            futures = [pool.submit(search, name, provider, sent_query, GroupCancellation()) for name, provider in group]
+            for future in as_completed(futures):
+                found, diagnostic = future.result()
+                candidates.extend(found)
+                if not (group_stop.is_set() and ": canceled;" in diagnostic):
+                    diagnostics.append(diagnostic)
+                merged_so_far = _merge_results(candidates, num_results)
+                if len(merged_so_far) >= num_results:
+                    group_stop.set()
 
-    return ToolResult(
-        ok=False,
-        output="\n".join(
-            [
-                "WEB_SEARCH_UNAVAILABLE",
-                "联网搜索暂时不可用：公共搜索入口没有返回可用结果。",
-                *failures,
-                "建议：稍后重试，换一个更具体的关键词，或用 web_fetch 读取已知网址。",
-                f"QUERY: {query}",
-            ]
-        ),
-    )
+    try:
+        for provider in api_providers(config, domains=domains, freshness=freshness, news=_is_news_query(query)):
+            collect([provider], provider_query)
+            if len(_merge_results(candidates, num_results)) >= min(3, num_results):
+                break
+            if cancellation.is_set() or time.monotonic() >= deadline:
+                break
+        if len(_merge_results(candidates, num_results)) < min(3, num_results) and not cancellation.is_set():
+            news_provider = ("Google News RSS", _search_google_news_rss if freshness == "any" else
+                lambda q, n: _search_google_news_rss(q, n, freshness=freshness))
+            duck_provider = ("DuckDuckGo HTML", _search_duckduckgo if freshness == "any" else
+                lambda q, n: _search_duckduckgo(q, n, freshness=freshness))
+            historical = any(int(year) < datetime.now(UTC).year for year in re.findall(r"\b(?:19|20)\d{2}\b", query))
+            prefer_news = _is_news_query(query) or historical or freshness != "any"
+            if prefer_news:
+                collect([news_provider], public_query)
+            if not candidates or (_overall_relevance(candidates) != "strong"
+                                  and len(_merge_results(candidates, num_results)) < min(3, num_results)):
+                public = [duck_provider] if freshness != "any" else [("Bing RSS", _search_bing_rss), duck_provider]
+                if time.monotonic() < deadline and not cancellation.is_set():
+                    collect(public, public_query)
+            # A news index can also supply schedule announcements when general
+            # indexes are unavailable; keep the query and label these as leads.
+            if (not candidates and _is_schedule_query(query) and not prefer_news
+                    and time.monotonic() < deadline and not cancellation.is_set()):
+                collect([news_provider], public_query)
+    finally:
+        stop.set()
+
+    if parent_cancel is not None and parent_cancel.is_set():
+        return ToolResult(ok=False, failureKind="canceled", output="Canceled: parent Runtime canceled this tool call")
+    merged = _merge_results(candidates, num_results)
+    if merged:
+        names = list(dict.fromkeys(item["_provider"] for item in merged))
+        output = _format_results(query, ", ".join(names), merged, provider_query=provider_query)
+        if "Bing RSS" in names:
+            output += "\nDATE_NOTE: Bing RSS dates may be indexing dates, not publication or event dates."
+        output += "\nFRESHNESS_REQUESTED: " + freshness
+        output += "\nPROVIDER_DIAGNOSTICS:\n" + "\n".join(diagnostics)
+        return ToolResult(ok=True, output=output)
+    return ToolResult(ok=False, failureKind="remote_rejected", output="\n".join([
+        "WEB_SEARCH_UNAVAILABLE", "联网搜索已结束，但没有取得符合查询条件的可用结果。",
+        *diagnostics,
+        ("NEXT_ACTION: Read a known original URL with web_fetch, or configure a search API. "
+        "Do not repeat the identical search or treat model-generated links as retrieved sources."),
+        "CONFIGURATION: MINI_CODE_SEARCH_PROVIDER=auto|public|brave|tavily; BRAVE_SEARCH_API_KEY or TAVILY_API_KEY.",
+        "NETWORK: MINI_CODE_WEB_PROXY=auto (system proxy), direct, or an HTTP proxy URL.",
+        f"QUERY: {query}",
+    ]))
+
+
+def _matches_domains(result: dict[str, str], domains: list[str]) -> bool:
+    host = (urllib.parse.urlsplit(result.get("source_url") or result["url"]).hostname or "").lower().rstrip(".")
+    return not domains or any(host == domain.lower() or host.endswith("." + domain.lower()) for domain in domains)
+
+
+def _query_domain_filters(query: str) -> tuple[list[str], list[str]]:
+    included, excluded = [], []
+    for match in re.finditer(r"(?<![\w-])(-?)site:([a-zA-Z0-9.-]+)", query, re.IGNORECASE):
+        (excluded if match[1] else included).append(match[2].lower().rstrip("."))
+    return included, excluded
+
+
+def _canonical_url(url: str) -> str:
+    parsed = urllib.parse.urlsplit(url)
+    parameters = [(key, value) for key, value in urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
+                  if not key.casefold().startswith("utm_") and key.casefold() not in {"gclid", "fbclid"}]
+    return urllib.parse.urlunsplit((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path or "/",
+                                   urllib.parse.urlencode(sorted(parameters)), ""))
+
+
+def _merge_results(results: list[dict[str, str]], limit: int) -> list[dict[str, str]]:
+    ordered = sorted(results, key=lambda item: (item.get("_relevance") == "strong",
+        int(item.get("_ranking_score", "0"))), reverse=True)
+    unique = {}
+    for item in ordered:
+        unique.setdefault(_canonical_url(item["url"]), item)
+    selected, deferred, counts = [], [], {}
+    for item in unique.values():
+        host = urllib.parse.urlsplit(item.get("source_url") or item["url"]).hostname or ""
+        count = counts.get(host, 0)
+        (selected if count < 2 else deferred).append(item)
+        counts[host] = count + 1
+    return (selected + deferred)[:limit]
 
 
 web_search_tool = ToolDefinition(
     name="web_search",
     description=(
-        "Search the public web through multiple no-key providers and return topic-matched titles, URLs, snippets, "
+        "Search the web using configured official search APIs with public-source fallback; return source titles, URLs, snippets, "
         "sources, publication dates, and an explicit relevance strength. Short entities such as F1 are preserved, "
         "while years and generic date words cannot make an unrelated result pass. Current/news queries prefer "
-        "Google News RSS; schedule queries prefer official results. For a simple lookup, search once, fetch the "
+        "Google News RSS. Optional domains and freshness restrict sources. A topic match is only a lead, not verified evidence. "
+        "The query is preserved, including historical dates. For a simple lookup, search once, fetch the "
         "strongest source, and answer when the requested fact is present instead of repeating equivalent searches. "
         "This is a network-backed capability: a registered tool can still be unavailable because of "
         "connectivity, provider rate limits, or human-verification pages."
     ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "query": {"type": "string", "description": "The search query"},
-            "num_results": {"type": "number", "description": "Number of results to return (1-10, default: 5)"},
-        },
-        "required": ["query"],
-    },
+    input_schema=WEB_SEARCH_INPUT,
     validator=_validate,
     run=_run,
 )

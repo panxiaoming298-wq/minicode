@@ -1,4 +1,4 @@
-"""Edit file tool with precise string matching, inspired by Claude Code's Edit tool.
+﻿"""Edit file tool with precise string matching, inspired by Claude Code's Edit tool.
 
 Key features:
 - Exact string match with line/whitespace-aware comparison
@@ -14,6 +14,7 @@ import difflib
 from minicode.file_review import apply_reviewed_file_change, load_existing_file
 from minicode.tooling import ToolDefinition, ToolResult
 from minicode.workspace import resolve_tool_path
+from minicode.tools._validation import normalize_aliases, validate_contract
 
 
 # ---------------------------------------------------------------------------
@@ -70,6 +71,14 @@ def _find_exact_match(content: str, search: str, fuzzy: bool = False) -> list[tu
     return results
 
 
+def _describe_indentation(indent: str) -> str:
+    if not indent:
+        return "no leading whitespace"
+    return ", ".join(f"{count} {label}{'s' if count != 1 else ''}"
+                     for char, label in ((" ", "space"), ("\t", "tab"))
+                     if (count := indent.count(char)))
+
+
 def _format_mismatch_diagnostic(content: str, search: str) -> str:
     """Produce a helpful diagnostic when search string is not found.
     
@@ -78,9 +87,13 @@ def _format_mismatch_diagnostic(content: str, search: str) -> str:
     search_lines = search.split("\n")
     content_lines = content.split("\n")
     
-    # Find the best matching region using difflib
-    best_ratio = 0.0
+    # Ignore indentation ONLY when ranking diagnostic candidates. Actual edits
+    # still use _find_exact_match, including its original whitespace rules.
+    search_text = [line.strip() for line in search_lines]
+    content_text = [line.strip() for line in content_lines]
+    best_score = (0.0, 0.0)
     best_start = -1
+    alternatives = []
     
     # Search in a sliding window
     window_size = len(search_lines)
@@ -88,16 +101,26 @@ def _format_mismatch_diagnostic(content: str, search: str) -> str:
         window = content_lines[i:i + window_size]
         if len(window) != window_size:
             continue
-        ratio = difflib.SequenceMatcher(None, window, search_lines).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
+        text_ratio = difflib.SequenceMatcher(
+            None, content_text[i:i + window_size], search_text, autojunk=False,
+        ).ratio() if any(search_text) else 0.0
+        exact_ratio = difflib.SequenceMatcher(None, window, search_lines, autojunk=False).ratio()
+        score = (text_ratio, exact_ratio)
+        if score > best_score:
+            best_score = score
             best_start = i
+            alternatives = []
+        elif score == best_score and best_start >= 0 and len(alternatives) < 3:
+            alternatives.append(i + 1)
     
     lines = ["Search string not found in file."]
     
-    if best_start >= 0 and best_ratio > 0.3:
+    if best_start >= 0 and best_score[0] > 0.3:
         lines.append("")
-        lines.append(f"Closest match at line {best_start + 1} (similarity: {best_ratio:.0%}):")
+        lines.append(f"Closest text at line {best_start + 1} (ignoring surrounding whitespace for diagnosis only):")
+        if alternatives:
+            lines.append("Other equally close regions start at lines: " + ", ".join(map(str, alternatives))
+                         + ". Read more context to identify the intended location.")
         lines.append("")
         
         # Show the closest match with line numbers
@@ -106,21 +129,21 @@ def _format_mismatch_diagnostic(content: str, search: str) -> str:
             prefix = "  "
             # Check if this line matches the search line
             if j < len(search_lines):
-                norm_content = _normalize_line(line)
-                norm_search = _normalize_line(search_lines[j])
-                if norm_content != norm_search:
+                if line != search_lines[j]:
                     prefix = ">>"
             lines.append(f"{prefix} {line_num:4d} | {line}")
         
         # Show diff hint
-        if best_ratio < 1.0:
-            lines.append("")
-            lines.append("Hints:")
-            search_norm = [_normalize_line(line) for line in search_lines]
-            content_norm = [_normalize_line(line) for line in content_lines[best_start:best_start + window_size]]
-            for j in range(min(len(search_norm), len(content_norm))):
-                if search_norm[j] != content_norm[j]:
-                    lines.append(f"  Line {best_start + 1 + j}: expected {search_norm[j]!r}, found {content_norm[j]!r}")
+        lines.extend(["", "Hints:"])
+        for j, (expected, actual) in enumerate(zip(search_lines, content_lines[best_start:best_start + window_size])):
+            if expected == actual:
+                continue
+            old_indent = expected[:len(expected) - len(expected.lstrip(" \t"))]
+            file_indent = actual[:len(actual) - len(actual.lstrip(" \t"))]
+            if old_indent != file_indent:
+                lines.append(f"  Line {best_start + 1 + j}: indentation mismatch: old has {_describe_indentation(old_indent)}; "
+                             f"file has {_describe_indentation(file_indent)}.")
+            lines.append(f"  Line {best_start + 1 + j}: old={expected!r}; file={actual!r}")
     else:
         # No close match found, show first few lines of file for context
         lines.append("")
@@ -128,22 +151,20 @@ def _format_mismatch_diagnostic(content: str, search: str) -> str:
         for i, line in enumerate(content_lines[:10]):
             lines.append(f"  {i + 1:4d} | {line}")
     
+    lines.extend(["", "No changes were made. Read the intended region and copy its exact text into old, "
+                  "without display line numbers. fuzzy=true normalizes tabs and trailing whitespace only; "
+                  "it does not ignore leading indentation. Do not repeat the unchanged mismatch."])
     return "\n".join(lines)
 
 
 def _validate(input_data: dict) -> dict:
+    input_data = normalize_aliases(input_data, {"search": "old", "replace": "new", "replaceAll": "replace_all"})
+    validate_contract(input_data, EDIT_FILE_INPUT)
     path = input_data.get("path")
-    search = input_data.get("search", input_data.get("old"))
-    replace = input_data.get("replace", input_data.get("new"))
-    replace_all = bool(input_data.get("replaceAll", input_data.get("replace_all", False)))
-    fuzzy = bool(input_data.get("fuzzy", False))
-    
-    if not isinstance(path, str) or not path:
-        raise ValueError("path is required")
-    if not isinstance(search, str) or not isinstance(replace, str):
-        raise ValueError("search and replace must be strings")
-    if not search:
-        raise ValueError("search must be non-empty")
+    search = input_data["old"]
+    replace = input_data["new"]
+    replace_all = input_data.get("replace_all", False)
+    fuzzy = input_data.get("fuzzy", False)
     
     # Normalize \r\n → \n so that search/replace strings provided by the
     # model always match the file content (read_text uses universal newlines).
@@ -160,6 +181,11 @@ def _validate(input_data: dict) -> dict:
 
 
 def _run(input_data: dict, context) -> ToolResult:
+    from minicode.tools.write_file import _enforce_read_obligation
+
+    refusal = _enforce_read_obligation(input_data, context)
+    if refusal is not None:
+        return refusal
     target = resolve_tool_path(context, input_data["path"], "write")
     content = load_existing_file(target)
     
@@ -210,24 +236,29 @@ def _run(input_data: dict, context) -> ToolResult:
     return apply_reviewed_file_change(context, input_data["path"], target, next_content)
 
 
+EDIT_FILE_INPUT = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "path": {"type": "string", "minLength": 1, "description": "File path to edit"},
+            "old": {"type": "string", "minLength": 1, "description": "Text to find (exact match required)"},
+            "new": {"type": "string", "description": "Replacement text"},
+            "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"},
+            "fuzzy": {"type": "boolean", "description": "Normalize tabs and trailing whitespace only; leading indentation must still match (default: false)"},
+        },
+        "required": ["path", "old", "new"],
+    }
+
+
 edit_file_tool = ToolDefinition(
     name="edit_file",
     description=(
-        "Replace a substring in a file. The search string must match exactly (including whitespace and indentation). "
-        "If the search string appears multiple times, you must provide more surrounding context to make it unique, "
-        "or set replace_all=true. On mismatch, a diagnostic is shown with the closest match and line numbers."
+        "Replace a substring in a file using path, old and new. The old string must match exactly (including whitespace and indentation). "
+        "If it appears multiple times, provide more surrounding context or set replace_all=true. "
+        "Use JSON booleans true/false, never strings. On mismatch, a diagnostic shows the closest match and line numbers. "
+        "Legacy search/replace/replaceAll names are accepted, but must not conflict with old/new/replace_all."
     ),
-    input_schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "File path to edit"},
-            "old": {"type": "string", "description": "Text to find (exact match required)"},
-            "new": {"type": "string", "description": "Replacement text"},
-            "replace_all": {"type": "boolean", "description": "Replace all occurrences (default: false)"},
-            "fuzzy": {"type": "boolean", "description": "Enable whitespace-fuzzy matching (default: false)"},
-        },
-        "required": ["path", "old", "new"],
-    },
+    input_schema=EDIT_FILE_INPUT,
     validator=_validate,
     run=_run,
 )

@@ -5,7 +5,20 @@ import uuid
 from pathlib import Path
 
 from minicode.tooling import ToolDefinition, ToolContext, ToolResult
+from minicode.tools._validation import validate_contract
 from minicode.workspace import resolve_tool_path
+
+
+BATCH_DELETE_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "path": {"type": "string", "minLength": 1,
+                 "description": "Path to delete (relative to workspace)"},
+        "recursive": {"type": "boolean", "default": False,
+                      "description": "Directories require boolean true. Omit or use false for files; never use a quoted string."},
+    },
+    "required": ["path"],
+}
 
 
 def _remove_copy_path(path: Path) -> None:
@@ -150,9 +163,10 @@ batch_move_tool = ToolDefinition(
 
 def _validate_batch_delete(input_data: dict) -> dict:
     """Validate input for batch_delete tool."""
+    validate_contract(input_data, BATCH_DELETE_INPUT)
     path = input_data.get("path", "")
-    if not isinstance(path, str) or not path.strip():
-        raise ValueError("path is required")
+    if not path.strip():
+        raise ValueError("$.path: must be a nonblank path")
     return {"path": path.strip(), "recursive": input_data.get("recursive", False)}
 
 
@@ -184,14 +198,7 @@ def _run_batch_delete(input_data: dict, context: ToolContext) -> ToolResult:
 batch_delete_tool = ToolDefinition(
     name="batch_delete",
     description="Delete files or directories. Directories require recursive=true.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "path": {"type": "string", "description": "Path to delete (relative to workspace)"},
-            "recursive": {"type": "boolean", "description": "Required to delete directories"}
-        },
-        "required": ["path"]
-    },
+    input_schema=BATCH_DELETE_INPUT,
     validator=_validate_batch_delete,
     run=_run_batch_delete,
 )

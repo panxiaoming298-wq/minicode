@@ -16,7 +16,6 @@ from .models import (
     MemoryHit,
     MemoryRecord,
     MemorySearchRequest,
-    OutboxRecord,
     TaskRetentionPolicy,
     TaskStateSnapshot,
 )
@@ -26,6 +25,10 @@ class AuthorityStore(Protocol):
     def initialize(self) -> None: ...
     def close(self) -> None: ...
     def health_check(self) -> bool: ...
+    def sync_history(self, *, tenant_id: str, task_id: str, stream: str,
+                     messages: Sequence[Mapping[str, Any]]) -> tuple[list[dict], dict[int, Mapping[str, Any]]]: ...
+    def history_migration(self, *, tenant_id: str, task_id: str, stream: str, key: str,
+                          proof: Mapping[str, Any] | None = None) -> dict | None: ...
 
     def ensure_task(
         self,
@@ -76,9 +79,7 @@ class AuthorityStore(Protocol):
         state_patch: Mapping[str, Any] | None = None,
         artifact: ArtifactRecord | None = None,
         memory: MemoryRecord | None = None,
-        outbox: OutboxRecord | None = None,
         memories: Sequence[MemoryRecord] = (),
-        outboxes: Sequence[OutboxRecord] = (),
         decision: DecisionRecord | None = None,
         checkpoint: CheckpointRecord | None = None,
         step_status: str = "",
@@ -86,9 +87,16 @@ class AuthorityStore(Protocol):
     def get_event(
         self, *, tenant_id: str, task_id: str, event_id: str
     ) -> AgentEvent | None: ...
+    def history_event_page(self, *, tenant_id: str, task_id: str, snapshot: int | None = None,
+                           position: int | None = None, recent_first: bool = True, role: str = "",
+                           tool_name: str = "", run_id: str = "", limit: int = 100
+                           ) -> tuple[int, list[tuple[int, AgentEvent]], bool]: ...
     def get_event_by_idempotency(
         self, *, tenant_id: str, task_id: str, idempotency_key: str
     ) -> AgentEvent | None: ...
+    def tool_result_events(
+        self, *, tenant_id: str, task_id: str, call_ids: Sequence[str]
+    ) -> list[AgentEvent]: ...
     def recent_events(
         self,
         *,
@@ -152,7 +160,7 @@ class AuthorityStore(Protocol):
     ) -> None: ...
 
     def put_memory(
-        self, memory: MemoryRecord, *, outbox: OutboxRecord | None = None
+        self, memory: MemoryRecord
     ) -> MemoryRecord: ...
     def get_memories(
         self, *, tenant_id: str, task_id: str, memory_ids: Sequence[str]
@@ -166,32 +174,9 @@ class AuthorityStore(Protocol):
     def all_memories(
         self, *, tenant_id: str | None = None, task_id: str | None = None
     ) -> list[MemoryRecord]: ...
-    def update_memory_indexed(
-        self,
-        *,
-        tenant_id: str,
-        task_id: str,
-        memory_id: str,
-        collection: str,
-        primary_key: str,
-    ) -> None: ...
+    def maintain_memories(self, *, tenant_id: str, task_id: str, now: float) -> dict[str, Any]: ...
+    def touch_memories(self, *, tenant_id: str, task_id: str, memory_ids: Sequence[str], now: float) -> None: ...
 
-    def pending_outbox(
-        self, *, limit: int = 100, now: float | None = None
-    ) -> list[OutboxRecord]: ...
-    def claim_outbox(
-        self,
-        *,
-        limit: int = 1,
-        now: float | None = None,
-        lease_seconds: float = 60.0,
-        index_id: str = "",
-    ) -> list[OutboxRecord]: ...
-    def complete_outbox(self, outbox_id: str, *, claim_token: str) -> None: ...
-    def fail_outbox(
-        self, outbox_id: str, *, claim_token: str, retry_at: float
-    ) -> None: ...
-    def dead_letter_outbox(self, outbox_id: str, *, claim_token: str) -> None: ...
 
     def put_checkpoint(self, checkpoint: CheckpointRecord) -> CheckpointRecord: ...
     def get_checkpoint(
@@ -266,37 +251,6 @@ class ArtifactStore(Protocol):
     def delete(self, artifact: ArtifactRecord) -> None: ...
     def list_objects(self) -> Iterable[tuple[str, float]]: ...
     def health_check(self) -> bool: ...
-    def close(self) -> None: ...
-
-
-class EmbeddingProvider(Protocol):
-    @property
-    def dimension(self) -> int: ...
-    def embed(self, texts: Sequence[str]) -> list[list[float]]: ...
-
-
-class VectorMemoryIndex(Protocol):
-    def upsert(self, records: Sequence[MemoryRecord]) -> None: ...
-    def delete(self, memory_ids: Sequence[str]) -> None: ...
-    def mark_status(self, memory_ids: Sequence[str], status: str) -> None: ...
-    def search(self, request: MemorySearchRequest) -> list[MemoryHit]: ...
-    def get(self, memory_ids: Sequence[str]) -> list[MemoryRecord]: ...
-    def list_ids(
-        self,
-        *,
-        tenant_id: str,
-        task_id: str,
-        statuses: Sequence[str] = (),
-    ) -> set[str]: ...
-    def list_entries(
-        self,
-        *,
-        tenant_id: str,
-        task_id: str,
-        statuses: Sequence[str] = (),
-    ) -> dict[str, str]: ...
-    def health_check(self) -> bool: ...
-    def rebuild(self, records: Iterable[MemoryRecord]) -> int: ...
     def close(self) -> None: ...
 
 

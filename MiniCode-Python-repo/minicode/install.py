@@ -68,6 +68,13 @@ _PROVIDER_INSTALL_DEFAULTS = {
         "base_url": "https://api.openai.com",
         "key_env": "OPENAI_API_KEY",
     },
+    "bailian": {
+        "model": "qwen-plus",
+        "model_env": "MINI_CODE_MODEL",
+        "base_env": "DASHSCOPE_BASE_URL",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "key_env": "DASHSCOPE_API_KEY",
+    },
     "openrouter": {
         "model": "openrouter/auto",
         "model_env": "MINI_CODE_MODEL",

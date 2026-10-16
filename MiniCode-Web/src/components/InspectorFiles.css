@@ -1,0 +1,18 @@
+.files-panel .file-explorer { min-height: 150px; max-height: 38%; flex-basis: 38%; }
+.files-panel.has-open-file .file-explorer { min-height: 140px; max-height: 30%; flex-basis: 30%; }
+.files-panel .file-explorer.is-collapsed { min-height: 44px; max-height: none; flex: 0 0 auto; }
+.files-panel .file-explorer-header { min-height: 44px; gap: 6px; }
+.file-explorer-toggle { display: flex; min-width: 0; min-height: 34px; flex: 1; align-items: center; padding: 4px 0; background: transparent; gap: 7px; text-align: left; }
+.file-explorer-toggle > svg { flex: 0 0 auto; color: var(--muted); }
+.file-explorer-toggle strong { flex: 1; }
+.file-explorer-toggle:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; box-shadow: none; }
+.files-panel .file-tree-row { min-height: 33px; gap: 6px; }
+.files-panel .file-tree-row > span:nth-child(3) { font-family: var(--font-ui); }
+.files-panel .file-tree-row small { font-family: var(--font-ui); font-size: 10px; }
+.rule-file-toolbar { display: flex; flex: 0 0 auto; align-items: center; gap: 6px; padding: 10px 12px 0; }
+.rule-file-toolbar > .button { margin-right: auto; gap: 5px; font-size: 12px; }
+.rule-file-origin { flex: 0 0 auto; margin: 8px 16px; color: var(--muted); font-size: 11px; }
+.rule-file-error-path { margin: 0 16px 8px; }
+@media (pointer: coarse) {
+  .file-explorer-toggle, .files-panel .file-tree-row { min-height: 44px; }
+}

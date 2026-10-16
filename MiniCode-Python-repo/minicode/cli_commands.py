@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import shlex
 from pathlib import Path
 
 from Main.MinicodeFrontline.Src.Application.Entry.LocalCommandSurface import (
@@ -20,6 +21,13 @@ from minicode.product_surfaces import (
     resolve_extension_manifest,
     set_extension_enabled,
 )
+from minicode.extensions import (
+    install_extension,
+    inspect_extension_health,
+    rollback_extension,
+    set_extension_trusted,
+    uninstall_extension,
+)
 from minicode.session import (
     format_rewind_preview,
     format_session_checkpoints,
@@ -35,7 +43,7 @@ from minicode.session import (
 )
 
 
-def format_slash_commands() -> str:
+def format_slash_commands(cwd: str | None = None) -> str:
     lines = [
         "╔══════════════════════════════════════════════════════════╗",
         "║  📚 Available Commands                                  ║",
@@ -45,6 +53,8 @@ def format_slash_commands() -> str:
     command_groups = {
         "🔧 Core Commands": [
             ("/help", "Show this help message"),
+            ("/task-file <path|show|clear>", "TUI: preview/remove the next task's acceptance contract"),
+            ("/task-confirm", "TUI: trust previewed local verification commands"),
             ("/exit", "Exit mini-code"),
             ("/clear", "Clear the current transcript view"),
             ("/history", "Show recent prompt history"),
@@ -52,6 +62,8 @@ def format_slash_commands() -> str:
         "🛠️ Tool Commands": [
             ("/tools", "List all available tools"),
             ("/skills", "List discovered SKILL.md workflows"),
+            ("/skill <name> [arguments]", "Run a selected Skill workflow with literal arguments"),
+            ("/skill-end", "Explicitly end Skill rules in a legacy direct session"),
             ("/mcp", "Show MCP servers and connection state"),
             ("/cmd", "Run development commands directly"),
         ],
@@ -87,6 +99,12 @@ def format_slash_commands() -> str:
             ("/extension-inspect <name>", "Inspect one extension in detail"),
             ("/extension-enable <name>", "Enable a local extension"),
             ("/extension-disable <name>", "Disable a local extension"),
+            ("/extension-install <source>", "Install an extension bundle"),
+            ("/extension-trust <name>", "Trust and grant an extension"),
+            ("/extension-untrust <name>", "Revoke extension trust"),
+            ("/extension-health <name>", "Check extension activation health"),
+            ("/extension-rollback <name>", "Restore previous package version"),
+            ("/extension-uninstall <name>", "Move extension to recoverable trash"),
             ("/readiness", "Inspect provider/runtime readiness"),
             ("/checkpoints", "List active session checkpoints"),
             ("/checkpoints <id>", "List saved session checkpoints"),
@@ -107,6 +125,19 @@ def format_slash_commands() -> str:
             cmd_display = f"    {cmd}"
             lines.append(f"║  {cmd_display:<20} {desc:<33} ║")
         lines.append("╠══════════════════════════════════════════════════════════╣")
+
+    if cwd is not None:
+        from minicode.extension_commands import list_extension_commands
+
+        extension_commands = list_extension_commands(cwd)
+        if extension_commands:
+            lines.append(f"║  {'🧩 Extension Commands':<54}║")
+            for command in extension_commands:
+                cmd_display = f"    {command.usage}"
+                lines.append(
+                    f"║  {cmd_display:<20} {command.description[:33]:<33} ║"
+                )
+            lines.append("╠══════════════════════════════════════════════════════════╣")
     
     lines.extend([
         "║  💡 Tips:                                              ║",
@@ -119,12 +150,16 @@ def format_slash_commands() -> str:
     return "\n".join(lines)
 
 
-def find_matching_slash_commands(user_input: str) -> list[str]:
+def find_matching_slash_commands(user_input: str, cwd: str | None = None) -> list[str]:
     """Find slash commands matching user input.
 
     Tries exact prefix first, falls back to fuzzy subsequence matching.
     """
     commands = [c.usage for c in SLASH_COMMANDS]
+    if cwd is not None:
+        from minicode.extension_commands import list_extension_commands
+
+        commands.extend(command.usage for command in list_extension_commands(cwd))
     prefix_matches = [c for c in commands if c.startswith(user_input)]
     if prefix_matches:
         return prefix_matches
@@ -422,12 +457,21 @@ def try_handle_local_command(
             f"Extension inspect: {manifest.name}",
             f"Scope: {manifest.scope}",
             f"Enabled: {'yes' if manifest.enabled else 'no'}",
+            f"Trusted: {'yes' if manifest.trusted else 'no'}",
+            f"Health: {manifest.health}",
             f"Manifest: {manifest.path}",
         ]
         if manifest.version:
             lines.append(f"Version: {manifest.version}")
         if manifest.description:
             lines.append(f"Description: {manifest.description}")
+        if manifest.permissions:
+            lines.append(f"Permissions: {', '.join(manifest.permissions)}")
+            lines.append(
+                f"Granted: {', '.join(manifest.granted_permissions) or 'none'}"
+            )
+        if manifest.contribution_kinds:
+            lines.append(f"Contributions: {', '.join(manifest.contribution_kinds)}")
         if manifest.entrypoint:
             entrypoint = Path(manifest.path).parent / manifest.entrypoint
             exists = "yes" if entrypoint.exists() else "no"
@@ -476,7 +520,7 @@ def try_handle_local_command(
         )
 
     if user_input in {"/", "/help"}:
-        return format_slash_commands()
+        return format_slash_commands(cwd)
 
     if user_input == "/config-paths":
         return "\n".join(
@@ -527,6 +571,99 @@ def try_handle_local_command(
         if not identifier:
             return "Usage: /extension-disable <name>"
         return _set_extension_state(identifier, False)
+
+    if user_input.startswith("/extension-install "):
+        if cwd is None:
+            return "No workspace is available for extension installation."
+        raw = user_input[len("/extension-install ") :].strip()
+        try:
+            tokens = [
+                token[1:-1]
+                if len(token) >= 2 and token[0] == token[-1] and token[0] in {'\"', "'"}
+                else token
+                for token in shlex.split(raw, posix=False)
+            ]
+            scope = "global"
+            trusted = False
+            source_parts: list[str] = []
+            for token in tokens:
+                if token == "--trust":
+                    trusted = True
+                elif token.startswith("--scope="):
+                    scope = token.split("=", 1)[1].strip()
+                else:
+                    source_parts.append(token)
+            source = " ".join(source_parts).strip()
+            if not source:
+                return "Usage: /extension-install <directory|zip|git-url> [--scope=project|global] [--trust]"
+            manifest = install_extension(cwd, source, scope=scope, trusted=trusted)
+            return (
+                f"Installed {manifest.key} v{manifest.version}. "
+                f"Trust: {'granted' if manifest.trusted else 'required before activation'}."
+            )
+        except (RuntimeError, ValueError) as exc:
+            return f"Extension install failed: {exc}"
+
+    if user_input.startswith("/extension-trust "):
+        if cwd is None:
+            return "No workspace is available for extension trust changes."
+        identifier = user_input[len("/extension-trust ") :].strip()
+        try:
+            manifest = set_extension_trusted(cwd, identifier, True)
+            return (
+                f"Trusted {manifest.key}; granted: "
+                f"{', '.join(manifest.granted_permissions) or 'none'}."
+            )
+        except (RuntimeError, ValueError) as exc:
+            return f"Extension trust failed: {exc}"
+
+    if user_input.startswith("/extension-untrust "):
+        if cwd is None:
+            return "No workspace is available for extension trust changes."
+        identifier = user_input[len("/extension-untrust ") :].strip()
+        try:
+            manifest = set_extension_trusted(cwd, identifier, False)
+            return f"Revoked trust for {manifest.key}."
+        except (RuntimeError, ValueError) as exc:
+            return f"Extension trust update failed: {exc}"
+
+    if user_input.startswith("/extension-health "):
+        if cwd is None:
+            return "No workspace is available for extension health checks."
+        identifier = user_input[len("/extension-health ") :].strip()
+        try:
+            checks = inspect_extension_health(cwd, identifier)
+            lines = [f"Extension health: {identifier}"]
+            lines.extend(
+                f"- {check.name}: {check.status} — {check.detail}"
+                for check in checks
+            )
+            return "\n".join(lines)
+        except (RuntimeError, ValueError) as exc:
+            return f"Extension health failed: {exc}"
+
+    if user_input.startswith("/extension-rollback "):
+        if cwd is None:
+            return "No workspace is available for extension rollback."
+        identifier = user_input[len("/extension-rollback ") :].strip()
+        try:
+            manifest = rollback_extension(cwd, identifier)
+            return f"Rolled back {manifest.key} to v{manifest.version}."
+        except (RuntimeError, ValueError) as exc:
+            return f"Extension rollback failed: {exc}"
+
+    if user_input.startswith("/extension-uninstall "):
+        if cwd is None:
+            return "No workspace is available for extension uninstall."
+        identifier = user_input[len("/extension-uninstall ") :].strip()
+        try:
+            result = uninstall_extension(cwd, identifier)
+            return (
+                f"Uninstalled {result['extension']}. Recoverable package: "
+                f"{result['trashPath']}"
+            )
+        except (RuntimeError, ValueError) as exc:
+            return f"Extension uninstall failed: {exc}"
 
     if user_input == "/readiness":
         return _format_readiness_surface(_product_snapshot())
@@ -680,6 +817,9 @@ def try_handle_local_command(
             checkpoint_id=checkpoint_id,
         )
 
+    if user_input == "/skill":
+        return "Usage: /skill <name> [arguments]"
+
     if user_input == "/skills":
         skills = tools.get_skills() if tools else []
         if not skills:
@@ -688,6 +828,15 @@ def try_handle_local_command(
             f"{skill['name']}  {skill['description']}  [{skill['source']}]"
             for skill in skills
         )
+
+    if user_input == "/skill-end":
+        from minicode.skill_runtime import release_skill_run
+        run_id = (getattr(session, "context_state", {}) or {}).get("skill_workflow")
+        if not run_id:
+            return "No legacy direct-session Skill workflow is active. Runtime tasks release rules when their completion gate succeeds."
+        run_id = str(getattr(session, "session_id", "")) + ":" + run_id
+        count = release_skill_run(cwd=str(cwd), runtime=load_runtime_config(cwd), run_id=run_id, reason="explicit_switch")
+        return f"Released {count} Skill invocation(s); audit sources were retained."
 
     if user_input == "/config":
         from minicode.config import format_config_diagnostic
@@ -755,6 +904,8 @@ def try_handle_local_command(
             auth_methods.append("OPENAI_API_KEY")
         if runtime.get("deepseekApiKey"):
             auth_methods.append("DEEPSEEK_API_KEY")
+        if runtime.get("bailianApiKey"):
+            auth_methods.append("DASHSCOPE_API_KEY")
         if runtime.get("openrouterApiKey"):
             auth_methods.append("OPENROUTER_API_KEY")
         if runtime.get("customApiKey"):

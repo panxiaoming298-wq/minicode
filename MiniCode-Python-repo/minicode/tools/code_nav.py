@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import ast
+import keyword
 import os
+import re
 from pathlib import Path
 from typing import Any
 from minicode.tooling import ToolDefinition, ToolResult
+from minicode.tools import _file_search
 from minicode.workspace import resolve_tool_path
 
 
@@ -49,7 +52,7 @@ def _extract_symbols_from_file(file_path: Path) -> list[dict[str, Any]]:
         lineno = getattr(node, "lineno", 0)
 
         # Get docstring if exists
-        docstring = ast.get_docstring(node)
+        docstring = ast.get_docstring(node) if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) else None
         docstring_preview = docstring[:100] if docstring else ""
 
         # Get arguments for functions
@@ -93,40 +96,6 @@ def _extract_symbols_from_file(file_path: Path) -> list[dict[str, Any]]:
         })
 
     return symbols
-
-
-def _find_symbol_references(file_path: Path, symbol_name: str) -> list[dict[str, Any]]:
-    """Find all references to a symbol in a file (simple text search)."""
-    if not file_path.exists():
-        return []
-
-    try:
-        content = file_path.read_text(encoding="utf-8")
-        lines = content.split("\n")
-    except (OSError, UnicodeDecodeError):
-        return []
-
-    references = []
-    for i, line in enumerate(lines, 1):
-        # Skip comments and strings (simple check)
-        stripped = line.strip()
-        if stripped.startswith("#"):
-            continue
-
-        if symbol_name in line:
-            # Get context (surrounding lines)
-            start = max(0, i - 3)
-            end = min(len(lines), i + 2)
-            context = "\n".join(lines[start:end])
-
-            references.append({
-                "file": str(file_path),
-                "line": i,
-                "code": line.strip()[:100],
-                "context": context,
-            })
-
-    return references
 
 
 # ---------------------------------------------------------------------------
@@ -212,60 +181,41 @@ def _validate_find_references(input_data: dict) -> dict:
     symbol_name = input_data.get("symbol_name")
     if not isinstance(symbol_name, str) or not symbol_name.strip():
         raise ValueError("symbol_name is required")
+    symbol_name = symbol_name.strip()
+    if not symbol_name.isidentifier() or keyword.iskeyword(symbol_name):
+        raise ValueError("symbol_name must be one Python identifier, not an expression or regex")
     path = input_data.get("path", ".")
-    return {"symbol_name": symbol_name.strip(), "path": path}
+    if not isinstance(path, str) or not path or "\0" in path:
+        raise ValueError("path must be a non-empty path string")
+    return {"symbol_name": symbol_name, "path": path}
 
 
 def _run_find_references(input_data: dict, context) -> ToolResult:
-    """Find all references to a symbol."""
-    symbol_name = input_data["symbol_name"]
+    """Return bounded textual candidates; this does not resolve symbol binding."""
     try:
-        search_path = resolve_tool_path(context, input_data["path"], "analyze")
-    except (PermissionError, RuntimeError) as error:
-        return ToolResult(ok=False, output=str(error))
-
-    if not search_path.exists():
-        return ToolResult(ok=False, output=f"Path not found: {search_path}")
-
-    # Find all Python files
-    py_files = []
-    if search_path.is_file():
-        py_files = [search_path]
-    else:
-        for root, dirs, files in os.walk(search_path):
-            dirs[:] = [d for d in dirs if d not in (".git", "__pycache__", "venv", "env", ".tox", "node_modules")]
-            for f in files:
-                if f.endswith(".py"):
-                    py_files.append(Path(root) / f)
-
-    all_refs = []
-    for py_file in py_files:
-        refs = _find_symbol_references(py_file, symbol_name)
-        all_refs.extend(refs)
-
-    if not all_refs:
-        return ToolResult(
-            ok=True,
-            output=f"No references found for '{symbol_name}' in {input_data['path']}",
-        )
-
-    # Format output
-    lines = [f"Found {len(all_refs)} reference(s) for '{symbol_name}':", ""]
-
-    by_file: dict[str, list] = {}
-    for ref in all_refs:
-        rel_path = Path(ref["file"]).relative_to(context.cwd)
-        by_file.setdefault(str(rel_path), []).append(ref)
-
-    for file, refs in by_file.items():
-        lines.append(f"📄 {file} ({len(refs)} refs)")
-        for ref in refs[:20]:  # Limit to 20 per file
-            lines.append(f"  L{ref['line']}: {ref['code']}")
-        if len(refs) > 20:
-            lines.append(f"  ... and {len(refs) - 20} more")
-        lines.append("")
-
-    return ToolResult(ok=True, output="\n".join(lines))
+        options = _validate_find_references(input_data)
+    except (ValueError, TypeError) as error:
+        return ToolResult(ok=False, output=f"Invalid reference search input: {error}", failureKind="invalid_input")
+    result = _file_search.search_files(
+        {
+            "pattern": rf"\b{re.escape(options['symbol_name'])}\b",
+            "path": options["path"],
+            "include": ["*.py"],
+            "case_sensitive": True,
+            "context_lines": 2,
+        },
+        context,
+        intent="analyze",
+    )
+    return result.to_tool_result(
+        header=(
+            "Candidate references (case-sensitive text matches, not resolved symbol references).\n"
+            "Paths are relative to the searched directory (or the explicit file's parent).\n"
+            "May include definitions, comments, strings, and unrelated scopes. Verify before renaming."
+        ),
+        match_label="candidate matching line(s)",
+        empty_output="No candidate reference matches found.",
+    )
 
 
 def _validate_get_ast_info(input_data: dict) -> dict:
@@ -351,12 +301,18 @@ find_symbols_tool = ToolDefinition(
 
 find_references_tool = ToolDefinition(
     name="find_references",
-    description="Find all references to a Python symbol (class, function, variable) across files. Use this before renaming to see impact.",
+    description=(
+        "Find candidate references to one Python identifier with ripgrep in UTF-8 .py files. "
+        "Uses case-sensitive whole-identifier text matching and two context lines. "
+        "Candidates may include definitions, comments, strings, and unrelated scopes; "
+        "this does not resolve symbol identity. Verify candidates before renaming. "
+        "Shares grep_files path filters, timeout, cancellation and result limits."
+    ),
     input_schema={
         "type": "object",
         "properties": {
-            "symbol_name": {"type": "string", "description": "Name of the symbol to find references for"},
-            "path": {"type": "string", "description": "File or directory path to search (default: current directory)"},
+            "symbol_name": {"type": "string", "description": "One Python identifier, e.g. foo or MyClass; no dotted expressions or regex"},
+            "path": {"type": "string", "description": "Python file or directory to search (default: current directory)"},
         },
         "required": ["symbol_name"],
     },

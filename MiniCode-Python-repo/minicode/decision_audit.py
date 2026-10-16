@@ -76,7 +76,9 @@ class DecisionRecord:
 
 class DecisionAuditor:
     def __init__(self, log_dir: str | Path | None = None):
-        self.log_dir = Path(log_dir) if log_dir else Path.home() / ".mini-code" / "audit"
+        from minicode import config
+
+        self.log_dir = Path(log_dir) if log_dir else config.MINI_CODE_DIR / "audit"
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self._records: list[DecisionRecord] = []
         self._session_records: dict[str, list[DecisionRecord]] = {}

@@ -56,6 +56,9 @@ class ScreenState:
     transcript_scroll_offset: int = 0
     transcript_revision: int = 0
     selected_slash_index: int = 0
+    skill_completion_workspace: str | None = None
+    skill_completion_commands: list[Any] = field(default_factory=list)
+    slash_dismissed_input: str | None = None
     status: str | None = None
     active_tool: str | None = None
     recent_tools: list[dict[str, str]] = field(default_factory=list)
@@ -75,3 +78,6 @@ class ScreenState:
     agent_event_queue: Any = None
     agent_event_handler: Callable[[Any], None] | None = None
     tool_start_time: float | None = None
+    pending_task: Any | None = None
+    task_confirmed: bool = False
+    task_scope: tuple[str, str] | None = None

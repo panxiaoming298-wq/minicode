@@ -1,4 +1,5 @@
 import {
+  ArrowUpRight,
   Boxes,
   Cable,
   CircleAlert,
@@ -10,12 +11,22 @@ import {
 import { useMemo, useState } from "react";
 
 import type { CapabilitySnapshot, SessionInspect } from "../types";
+import {
+  capabilitySourceLabel,
+  capabilityStatusLabel,
+  matchesToolQuery,
+  replayPolicyLabel,
+  toolEffectLabel,
+  toolText,
+  toolSource,
+} from "../lib/capabilityText";
 
 interface CapabilityPanelProps {
   capabilities: CapabilitySnapshot | null;
   inspect: SessionInspect | null;
   loading: boolean;
   error: string;
+  onOpenTools?: () => void;
 }
 
 function statusTone(status: string): string {
@@ -26,16 +37,7 @@ function statusTone(status: string): string {
   return "is-pending";
 }
 
-function effectLabel(effect: string): string {
-  return {
-    read_only: "只读",
-    workspace_write: "写入工作区",
-    external_side_effect: "依赖外部服务",
-    privileged: "需授权",
-  }[effect] || effect || "未分类";
-}
-
-export function CapabilityPanel({ capabilities, inspect, loading, error }: CapabilityPanelProps) {
+export function CapabilityPanel({ capabilities, inspect, loading, error, onOpenTools }: CapabilityPanelProps) {
   const [query, setQuery] = useState("");
   const skills = inspect?.skills.length ? inspect.skills : capabilities?.skills || [];
   const mcpServers = inspect?.mcpServers.length ? inspect.mcpServers : capabilities?.mcpServers || [];
@@ -43,9 +45,7 @@ export function CapabilityPanel({ capabilities, inspect, loading, error }: Capab
   const filteredTools = useMemo(() => {
     const needle = query.trim().toLowerCase();
     if (!needle) return tools;
-    return tools.filter((tool) =>
-      `${tool.name} ${tool.description} ${tool.effect} ${tool.source}`.toLowerCase().includes(needle),
-    );
+    return tools.filter((tool) => matchesToolQuery(tool, needle));
   }, [query, tools]);
 
   if (loading && !capabilities) {
@@ -61,23 +61,23 @@ export function CapabilityPanel({ capabilities, inspect, loading, error }: Capab
   return (
     <div className="inspector-body capability-panel">
       <div className="capability-summary" aria-label="能力摘要">
-        <span><strong>{skills.length}</strong> Skills</span>
+        <span><strong>{skills.length}</strong> 技能</span>
         <span><strong>{mcpServers.length}</strong> MCP</span>
         <span><strong>{tools.length}</strong> 工具</span>
       </div>
 
       <section className="inspector-section capability-section">
         <div className="section-heading">
-          <h2><Sparkles size={15} />Skills</h2>
+          <h2><Sparkles size={15} />技能</h2>
           <span>{skills.length} 个已发现</span>
         </div>
         {skills.length === 0 ? (
-          <p className="section-empty">当前作用域没有发现 Skill。</p>
+          <p className="section-empty">当前作用域没有发现技能。</p>
         ) : (
           <ul className="capability-list skill-list">
             {skills.map((skill) => (
               <li key={`${skill.source}-${skill.name}`}>
-                <div><strong>{skill.name}</strong><span className="compact-badge">{skill.source}</span></div>
+                <div><strong>{skill.name}</strong><span className="compact-badge">{capabilitySourceLabel(skill.source)}</span></div>
                 <p>{skill.description || "没有描述"}</p>
               </li>
             ))}
@@ -87,7 +87,7 @@ export function CapabilityPanel({ capabilities, inspect, loading, error }: Capab
 
       <section className="inspector-section capability-section">
         <div className="section-heading">
-          <h2><Cable size={15} />MCP 服务器</h2>
+          <h2 data-inspector-section="mcp" tabIndex={-1}><Cable size={15} />MCP 服务器</h2>
           <span>{mcpServers.filter((server) => server.status === "connected").length} 个已连接</span>
         </div>
         {mcpServers.length === 0 ? (
@@ -99,7 +99,7 @@ export function CapabilityPanel({ capabilities, inspect, loading, error }: Capab
                 <div className="mcp-line">
                   <i className={`status-dot ${statusTone(server.status)}`} />
                   <strong>{server.name}</strong>
-                  <span>{server.status}</span>
+                  <span>{capabilityStatusLabel(server.status)}</span>
                 </div>
                 <p>
                   {server.toolCount} 工具 · {server.resourceCount} 资源 · {server.promptCount} 提示
@@ -114,32 +114,39 @@ export function CapabilityPanel({ capabilities, inspect, loading, error }: Capab
 
       <section className="inspector-section capability-section tool-surface-section">
         <div className="section-heading">
-          <h2><Wrench size={15} />工具面</h2>
+          <h2 data-inspector-section="tools" tabIndex={-1}><Wrench size={15} />当前范围的工具</h2>
           <span>{filteredTools.length} / {tools.length}</span>
         </div>
         <p className="capability-availability-note">
-          这里显示模型可以尝试调用的工具，不代表外部服务正处于可用状态。web_search 和 web_fetch 仍会受网络、目标站点及人机验证影响。
+          这里展示当前范围内发现的工具。实际调用遵守任务权限；网页搜索、网页读取等外部能力还受网络、目标站点及人机验证影响。
         </p>
+        {onOpenTools && <button type="button" className="capability-catalog-link" onClick={onOpenTools}>查看全部工具<ArrowUpRight size={13} /></button>}
         {tools.length > 8 && (
           <label className="capability-search">
             <Search size={14} />
-            <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="筛选工具" />
+            <input value={query} onChange={(event) => setQuery(event.target.value)} aria-label="筛选工具" placeholder="按中文名称或工具名筛选" />
           </label>
         )}
         {filteredTools.length === 0 ? (
           <p className="section-empty">没有符合筛选条件的工具。</p>
         ) : (
           <ul className="tool-surface-list">
-            {filteredTools.map((tool) => (
-              <li key={tool.name}>
-                <div>
-                  <code>{tool.name}</code>
-                  <span className={`effect-badge effect-${tool.effect}`}>{effectLabel(tool.effect)}</span>
-                </div>
-                <p>{tool.description}</p>
-                <small>{tool.source} · {tool.replayPolicy || "无自动重放"}</small>
-              </li>
-            ))}
+            {filteredTools.map((tool) => {
+              const text = toolText(tool);
+              return (
+                <li key={tool.name}>
+                  <div>
+                    <span className="tool-surface-name">
+                      {text.name !== tool.name && <strong>{text.name}</strong>}
+                      <code title={tool.name}>{tool.name}</code>
+                    </span>
+                    <span className={`effect-badge effect-${tool.effect}`}>{toolEffectLabel(tool.effect)}</span>
+                  </div>
+                  <p>{text.description}</p>
+                  <small>{capabilitySourceLabel(toolSource(tool))} · {replayPolicyLabel(tool.replayPolicy)}</small>
+                </li>
+              );
+            })}
           </ul>
         )}
       </section>

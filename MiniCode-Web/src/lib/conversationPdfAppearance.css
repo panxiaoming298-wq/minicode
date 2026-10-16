@@ -1,0 +1,75 @@
+/* Match the chat surface; only wrapping and pagination differ from the screen. */
+.print-document.is-appearance {
+  --panel: #f5f6f8;
+  --panel-deep: #e9ecf1;
+  --text: #25272c;
+  --text-soft: #44474f;
+  --muted: #666b75;
+  --line: rgba(38, 43, 55, 0.09);
+  --code-bg: #2a2b28;
+  --code-text: #dcddd6;
+  --link: #2563eb;
+  padding: 12mm;
+  background: #fdfdfe;
+  color: var(--text);
+  font: 15px/1.85 -apple-system, BlinkMacSystemFont, "Segoe UI Variable Text", "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+}
+.is-appearance, .is-appearance * { print-color-adjust: exact; -webkit-print-color-adjust: exact; }
+.is-appearance .pdf-chat-heading { margin-bottom: 30px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+.is-appearance .pdf-chat-heading > span { color: var(--muted); font-size: 12px; }
+.is-appearance .pdf-chat-heading h1 { margin: 5px 0 0; font-size: 22px; line-height: 1.4; }
+.is-appearance .user-message {
+  max-width: 86%;
+  margin: 0 0 30px auto;
+  padding: 14px 18px;
+  border: 1px solid transparent;
+  border-radius: 20px;
+  background: var(--panel);
+  line-height: 1.65;
+  box-decoration-break: clone;
+}
+.is-appearance .pdf-user-text { white-space: pre-wrap; }
+.is-appearance .assistant-message { max-width: 100%; margin-bottom: 30px; }
+.is-appearance .assistant-message > :first-child { margin-top: 0; }
+.is-appearance .assistant-message > :last-child { margin-bottom: 0; }
+.is-appearance .assistant-message h1,
+.is-appearance .assistant-message h2,
+.is-appearance .assistant-message h3 { margin: 1.4em 0 0.55em; letter-spacing: -0.025em; line-height: 1.3; }
+.is-appearance .assistant-message h1 { font-size: 22px; }
+.is-appearance .assistant-message h2 { font-size: 18px; }
+.is-appearance .assistant-message h3 { font-size: 15px; }
+.is-appearance .assistant-message p,
+.is-appearance .assistant-message ul,
+.is-appearance .assistant-message ol { margin: 0.75em 0; }
+.is-appearance .assistant-message ul,
+.is-appearance .assistant-message ol { padding-left: 1.5em; }
+.is-appearance pre, .is-appearance code { font-family: "Cascadia Code", "SFMono-Regular", Consolas, "Microsoft YaHei", monospace; font-size: 0.88em; }
+.is-appearance code { padding: 0.12em 0.34em; border-radius: 4px; background: var(--panel-deep); }
+.is-appearance pre { padding: 15px; border: 1px solid #ffffff26; border-radius: 14px; background: var(--code-bg); color: var(--code-text); line-height: 1.6; }
+.is-appearance pre code { padding: 0; background: transparent; color: inherit; font-size: inherit; }
+.is-appearance blockquote { margin: 1em 0; padding: 2px 15px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); color: var(--text-soft); }
+.is-appearance table { font-size: 12px; }
+.is-appearance th, .is-appearance td { padding: 8px; border: 0; border-bottom: 1px solid var(--line); text-align: left; }
+.is-appearance th { background: var(--panel); }
+.is-appearance tr { break-inside: avoid; }
+.is-appearance a, .is-appearance .pdf-file-reference { color: var(--link); }
+.is-appearance .pdf-attachment { margin: 12px 0 0; white-space: normal; }
+.is-appearance .pdf-attachment > header { color: var(--text-soft); font-size: 12px; break-after: avoid; }
+.is-appearance .pdf-attachment pre { margin: 8px 0 0; }
+.is-appearance figure { margin: 0 0 20px; break-inside: avoid; }
+.is-appearance figcaption { margin-top: 7px; color: var(--muted); font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+.is-appearance .pdf-image { display: block; margin: 12px 0; break-inside: avoid; }
+.is-appearance .pdf-image img { display: block; width: auto; max-width: 100%; height: auto; max-height: 220mm; object-fit: contain; border: 1px solid var(--line); border-radius: 10px; }
+.is-appearance .pdf-image-fallback, .is-appearance .pdf-image-unavailable { display: block; padding: 18px; border: 1px dashed #bbc1cb; border-radius: 10px; background: var(--panel); color: var(--muted); font-size: 13px; }
+.is-appearance [hidden] { display: none !important; }
+@media (max-width: 600px) {
+  .print-document.is-appearance { padding: 24px 18px; }
+  .is-appearance .user-message { max-width: 92%; padding: 12px 14px; }
+}
+@media print {
+  .print-document.is-appearance { max-width: none; margin: 0; padding: 0; }
+  .is-appearance .user-message { max-width: 86%; padding: 14px 18px; }
+  .is-appearance .user-message, .is-appearance .assistant-message { margin-bottom: 22px; }
+  .is-appearance .pdf-chat-turn:not(:has(pre, table, .pdf-image)) { break-inside: avoid; }
+  .is-appearance .pdf-image { break-inside: avoid; }
+}

@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import time
 
+from minicode.runtime_messages import is_user_input
 from minicode.types import AgentStep
 
 
 def _last_user_message(messages):
-    return next((message["content"] for message in reversed(messages) if message["role"] == "user"), "")
+    return next((message["content"] for message in reversed(messages) if is_user_input(message)), "")
 
 
 def _last_tool_message(messages):

@@ -4,6 +4,27 @@ import time
 from typing import Any
 
 from minicode.tooling import ToolDefinition, ToolResult
+from minicode.tools._validation import validate_contract
+
+
+TODO_WRITE_INPUT = {
+    "type": "object", "additionalProperties": False,
+    "properties": {
+        "todos": {
+            "type": "array", "description": "Complete task list. An empty array clears the list.",
+            "items": {
+                "type": "object", "additionalProperties": False,
+                "properties": {
+                    "content": {"type": "string", "minLength": 1, "description": "Nonblank task description"},
+                    "status": {"type": "string", "enum": ["pending", "in_progress", "completed"],
+                               "description": "Omit to retain an existing task's status; new tasks default to pending"},
+                },
+                "required": ["content"],
+            },
+        },
+    },
+    "required": ["todos"],
+}
 
 # In-memory task storage (resets per session)
 _tasks: list[dict[str, Any]] = []
@@ -11,17 +32,11 @@ _task_id_counter = 0
 
 
 def _validate(input_data: dict) -> dict:
-    todos = input_data.get("todos")
-    if not isinstance(todos, list):
-        raise ValueError("todos must be a list")
+    validate_contract(input_data, TODO_WRITE_INPUT)
+    todos = input_data["todos"]
     for i, todo in enumerate(todos):
-        if not isinstance(todo, dict):
-            raise ValueError(f"todo[{i}] must be an object")
-        if "content" not in todo:
-            raise ValueError(f"todo[{i}] must have a 'content' field")
-        status = todo.get("status", "pending")
-        if status not in ("pending", "in_progress", "completed"):
-            raise ValueError(f"todo[{i}] status must be 'pending', 'in_progress', or 'completed'")
+        if not todo["content"].strip():
+            raise ValueError(f"$.todos[{i}].content: must be nonblank")
     return {"todos": todos}
 
 
@@ -88,24 +103,7 @@ def _run(input_data: dict, context) -> ToolResult:
 todo_write_tool = ToolDefinition(
     name="todo_write",
     description="Create or update a list of tasks. Use this to track progress on multi-step tasks. Each task has content (required) and status (pending/in_progress/completed). Pass the complete list each time to update.",
-    input_schema={
-        "type": "object",
-        "properties": {
-            "todos": {
-                "type": "array",
-                "description": "Complete list of tasks to track. Each task must have 'content' (string) and optionally 'status' (pending/in_progress/completed).",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "Task description"},
-                        "status": {"type": "string", "enum": ["pending", "in_progress", "completed"], "description": "Task status"},
-                    },
-                    "required": ["content"],
-                },
-            },
-        },
-        "required": ["todos"],
-    },
+    input_schema=TODO_WRITE_INPUT,
     validator=_validate,
     run=_run,
 )

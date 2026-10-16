@@ -18,6 +18,8 @@ venv/
 # Test and dev files
 tests/
 benchmarks/
+**/Test/
+**/Data/
 docs/
 *.md
 !README.md

@@ -1,8 +1,6 @@
 """Vector-based memory search — parallel path to BM25.
 
-Two backends:
-- SparseVectorStore: zero-dependency TF-IDF vectors, always available
-- VectorMemoryStore: optional sentence-transformers (all-MiniLM-L6-v2)
+Local TF-IDF keyword similarity, without a database or embedding model.
 
 Results merged with BM25 via reciprocal rank fusion.
 """
@@ -22,7 +20,7 @@ class SparseVectorStore:
 
     Uses the same tokenization infrastructure as BM25. Each document is
     a sparse {term_id: tfidf_weight} dict. Cosine similarity provides
-    a lightweight semantic path parallel to BM25 keyword scoring.
+    a local term-overlap path parallel to BM25 keyword scoring.
     """
 
     def __init__(self):
@@ -118,79 +116,6 @@ class SparseVectorStore:
         self._id_to_term.clear()
         self._doc_freq.clear()
         self._doc_count = 0
-
-
-class VectorMemoryStore:
-    """Optional sentence-transformers backend for semantic search."""
-
-    def __init__(self):
-        self._model = None
-        self._embeddings: dict[str, list[float]] = {}
-        self._enabled = False
-        self._load_model()
-
-    def _load_model(self) -> None:
-        try:
-            from sentence_transformers import SentenceTransformer
-            self._model = SentenceTransformer("all-MiniLM-L6-v2")
-            self._enabled = True
-            logger.info("VectorMemoryStore: loaded all-MiniLM-L6-v2")
-        except ImportError:
-            logger.info("VectorMemoryStore: sentence-transformers not installed, using sparse vectors only")
-        except Exception as e:
-            logger.warning("VectorMemoryStore: model load failed: %s", e)
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-
-    def index_entries(self, entries: list[Any]) -> int:
-        if not self._enabled or not self._model:
-            return 0
-        count = 0
-        for entry in entries:
-            eid = getattr(entry, 'id', '')
-            if eid in self._embeddings:
-                continue
-            content = getattr(entry, 'content', '')
-            if not content.strip():
-                continue
-            try:
-                embedding = self._model.encode(content[:500], show_progress_bar=False)
-                self._embeddings[eid] = embedding.tolist()
-                count += 1
-            except Exception:
-                pass
-        return count
-
-    def search(self, query: str, candidate_ids: list[str] | None = None, top_k: int = 10) -> list[tuple[str, float]]:
-        if not self._enabled or not self._model or not self._embeddings:
-            return []
-        try:
-            query_emb = self._model.encode(query[:500], show_progress_bar=False).tolist()
-        except Exception:
-            return []
-        results: list[tuple[str, float]] = []
-        for eid, emb in self._embeddings.items():
-            if candidate_ids and eid not in candidate_ids:
-                continue
-            sim = self._cosine_similarity(query_emb, emb)
-            if sim > 0.3:
-                results.append((eid, sim))
-        results.sort(key=lambda x: x[1], reverse=True)
-        return results[:top_k]
-
-    @staticmethod
-    def _cosine_similarity(a: list[float], b: list[float]) -> float:
-        dot = sum(x * y for x, y in zip(a, b))
-        norm_a = math.sqrt(sum(x * x for x in a))
-        norm_b = math.sqrt(sum(y * y for y in b))
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
-
-    def clear(self) -> None:
-        self._embeddings.clear()
 
 
 def merge_bm25_vector(

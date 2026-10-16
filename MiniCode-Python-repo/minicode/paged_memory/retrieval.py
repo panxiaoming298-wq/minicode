@@ -1,14 +1,15 @@
-"""Explicit dependency resolution, hybrid retrieval and phase working set."""
+"""Explicit dependency resolution, keyword retrieval and phase working set."""
 
 from __future__ import annotations
 
+import re
 import time
 from collections import deque
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from typing import Any
 
+from .lexical import lexical_tokens
 from .models import (
     MEMORY_NAVIGATION_TOOL_NAMES,
     ArtifactStatus,
@@ -21,6 +22,7 @@ from .models import (
     MemoryStatus,
     TaskStateSnapshot,
     content_hash_text,
+    stable_json,
 )
 from .policy import TokenBudgetManager
 
@@ -61,6 +63,8 @@ def merge_state_dependencies(
 
     for raw in state.active_constraints:
         if not isinstance(raw, dict):
+            continue
+        if str(raw.get("status", "ACTIVE")).upper() not in {"ACTIVE", "OPEN"}:
             continue
         memory_id = str(raw.get("memory_id", "")).strip()
         if not memory_id or require_existing(
@@ -109,6 +113,34 @@ def merge_state_dependencies(
     return merged
 
 
+def dependency_contract_hash(
+    dependencies: Sequence[DependencyRecord],
+    state: TaskStateSnapshot | None = None,
+) -> str:
+    """Fingerprint the required read set, excluding unrelated task progress."""
+    required = sorted(
+        (
+            dependency.dependency_type.value,
+            dependency.dependency_id,
+            dependency.closure_truncated,
+        )
+        for dependency in dependencies
+        if dependency.required
+    )
+    # A dependency may name a decision key rather than its immutable version
+    # ID. Include the active version map so key aliases cannot bypass the fence.
+    versions = {
+        key: {
+            field: raw.get(field)
+            for field in ("id", "decision_id", "source_event_id", "status")
+        }
+        for key, raw in (state.active_decisions.items() if state else ())
+        if isinstance(raw, dict)
+        and str(raw.get("status", "ACTIVE")).upper() in {"ACTIVE", "OPEN"}
+    }
+    return content_hash_text(stable_json({"required": required, "decisions": versions}))
+
+
 class DependencyResolver:
     def __init__(
         self,
@@ -130,8 +162,7 @@ class DependencyResolver:
     ) -> list[DependencyRecord]:
         pending: deque[tuple[str, int]] = deque([(step_id, 0)])
         visited_steps: set[str] = set()
-        seen: set[tuple[str, str]] = set()
-        resolved: list[DependencyRecord] = []
+        resolved_by_key: dict[tuple[str, str], DependencyRecord] = {}
         while pending:
             current_step, depth = pending.popleft()
             if current_step in visited_steps or depth > self.max_depth:
@@ -141,15 +172,34 @@ class DependencyResolver:
                 tenant_id=tenant_id, task_id=task_id, step_id=current_step
             ):
                 key = (dependency.dependency_type.value, dependency.dependency_id)
-                if key not in seen:
-                    dependency.dependency_depth = depth
-                    resolved.append(dependency)
-                    seen.add(key)
+                dependency = replace(dependency, dependency_depth=depth)
+                previous = resolved_by_key.get(key)
+                if previous is not None:
+                    dependency = replace(
+                        previous,
+                        required=previous.required or dependency.required,
+                    )
+                resolved_by_key[key] = dependency
                 if (
                     dependency.dependency_type == DependencyType.STEP
                     and depth < self.max_depth
                 ):
                     pending.append((dependency.dependency_id, depth + 1))
+        resolved = list(resolved_by_key.values())
+        for dependency in resolved:
+            # A longer path may hit the limit after a shorter path already
+            # expanded the same Step. Only genuinely unexpanded edges are gaps.
+            if (
+                dependency.dependency_type == DependencyType.STEP
+                and dependency.dependency_id not in visited_steps
+            ):
+                dependency.closure_truncated = bool(
+                    self.authority.dependencies_for_step(
+                        tenant_id=tenant_id,
+                        task_id=task_id,
+                        step_id=dependency.dependency_id,
+                    )
+                )
         resolved.sort(
             key=lambda value: (
                 not value.required,
@@ -182,8 +232,8 @@ class DependencyResolver:
                     DependencyType.MEMORY,
                     DependencyType.CONSTRAINT,
                 }
-                unresolved = pointer_required and not (
-                    item.source_event_id or item.artifact_id
+                unresolved = dependency.closure_truncated or (
+                    pointer_required and not (item.source_event_id or item.artifact_id)
                 )
                 unresolved = unresolved or (
                     kind == DependencyType.ARTIFACT
@@ -223,6 +273,11 @@ class DependencyResolver:
                 source_event_id=event.id,
                 content_hash=event.content_hash,
                 reason_loaded="explicit event dependency",
+                facets=(
+                    ("user_instruction",)
+                    if event.content_json.get("contract_source") == "user_instruction"
+                    else ()
+                ),
             )
         if kind == DependencyType.DECISION:
             decisions = self.authority.active_decisions(
@@ -248,6 +303,11 @@ class DependencyResolver:
                 content_hash=content_hash_text(decision.decision_text),
                 status=decision.status.value,
                 reason_loaded="explicit active decision dependency",
+                facets=(
+                    ("task_contract",)
+                    if decision.decision_key.startswith("runtime.task_")
+                    else ()
+                ),
             )
         if kind in {DependencyType.MEMORY, DependencyType.CONSTRAINT}:
             memories = self.authority.get_memories(
@@ -378,44 +438,28 @@ class WorkingSetManager:
             invalidator(tenant_id=tenant_id, task_id=task_id, memory_ids=memory_ids)
 
 
-class HybridMemoryRetriever:
+class LexicalMemoryRetriever:
+    """Scoped SQLite keyword retrieval with a bounded query deadline."""
+
     def __init__(
-        self, authority: Any, vector_index: Any | None = None, *, rrf_k: int = 60
+        self,
+        authority: Any,
+        *,
+        lexical_candidate_limit: int = 0,
+        timeout_seconds: float = 3.0,
     ) -> None:
         self.authority = authority
-        self.vector_index = vector_index
-        self.rrf_k = rrf_k
-        self.last_lexical_latency_ms = 0.0
-        self.last_vector_latency_ms = 0.0
-        self.last_vector_error = ""
-        self.last_vector_mismatch_ids: list[str] = []
-        self.last_candidate_count = 0
+        self.lexical_candidate_limit = lexical_candidate_limit
+        self.timeout_seconds = timeout_seconds
+        self.reset_observation()
 
     def reset_observation(self) -> None:
         self.last_lexical_latency_ms = 0.0
-        self.last_vector_latency_ms = 0.0
-        self.last_vector_error = ""
-        self.last_vector_mismatch_ids = []
         self.last_candidate_count = 0
-
-    def _search_vector(
-        self, request: MemorySearchRequest
-    ) -> tuple[list[Any], float, str]:
-        """Run the optional lane without turning its failure into authority failure."""
-
-        started = time.perf_counter()
-        try:
-            return (
-                list(self.vector_index.search(request)),
-                (time.perf_counter() - started) * 1_000,
-                "",
-            )
-        except Exception as exc:  # noqa: BLE001 - SDKs expose unrelated error types.
-            return (
-                [],
-                (time.perf_counter() - started) * 1_000,
-                f"{type(exc).__name__}: {exc}",
-            )
+        self.last_refill_count = 0
+        self.last_has_more = False
+        self.last_lexical_has_more = False
+        self.last_lexical_error = ""
 
     @staticmethod
     def _record_matches_request(
@@ -430,133 +474,50 @@ class HybridMemoryRetriever:
             return False
         return not set(request.excluded_facets).intersection(record.facets)
 
-    @staticmethod
-    def _vector_metadata_matches(hit: Any, record: MemoryRecord) -> bool:
-        """Verify every vector field that can affect filtering or ranking."""
-
-        return (
-            str(getattr(hit, "content_hash", "")) == record.content_hash
-            and str(getattr(hit, "status", "")) == record.status.value
-            and str(getattr(hit, "memory_type", "")) == record.memory_type.value
-            and str(getattr(hit, "phase", "")) == record.phase
-            and str(getattr(hit, "run_id", "")) == record.run_id
-            and set(getattr(hit, "facets", ())) == set(record.facets)
-        )
-
     def search(
-        self, request: MemorySearchRequest, *, use_vector: bool
+        self, request: MemorySearchRequest, *, lexical_limit: int | None = None
     ) -> list[MemoryHit]:
+        from .search_budget import authority_deadline, has_more
+
         self.reset_observation()
-        if not use_vector:
-            lexical_started = time.perf_counter()
-            lexical = self.authority.search_memories_lexical(request)
-            self.last_lexical_latency_ms = (
-                time.perf_counter() - lexical_started
-            ) * 1_000
-            self.last_candidate_count = len(lexical)
-            return lexical
-
-        if self.vector_index is None:
-            lexical_started = time.perf_counter()
-            lexical = self.authority.search_memories_lexical(request)
-            self.last_lexical_latency_ms = (
-                time.perf_counter() - lexical_started
-            ) * 1_000
-            self.last_candidate_count = len(lexical)
-            self.last_vector_error = "vector index is not configured"
-            return lexical
-
-        # Start the optional vector lane first, then execute authority FTS on the
-        # caller thread. The relational connection is not shared across workers.
-        with ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="paged-memory-vector"
-        ) as executor:
-            vector_future = executor.submit(self._search_vector, request)
-            lexical_started = time.perf_counter()
-            lexical = self.authority.search_memories_lexical(request)
-            self.last_lexical_latency_ms = (
-                time.perf_counter() - lexical_started
-            ) * 1_000
-            vector, self.last_vector_latency_ms, self.last_vector_error = (
-                vector_future.result()
-            )
-
-        if self.last_vector_error:
-            self.last_candidate_count = len(lexical)
-            return lexical
-
-        raw_ids = list(
-            dict.fromkeys(
-                [hit.record.id for hit in lexical]
-                + [str(hit.memory_id) for hit in vector]
-            )
+        if request.candidate_limit <= 0:
+            return []
+        deadline = min(
+            time.monotonic() + self.timeout_seconds,
+            request.deadline_monotonic or float("inf"),
         )
-        self.last_candidate_count = len(raw_ids)
-        verified = self.authority.verify_active_memories(
-            tenant_id=request.tenant_id,
-            task_id=request.task_id,
-            memory_ids=raw_ids,
+        lexical_request = replace(
+            request,
+            deadline_monotonic=deadline,
+            candidate_limit=lexical_limit or self.lexical_candidate_limit or request.candidate_limit,
         )
-        eligible = {
-            record.id: record
-            for record in verified
-            if self._record_matches_request(record, request)
-        }
-
-        valid_vector: list[Any] = []
-        mismatches: list[str] = []
-        for hit in vector:
-            record = eligible.get(str(hit.memory_id))
-            if record is None or not self._vector_metadata_matches(hit, record):
-                mismatches.append(str(hit.memory_id))
-                continue
-            valid_vector.append(hit)
-        self.last_vector_mismatch_ids = list(dict.fromkeys(mismatches))
-        if self.last_vector_mismatch_ids:
-            self.last_vector_error = (
-                "vector candidate verification failed for "
-                f"{len(self.last_vector_mismatch_ids)} item(s)"
-            )
-
-        scores: dict[str, float] = {}
-        lexical_map = {
-            hit.record.id: hit for hit in lexical if hit.record.id in eligible
-        }
-        for rank, hit in enumerate(lexical, start=1):
-            if hit.record.id not in eligible:
-                continue
-            scores[hit.record.id] = scores.get(hit.record.id, 0.0) + 1.0 / (
-                self.rrf_k + rank
-            )
-
-        # Preserve original vector ranks when a stale row is discarded. A bad
-        # candidate must not promote every item below it in the same request.
-        valid_vector_ids = {id(hit) for hit in valid_vector}
-        for rank, hit in enumerate(vector, start=1):
-            if id(hit) not in valid_vector_ids:
-                continue
-            scores[hit.memory_id] = scores.get(hit.memory_id, 0.0) + 1.0 / (
-                self.rrf_k + rank
-            )
-
-        ids = sorted(scores, key=lambda memory_id: scores[memory_id], reverse=True)[
-            : request.candidate_limit
-        ]
-        vector_scores = {hit.memory_id: hit.score for hit in valid_vector}
-        results: list[MemoryHit] = []
-        for memory_id in ids:
-            record = eligible[memory_id]
-            lexical_hit = lexical_map.get(record.id)
-            results.append(
-                MemoryHit(
-                    record=record,
-                    score=scores.get(record.id, 0.0),
-                    lexical_score=lexical_hit.lexical_score if lexical_hit else 0.0,
-                    vector_score=vector_scores.get(record.id, 0.0),
-                    reason="hybrid-rrf-verified",
+        started = time.perf_counter()
+        try:
+            with authority_deadline(self.authority, deadline):
+                hits = self.authority.search_memories_lexical(lexical_request)
+                self.last_candidate_count = len(hits)
+                self.last_lexical_has_more = has_more(hits, lexical_request.candidate_limit)
+                self.last_has_more = (
+                    self.last_lexical_has_more or len(hits) > request.candidate_limit
                 )
-            )
-        return results
+                return hits[: request.candidate_limit]
+        except TimeoutError:
+            self.last_lexical_error = "retrieval_deadline"
+            return []
+        finally:
+            self.last_lexical_latency_ms = (time.perf_counter() - started) * 1000
+
+
+def _similarity(left: str, right: str) -> float:
+    # Preserve changed numbers, identifiers, operators and negation. Compare
+    # against individual selected cards, not their ever-growing term union.
+    protected = r"[A-Za-z0-9_]+(?:[.\-/][A-Za-z0-9_]+)*|[<>=!]+|不|无|未|非|禁止|允许|必须|仅|启用|禁用"
+    if re.findall(protected, left.casefold()) != re.findall(
+        protected, right.casefold()
+    ):
+        return 0.0
+    a, b = set(lexical_tokens(left)), set(lexical_tokens(right))
+    return len(a & b) / max(1, len(a | b))
 
 
 class MinimumCoverSelector:
@@ -569,41 +530,63 @@ class MinimumCoverSelector:
         *,
         required_facets: Sequence[str],
         token_budget: int,
+        card_limit: int | None = None,
+        rerank_min_score: float | None = None,
     ) -> list[MemoryRecord]:
         remaining = set(required_facets)
         selected: list[MemoryRecord] = []
-        selected_terms: set[str] = set()
         used = 0
         pool = list(candidates)
+        score_scale = max((abs(hit.score) for hit in pool), default=1.0) or 1.0
         while pool:
+            cap_reached = card_limit is not None and len(selected) >= card_limit
+            if cap_reached and not remaining:
+                break
 
             def value(hit: MemoryHit) -> tuple[float, float, float]:
                 facets = set(hit.record.facets)
                 gain = len(facets & remaining)
-                terms = set(hit.record.preview_text.casefold().split())
-                duplicate = len(terms & selected_terms) / max(
-                    1, len(terms | selected_terms)
+                duplicate = max(
+                    (
+                        _similarity(hit.record.preview_text, item.preview_text)
+                        for item in selected
+                    ),
+                    default=0.0,
                 )
                 tokens = max(
                     1, self.token_budget.estimate_text(hit.record.preview_text)
                 )
-                return (float(gain), hit.score - duplicate * 0.4, -float(tokens))
+                return (
+                    float(gain),
+                    hit.score / score_scale - duplicate * 0.4,
+                    -float(tokens),
+                )
 
             best = max(pool, key=value)
+            if cap_reached and not set(best.record.facets).intersection(remaining):
+                break
             pool.remove(best)
             record = best.record
+            if (
+                rerank_min_score is not None
+                and (best.rerank_score is None or best.rerank_score < rerank_min_score)
+                and not set(record.facets).intersection(remaining)
+            ):
+                continue
             tokens = max(1, self.token_budget.estimate_text(record.preview_text))
             if used + tokens > token_budget:
                 continue
-            terms = set(record.preview_text.casefold().split())
-            duplicate = len(terms & selected_terms) / max(
-                1, len(terms | selected_terms)
+            duplicate = max(
+                (
+                    _similarity(record.preview_text, item.preview_text)
+                    for item in selected
+                ),
+                default=0.0,
             )
-            if duplicate >= 0.90:
+            if duplicate >= 0.90 and not set(record.facets).intersection(remaining):
                 continue
             selected.append(record)
             used += tokens
-            selected_terms.update(terms)
             remaining.difference_update(record.facets)
         return selected
 

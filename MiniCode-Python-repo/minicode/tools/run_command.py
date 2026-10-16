@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import os
+import json
 import locale
+from pathlib import Path
 import re
 import signal
 import shlex
@@ -15,6 +17,7 @@ from typing import Sequence
 from minicode.background_tasks import register_background_shell_task
 from minicode.tooling import ToolDefinition, ToolResult
 from minicode.workspace import resolve_tool_path
+from minicode.tools._validation import validate_contract
 
 # 命令执行超时（秒）- 5 分钟
 COMMAND_TIMEOUT = 300
@@ -30,11 +33,12 @@ def _command_output_encoding() -> str:
     ``cp936`` (or ``gbk``) on Chinese Windows where legacy commands (``dir``,
     ``systeminfo``, batch scripts printing CJK) output in the OEM code page and
     would otherwise garble under the wrong code page. Without an override,
-    decoding tries UTF-8 first and then the local Windows ANSI/OEM encodings.
+    decoding tries UTF-8 first and then the local Windows ANSI/OEM encodings
+    per line, so console messages and UTF-8 file contents can share a stream.
 
-    A single global encoding can't be perfect for mixed output (a ``cp936``
-    override will garble UTF-8 tools, and vice-versa) — pick whichever matches
-    the majority of the commands you run.
+    Explicit overrides apply to the entire stream. Mixed encodings within a
+    single line remain ambiguous; a ``cp936`` override will also garble UTF-8
+    tools, and vice-versa.
     """
     return os.environ.get("MINICODE_COMMAND_ENCODING", "").strip() or "utf-8"
 
@@ -74,35 +78,57 @@ def _decode_command_output(data: bytes | str | None) -> str:
             return data.decode("utf-16")
         except UnicodeDecodeError:
             pass
-    for encoding in _automatic_command_encodings():
-        try:
-            return data.decode(encoding)
-        except (UnicodeDecodeError, LookupError):
-            continue
-    return data.decode("utf-8", errors="replace")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    # `cmd /c dir ... & type package.json` can combine OEM console lines with
+    # raw UTF-8 file bytes. Selecting one codec for the whole stream corrupts
+    # one of those sources. Preserve line endings and choose strict codecs per
+    # line; a multibyte character cannot contain the ASCII LF byte.
+    encodings = _automatic_command_encodings()
+    lines = []
+    for line in data.split(b"\n"):
+        for encoding in encodings:
+            try:
+                lines.append(line.decode(encoding))
+                break
+            except (UnicodeDecodeError, LookupError):
+                continue
+        else:
+            lines.append(line.decode("utf-8", errors="replace"))
+    return "\n".join(lines)
 
 
-def _kill_process_tree(process: subprocess.Popen) -> None:
-    """Best-effort termination of the governed command and its descendants."""
-    if process.poll() is not None:
-        return
+def _kill_process_tree(process: subprocess.Popen) -> bool:
+    """Report tree termination separately from a best-effort parent-only kill."""
+    if os.name == "nt" and process.poll() is not None:
+        # taskkill cannot establish ownership after the parent has disappeared.
+        return False
     try:
         if os.name == "nt":
-            subprocess.run(
+            outcome = subprocess.run(
                 ["taskkill", "/PID", str(process.pid), "/T", "/F"],
                 capture_output=True,
                 check=False,
                 timeout=5,
             )
+            if outcome.returncode and process.poll() is None:
+                process.kill()
+            return outcome.returncode == 0
         else:
-            killpg = getattr(os, "killpg")
-            getpgid = getattr(os, "getpgid")
-            killpg(getpgid(process.pid), getattr(signal, "SIGKILL", 9))
+            # The command owns a session/process group with its launch PID.
+            # Descendants can outlive the group leader.
+            os.killpg(process.pid, signal.SIGKILL)
+            return True
+    except ProcessLookupError:
+        return os.name != "nt"
     except (OSError, subprocess.SubprocessError):
         try:
             process.kill()
         except OSError:
             pass
+    return False
 
 
 
@@ -160,8 +186,11 @@ class _BoundedByteBuffer:
 
 def _drain_process_stream(stream, sink: _BoundedByteBuffer) -> None:
     try:
+        read = getattr(stream, "read1", stream.read)
         while True:
-            chunk = stream.read(8192)
+            # Buffered read(n) may wait for n bytes/EOF while a descendant
+            # holds the pipe. Keep already-printed diagnostics during cleanup.
+            chunk = read(8192)
             if not chunk:
                 return
             sink.append(chunk)
@@ -169,15 +198,22 @@ def _drain_process_stream(stream, sink: _BoundedByteBuffer) -> None:
         return
 
 
-def _bounded_process_output(stdout: _BoundedByteBuffer, stderr: _BoundedByteBuffer) -> str:
-    return "\n".join(
-        part
-        for part in (
-            _decode_command_output(stdout.value()).strip(),
-            _decode_command_output(stderr.value()).strip(),
-        )
-        if part
-    ).strip()
+def _bounded_process_streams(stdout: _BoundedByteBuffer, stderr: _BoundedByteBuffer) -> tuple[str, str]:
+    return (_decode_command_output(stdout.value()).strip(),
+            _decode_command_output(stderr.value()).strip())
+
+
+def _process_arguments(command: str, args: list[str]) -> str | list[str]:
+    # cmd.exe parses its /c payload as shell source, not C-runtime argv.
+    # list2cmdline would backslash-escape embedded quotes, breaking quoted
+    # paths in e.g. `if exist "C:\\Program Files\\..." ...`.
+    if os.name == "nt" and os.path.basename(command).lower() in {"cmd", "cmd.exe"}:
+        switches = [arg.lower() for arg in args]
+        if "/c" in switches:
+            index = switches.index("/c")
+            if len(args) == index + 2:
+                return subprocess.list2cmdline([command, *args[:index + 1]]) + ' "' + args[-1] + '"'
+    return [command, *args]
 
 
 def _run_with_bounded_pipes(
@@ -187,60 +223,146 @@ def _run_with_bounded_pipes(
     cwd: str,
     timeout: float,
     cancellation_event,
+    env=None,
 ) -> ToolResult:
-    popen_kwargs: dict = {}
-    if os.name == "nt":
-        popen_kwargs["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-    else:
-        popen_kwargs["start_new_session"] = True
-    process = subprocess.Popen(  # noqa: S603
-        [command, *args],
-        cwd=cwd,
-        env=os.environ.copy(),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        **popen_kwargs,
-    )
+    started_at = time.monotonic()
+    process, job = (_start_foreground_process(command, args, cwd=cwd) if env is None else
+                    _start_foreground_process(command, args, cwd=cwd, env=env))
     assert process.stdout is not None and process.stderr is not None
     stdout = _BoundedByteBuffer(MAX_OUTPUT_CHARS // 2)
     stderr = _BoundedByteBuffer(MAX_OUTPUT_CHARS // 2)
     readers = [
-        threading.Thread(target=_drain_process_stream, args=(process.stdout, stdout), daemon=True),
-        threading.Thread(target=_drain_process_stream, args=(process.stderr, stderr), daemon=True),
+        threading.Thread(target=_drain_process_stream, args=(process.stdout, stdout), daemon=True,
+                         name="minicode-command-stdout"),
+        threading.Thread(target=_drain_process_stream, args=(process.stderr, stderr), daemon=True,
+                         name="minicode-command-stderr"),
     ]
     for reader in readers:
         reader.start()
 
-    started_at = time.monotonic()
     canceled = False
     timed_out = False
-    while process.poll() is None:
-        if cancellation_event is not None and cancellation_event.is_set():
-            canceled = True
-            _kill_process_tree(process)
-            break
-        if time.monotonic() - started_at >= timeout:
-            timed_out = True
-            _kill_process_tree(process)
-            break
-        time.sleep(0.02)
-
+    tree_terminated = False
+    cleanup_error = ""
+    active_children = None
     try:
-        process.wait(timeout=5)
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait(timeout=5)
-    for reader in readers:
-        reader.join(timeout=5)
+        while True:
+            # A browser can outlive node or close its inherited output pipes.
+            # Parent exit alone is not completion of an owned foreground job.
+            if process.poll() is not None and not any(reader.is_alive() for reader in readers):
+                if job is None or job.active_processes() == 0:
+                    break
+            if cancellation_event is not None and cancellation_event.is_set():
+                canceled = True
+                break
+            if time.monotonic() - started_at >= timeout:
+                timed_out = True
+                break
+            time.sleep(0.02)
 
-    output = _bounded_process_output(stdout, stderr)
+        if canceled or timed_out:
+            if job is not None:
+                try:
+                    job.terminate()
+                    tree_terminated = True
+                except OSError as error:
+                    cleanup_error = str(error)
+                    if process.poll() is None:
+                        process.kill()
+            else:
+                tree_terminated = _kill_process_tree(process)
+                if not tree_terminated:
+                    cleanup_error = "process-group termination failed"
+
+        # One cleanup budget covers the parent, all descendants and both pipes.
+        cleanup_deadline = time.monotonic() + 10.0
+        try:
+            process.wait(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        except subprocess.TimeoutExpired:
+            cleanup_error = cleanup_error or "foreground launcher did not exit"
+        for reader in readers:
+            reader.join(timeout=max(0.0, cleanup_deadline - time.monotonic()))
+        if job is not None:
+            active_children = job.active_processes()
+            while active_children and time.monotonic() < cleanup_deadline:
+                time.sleep(0.02)
+                active_children = job.active_processes()
+    except OSError as error:
+        cleanup_error = str(error)
+    finally:
+        # KILL_ON_JOB_CLOSE also applies when receipt collection raises.
+        # An unconfirmed cleanup is still reported as uncertain below.
+        if job is not None:
+            job.close()
+        for stream, reader in zip((process.stdout, process.stderr), readers):
+            if not reader.is_alive():
+                stream.close()
+
+    stdout_text, stderr_text = _bounded_process_streams(stdout, stderr)
+    output = "\n".join(part for part in (stdout_text, stderr_text) if part)
     partial = f"\nPartial output:\n{output}" if output else ""
-    if canceled:
-        return ToolResult(ok=False, output=f"Command canceled by parent Runtime (process killed).{partial}")
-    if timed_out:
-        return ToolResult(ok=False, output=f"Command timed out after {timeout} seconds (process killed).{partial}")
-    return ToolResult(ok=process.returncode == 0, output=output)
+    settled = (process.poll() is not None and not any(reader.is_alive() for reader in readers)
+               and (job is None or active_children == 0) and not cleanup_error
+               and (not (canceled or timed_out) or tree_terminated))
+    command_result = {"exitCode": process.returncode, "stdout": stdout_text,
+                      "stderr": stderr_text, "settled": settled}
+    if not settled:
+        details = (f"launcher_pid={process.pid}, exit_code={process.returncode}, "
+                   f"job_active_processes={active_children}, "
+                   f"stdout_pending={readers[0].is_alive()}, stderr_pending={readers[1].is_alive()}")
+        partial += f"\nCleanup diagnostics: {details}" + (f"; {cleanup_error}" if cleanup_error else "")
+    if canceled or timed_out:
+        reason = "Command canceled by parent Runtime" if canceled else f"Command timed out after {timeout} seconds"
+        cleanup = "process tree terminated and output collected" if settled else "process cleanup is not confirmed"
+        return ToolResult(ok=False, output=f"{reason} ({cleanup}).{partial}", timedOut=timed_out,
+            failureKind="canceled" if canceled else None, commandExitCode=process.returncode,
+            commandResult=command_result,
+            commandExecutionSettled=settled, unsettledTool=not settled, ambiguousSideEffect=not settled)
+    if not settled:
+        output = "Command exited, but output collection has not settled; descendant processes may still be running." + partial
+    elif process.returncode != 0:
+        output = f"Command exited with code {process.returncode}."
+        if stdout_text:
+            output += f"\n\nstdout:\n{stdout_text}"
+        output += (f"\n\nstderr:\n{stderr_text}" if stderr_text else
+                   "\n\nNo stderr was captured. If the command redirects or suppresses stderr, "
+                   "keep diagnostics visible when investigating; stdout alone does not establish success.")
+    return ToolResult(ok=settled and process.returncode == 0, output=output,
+        commandExitCode=process.returncode, commandResult=command_result, commandExecutionSettled=settled,
+        unsettledTool=not settled, ambiguousSideEffect=not settled)
+
+
+def _start_foreground_process(command: str, args: list[str], *, cwd: str, env=None):
+    """Register Windows ownership before allowing the command to spawn children."""
+    argv = _process_arguments(command, args)
+    environment = os.environ.copy() if env is None else dict(env)
+    if os.name != "nt":
+        return subprocess.Popen(argv, cwd=cwd, env=environment, stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True), None
+
+    from minicode.service_process import WindowsJob
+    gate = Path(__file__).resolve().parents[1] / "service_host.py"
+    # The stdlib-only gate does not need venv redirectors or site initialization.
+    gate_python = getattr(sys, "_base_executable", None) or sys.executable
+    process = subprocess.Popen([gate_python, "-I", "-S", "-u", str(gate)], cwd=cwd, env=environment,
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        creationflags=subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP)
+    job = None
+    try:
+        job = WindowsJob(process)
+        process.stdin.write((json.dumps({"argv": argv, "cwd": cwd}, ensure_ascii=False) + "\n").encode("utf-8"))
+        process.stdin.close()
+        return process, job
+    except BaseException:
+        # The gate cannot launch the requested command until registration succeeds.
+        if job is not None:
+            job.close()
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            stream.close()
+        raise
 
 # Read-only commands that never need permission prompts.
 # Includes both Unix and Windows equivalents.
@@ -395,6 +517,7 @@ def _build_execution_command(
     *,
     use_shell: bool,
     background_shell: bool,
+    cwd: str | None = None,
 ) -> tuple[str, list[str]]:
     if use_shell:
         shell_command = _strip_trailing_background_operator(raw_command) if background_shell else raw_command
@@ -408,6 +531,22 @@ def _build_execution_command(
         quoted_args = subprocess.list2cmdline(list(normalized_args))
         shell_command = normalized_command if not quoted_args else f"{normalized_command} {quoted_args}"
         return "cmd", ["/d", "/s", "/c", shell_command]
+    # Explicit relative launchers belong to the requested working directory,
+    # not the server process directory. Resolve before permission admission.
+    if cwd and os.path.dirname(normalized_command) and not os.path.isabs(normalized_command):
+        normalized_command = os.path.abspath(os.path.join(cwd, normalized_command))
+    if os.name == "nt":
+        # CreateProcess does not search PATHEXT like a Windows shell does.
+        # Resolve npm/npx/pnpm .cmd shims before launch, preserving the argv and
+        # passing the real executable through the normal permission check.
+        resolved = shutil.which(normalized_command)
+        # Python 3.11's which() does not try PATHEXT when a directory is
+        # present. Explicit extensionless launcher paths need the same lookup.
+        if resolved is None and os.path.dirname(normalized_command):
+            resolved = next((path for suffix in (".exe", ".com", ".cmd", ".bat")
+                             if (path := shutil.which(normalized_command + suffix))), None)
+        if resolved:
+            return resolved, list(normalized_args)
     # On non-Windows, if "python" is not in PATH but "python3" is, use python3.
     # This is a common situation on Linux distros that only ship "python3".
     if os.name != "nt" and normalized_command == "python" and shutil.which("python") is None:
@@ -417,24 +556,38 @@ def _build_execution_command(
     return normalized_command, list(normalized_args)
 
 
+RUN_COMMAND_INPUT = {"type": "object", "additionalProperties": False, "properties": {
+    "command": {"type": "string", "minLength": 1, "description": "Command to run"},
+    "args": {"type": ["array", "null"], "items": {"type": "string"},
+             "description": "Literal string arguments, without shell glob expansion. Use powershell/pwsh -NoProfile -Command for PowerShell scripts; -lc belongs to POSIX shells. Keep stderr visible for diagnostics: avoid 2>$null in PowerShell dependency checks. Query Python packages with the project's Python interpreter and -m pip --disable-pip-version-check list. Omit or use null/[] for none. Boolean and numeric values must be formatted intentionally as strings."},
+    "cwd": {"type": ["string", "null"], "description": "Working directory; omit or use null for the workspace root"},
+    "timeout": {"type": ["integer", "null"], "minimum": 1, "maximum": 600,
+                "description": "Timeout in seconds; omit or use null for the default of 300"},
+    "check_report": {"type": "string", "minLength": 1,
+                     "description": "Optional: only for a custom script that explicitly writes this report. Omit for ordinary pytest, ruff, npm test and other test runners; this option does not generate a report. Declare the script's JSON output path relative to cwd. The command must freshly write {\"schema\":\"minicode.check-report.v1\",\"completed\":true,\"checks\":[{\"name\":\"specific criterion\",\"passed\":true}]}. Missing, stale, incomplete or failed reports fail the call even with exit code 0. Use unique check names and report failures; a report only covers its listed checks."},
+    "image_paths": {"type": "array", "maxItems": 12,
+                    "items": {"type": "string", "minLength": 1},
+                    "description": "Expected screenshot/image output files, relative to cwd or absolute. Declare these when running screenshot scripts: completed new/changed images are immediately saved and shown to the user, including when the command later fails. Exact paths only; unchanged existing images are not republished (use display_image for those)."},
+}, "required": ["command"]}
+
+
 def _validate(input_data: dict) -> dict:
-    command = input_data.get("command")
-    if not isinstance(command, str):
-        raise ValueError("command is required")
+    validate_contract(input_data, RUN_COMMAND_INPUT)
+    command = input_data["command"]
     args = input_data.get("args") or []
-    if not isinstance(args, list):
-        raise ValueError("args must be a list")
     cwd = input_data.get("cwd")
-    if cwd is not None and not isinstance(cwd, str):
-        raise ValueError("cwd must be a string")
-    # Optional timeout (seconds), clamped to [1, 600]
+    if not command.strip():
+        raise ValueError("command must be nonblank")
+    program, arguments = _normalize_command_input({"command": command, "args": args})
+    from minicode.tools._command_preflight import validate_shell_arguments
+    validate_shell_arguments(program, arguments)
+    # Invalid values must be corrected before a process starts, never clamped.
     timeout = input_data.get("timeout")
-    if timeout is not None:
-        try:
-            timeout = max(1, min(600, int(timeout)))
-        except (ValueError, TypeError):
-            timeout = None
-    return {"command": command, "args": [str(arg) for arg in args], "cwd": cwd, "timeout": timeout}
+    if "check_report" in input_data and not input_data["check_report"].strip():
+        raise ValueError("check_report must be a nonblank file path")
+    return {"command": command, "args": args, "cwd": cwd, "timeout": timeout,
+            **({"check_report": input_data["check_report"]} if "check_report" in input_data else {}),
+            **({"image_paths": input_data["image_paths"]} if "image_paths" in input_data else {})}
 
 
 def _run(input_data: dict, context) -> ToolResult:
@@ -454,6 +607,7 @@ def _run(input_data: dict, context) -> ToolResult:
         normalized_args,
         use_shell=use_shell,
         background_shell=background_shell,
+        cwd=effective_cwd,
     )
     shell_prompt_reason = _classify_shell_snippet_risk(input_data["command"]) if use_shell else None
     force_prompt_reason = (
@@ -468,7 +622,28 @@ def _run(input_data: dict, context) -> ToolResult:
         elif use_shell or not _is_read_only_command(normalized_command):
             context.permissions.ensure_command(command, args, effective_cwd)
 
+    if (getattr(context, "cancellation_event", None) is not None
+            and context.cancellation_event.is_set()):
+        return ToolResult(ok=False, output="Command canceled before process start.", failureKind="canceled")
+
+    from minicode.tools._command_preflight import check_command
+    from minicode.tools._validation import InputContractError
+    try:
+        preflight = check_command(command, args, cwd=effective_cwd, use_shell=use_shell)
+    except InputContractError as error:
+        return ToolResult(ok=False, output=str(error), failureKind="invalid_input",
+                          inputRejected=True, inputValidationFailed=True, inputIssues=error.issues)
+    if preflight is not None:
+        return preflight
+
     if use_shell and background_shell:
+        if input_data.get("check_report"):
+            return ToolResult(ok=False, inputRejected=True, failureKind="invalid_input",
+                output="Check reports require a foreground command with a settled process result. No command was started.")
+        if input_data.get("image_paths"):
+            return ToolResult(ok=False, output=("Image outputs require a foreground command. "
+                "Remove the trailing background operator, or use display_image after the files are saved."),
+                failureKind="invalid_input")
         if getattr(context, "cancellation_event", None) is not None:
             return ToolResult(
                 ok=False,
@@ -513,7 +688,10 @@ def _run(input_data: dict, context) -> ToolResult:
             backgroundTask=background_task,
         )
 
-    if sys.platform != "win32":
+    # Governed commands need the same bounded join/termination receipt on every
+    # platform. Keep PTY compatibility only for the ungoverned CLI path.
+    if (sys.platform != "win32" and getattr(context, "cancellation_event", None) is None
+            and not input_data.get("image_paths") and not input_data.get("check_report")):
         try:
             import pty
             import select
@@ -584,28 +762,43 @@ def _run(input_data: dict, context) -> ToolResult:
                     ok=False,
                     output=f"Command canceled by parent Runtime (process killed).\nPartial output:\n{output_str}",
                 )
-            return ToolResult(ok=process.returncode == 0, output=output_str)
+            return ToolResult(ok=process.returncode == 0, output=output_str, commandExitCode=process.returncode)
             
         except ImportError:
             pass  # Fallback to subprocess on systems without pty
 
     effective_timeout = input_data.get("timeout") or COMMAND_TIMEOUT
     try:
-        return _run_with_bounded_pipes(
-            command,
-            args,
-            cwd=effective_cwd,
-            timeout=effective_timeout,
-            cancellation_event=getattr(context, "cancellation_event", None),
-        )
+        from minicode.command_images import CommandImages
+        from minicode.command_checks import CommandCheckReport
+        try:
+            check_report = (CommandCheckReport(context, effective_cwd, input_data["check_report"])
+                            if input_data.get("check_report") else None)
+        except (OSError, ValueError) as error:
+            return ToolResult(ok=False, inputRejected=True, failureKind="invalid_input",
+                output=f"Check report path rejected before execution: {error}")
+        with CommandImages(context, effective_cwd, input_data.get("image_paths", [])) as images:
+            result = _run_with_bounded_pipes(
+                command,
+                args,
+                cwd=effective_cwd,
+                timeout=effective_timeout,
+                cancellation_event=getattr(context, "cancellation_event", None),
+            )
+        if note := images.summary():
+            result.output += "\n" + note
+        if check_report is not None:
+            result = check_report.finish(result)
+        return result
     except OSError as error:
         return ToolResult(ok=False, output=f"Command execution failed: {error}")
 
 
 run_command_tool = ToolDefinition(
     name="run_command",
-    description="Run a common development command from an allowlist. Supports optional timeout parameter (1-600 seconds).",
-    input_schema={"type": "object", "properties": {"command": {"type": "string", "description": "Command to run"}, "args": {"type": "array", "items": {"type": "string"}, "description": "Arguments"}, "cwd": {"type": "string", "description": "Working directory"}, "timeout": {"type": "integer", "description": "Timeout in seconds (1-600, default 300)"}}, "required": ["command"]},
+    description=("Run a common development command from an allowlist. Supports optional timeout parameter (1-600 seconds). "
+                 "Git ignore checks are skipped in directories without a repository; a skip does not verify ignore rules."),
+    input_schema=RUN_COMMAND_INPUT,
     validator=_validate,
     run=_run,
 )

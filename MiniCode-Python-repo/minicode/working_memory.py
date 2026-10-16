@@ -14,7 +14,12 @@ Provides:
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass, field
+import json
+from collections.abc import Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import asdict, dataclass, field
+from copy import deepcopy
 from typing import Any
 
 from minicode.context_manager import estimate_tokens
@@ -58,6 +63,26 @@ class WorkingMemoryTracker:
         self._entries: list[WorkingMemoryEntry] = []
         self.max_entries = max_entries
         self.max_tokens = max_tokens
+        # One explicit current-task slot, separate from best-effort/TTL notes.
+        # The Runtime consumes this data through its own native receipt gate;
+        # it is not automatically injected into StableTaskPack or granted trust.
+        self._task_context: dict[str, Any] | None = None
+
+    def task_context(self) -> dict[str, Any] | None:
+        return deepcopy(self._task_context)
+
+    def set_task_context(self, value: dict[str, Any] | None) -> None:
+        """Bounded, explicit replacement; ordinary note eviction cannot erase it.
+
+        This stores data only. Restoring the same JSON never restores native
+        tool observations, delivery/reading credit or permission to project it.
+        """
+        if value is not None:
+            if not isinstance(value, dict):
+                raise ValueError("task working context must be an object")
+            if len(json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")) > 16000:
+                raise ValueError("task working context exceeds 16000 UTF-8 bytes; existing context was retained")
+        self._task_context = deepcopy(value)
 
     def add(
         self,
@@ -237,16 +262,52 @@ class ConversationContinuityManager:
 
 _working_memory = WorkingMemoryTracker()
 _continuity_manager = ConversationContinuityManager()
+_worker_memory: ContextVar[tuple[WorkingMemoryTracker, ConversationContinuityManager] | None] = ContextVar(
+    "worker_working_memory", default=None,
+)
+
+
+@contextmanager
+def isolated_working_memory() -> Iterator[None]:
+    """Keep short-term state local to a Worker, including nested delegation."""
+    token = _worker_memory.set((WorkingMemoryTracker(), ConversationContinuityManager()))
+    try:
+        yield
+    finally:
+        _worker_memory.reset(token)
 
 
 def get_working_memory() -> WorkingMemoryTracker:
-    """Get the global working memory tracker."""
-    return _working_memory
+    """Get this Worker's tracker, or the legacy tracker outside a Worker."""
+    scoped = _worker_memory.get()
+    return scoped[0] if scoped is not None else _working_memory
 
 
 def get_continuity_manager() -> ConversationContinuityManager:
-    """Get the global conversation continuity manager."""
-    return _continuity_manager
+    """Get this Worker's continuity manager, or the legacy standalone manager."""
+    scoped = _worker_memory.get()
+    return scoped[1] if scoped is not None else _continuity_manager
+
+
+def snapshot_working_state() -> dict[str, Any]:
+    """Lossless short-term context; kept private in completed-turn snapshots."""
+    tracker, continuity = get_working_memory(), get_continuity_manager()
+    return {"entries": [asdict(entry) for entry in tracker._entries],
+            "markers": [asdict(marker) for marker in continuity._markers],
+            "max_entries": tracker.max_entries, "max_tokens": tracker.max_tokens,
+            "max_markers": continuity.max_markers,
+            **({"task_context": tracker.task_context()} if tracker.task_context() is not None else {})}
+
+
+def restore_working_state(value: dict[str, Any]) -> None:
+    """Restore data only, inside the new Worker's independent context scope."""
+    tracker, continuity = get_working_memory(), get_continuity_manager()
+    tracker._entries = [WorkingMemoryEntry(**deepcopy(entry)) for entry in value.get("entries", [])]
+    continuity._markers = [ContinuityMarker(**deepcopy(marker)) for marker in value.get("markers", [])]
+    tracker.max_entries = int(value.get("max_entries", tracker.max_entries))
+    tracker.max_tokens = int(value.get("max_tokens", tracker.max_tokens))
+    continuity.max_markers = int(value.get("max_markers", continuity.max_markers))
+    tracker.set_task_context(value.get("task_context"))
 
 
 def protect_context(
@@ -256,7 +317,7 @@ def protect_context(
     importance: float = 1.0,
 ) -> WorkingMemoryEntry:
     """Convenience function to protect context during compaction."""
-    return _working_memory.add(
+    return get_working_memory().add(
         content,
         entry_type,
         ttl_seconds,
@@ -270,4 +331,4 @@ def mark_continuity(
     metadata: dict[str, Any] | None = None,
 ) -> ContinuityMarker:
     """Convenience function to add a continuity marker."""
-    return _continuity_manager.add_marker(marker_type, description, metadata)
+    return get_continuity_manager().add_marker(marker_type, description, metadata)

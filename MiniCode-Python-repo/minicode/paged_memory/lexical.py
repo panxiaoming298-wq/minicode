@@ -1,7 +1,7 @@
 """Deterministic search text preparation shared by authority adapters.
 
 The authority database owns exact/full-text retrieval.  This module keeps the
-same token stream in SQLite and PostgreSQL so both backends rank the same
+consistent token stream in SQLite so keyword retrieval ranks the same
 Chinese, English, and source-code identifiers instead of falling back to a
 bounded Python scan.
 """
@@ -14,9 +14,7 @@ from collections import Counter
 from collections.abc import Iterable, Sequence
 
 _RAW_TOKEN = re.compile(r"[A-Za-z][A-Za-z0-9_]*|[0-9]+|[\u3400-\u9fff]+")
-_CAMEL_PART = re.compile(
-    r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+"
-)
+_CAMEL_PART = re.compile(r"[A-Z]+(?=[A-Z][a-z]|[0-9]|$)|[A-Z]?[a-z]+|[0-9]+")
 
 
 def lexical_tokens(value: str) -> list[str]:
@@ -59,24 +57,32 @@ def memory_search_document(
 
 
 def query_tokens(value: str) -> list[str]:
-    """Deduplicate query terms without losing their deterministic order."""
+    """Prefer Chinese words/bigrams; keep explicit single-character queries.
 
-    return list(dict.fromkeys(lexical_tokens(value)))
+    Existing persisted documents already contain these lexemes, so improving
+    query precision does not require rewriting authoritative records or FTS.
+    """
+    terms: list[str] = []
+    for match in _RAW_TOKEN.finditer(value):
+        raw = match.group(0)
+        tokens = lexical_tokens(raw)
+        if "\u3400" <= raw[0] <= "\u9fff" and len(raw) > 1:
+            tokens = [token for token in tokens if len(token) > 1]
+        terms.extend(tokens)
+    return list(dict.fromkeys(terms))
 
 
 def sqlite_match_expression(value: str) -> str:
     """Render safe FTS5 OR terms; lexical_tokens emits no query operators."""
 
-    return " OR ".join(f'"{token.replace(chr(34), chr(34) * 2)}"' for token in query_tokens(value))
+    return " OR ".join(
+        f'"{token.replace(chr(34), chr(34) * 2)}"' for token in query_tokens(value)
+    )
 
 
-def postgres_tsquery(value: str) -> str:
-    """Render safe ``to_tsquery('simple', ...)`` input."""
-
-    return " | ".join(query_tokens(value))
-
-
-def scope_boost(*, record_phase: str, record_run_id: str, phase: str, run_id: str) -> float:
+def scope_boost(
+    *, record_phase: str, record_run_id: str, phase: str, run_id: str
+) -> float:
     """Prefer the current scope without making older phases/runs invisible."""
 
     score = 0.0
@@ -123,7 +129,6 @@ __all__ = [
     "bm25_scores",
     "lexical_tokens",
     "memory_search_document",
-    "postgres_tsquery",
     "query_tokens",
     "scope_boost",
     "sqlite_match_expression",

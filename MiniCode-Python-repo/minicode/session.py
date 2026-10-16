@@ -11,6 +11,8 @@ Uses incremental delta saves to reduce serialization overhead:
 
 from __future__ import annotations
 
+from minicode.store_lock import serialized_sessions
+
 import hashlib
 import json
 import time
@@ -20,13 +22,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from minicode.config import MINI_CODE_DIR
+from minicode.config import MINI_CODE_DIR, runtime_sessions_directory
 from minicode.logging_config import log_session_event
 from minicode.path_safety import is_unsafe_stored_path
+from minicode.runtime_messages import is_user_input
+from minicode.session_trash import SessionTrash
 from minicode.session_contract import (
+    derive_turn_records,
     atomic_write_json,
     build_session_record,
     delete_session_bundle,
+    session_bundle_deletable,
     read_session_bundle,
     _valid_session_id,
     write_session_bundle,
@@ -37,7 +43,7 @@ from minicode.session_contract import (
 # Configuration
 # ---------------------------------------------------------------------------
 
-SESSIONS_DIR = MINI_CODE_DIR / "sessions"
+SESSIONS_DIR = runtime_sessions_directory()
 AUTOSAVE_INTERVAL_SECONDS = 30  # Minimum seconds between autosaves
 
 # Incremental save configuration
@@ -77,6 +83,8 @@ class SessionMetadata:
     tool_call_count: int = 0
     status: str = "active"
     memory_summary: str = ""
+    binding: dict[str, Any] = field(default_factory=dict)
+    review_pending: bool = False
 
 
 @dataclass
@@ -116,6 +124,8 @@ class SessionData:
     runtime_runs: list[dict[str, Any]] = field(default_factory=list)
     checkpoints: list[FileCheckpoint] = field(default_factory=list)
     metadata: SessionMetadata = field(default=None)
+    binding: dict[str, Any] = field(default_factory=dict)
+    context_state: dict[str, Any] = field(default_factory=dict)
     
     # Incremental save tracking
     _last_saved_msg_count: int = field(default=0, repr=False)
@@ -139,22 +149,20 @@ class SessionData:
                 delegation_summary=_summarize_delegation_status(self.delegation_status),
                 extension_summary=_summarize_extension_manifests(self.extension_manifests),
                 readiness_summary=_summarize_readiness_report(self.readiness_report),
-                turn_count=len(self.turns)
-                or sum(
-                    1 for message in self.messages
-                    if isinstance(message, dict) and message.get("role") == "user"
-                ),
+                turn_count=len(derive_turn_records(self.messages, created_at=self.created_at)),
                 user_input_count=sum(
                     1 for message in self.messages
-                    if isinstance(message, dict) and message.get("role") == "user"
+                    if isinstance(message, dict) and is_user_input(message)
                 ),
                 tool_call_count=sum(
                     1 for message in self.messages
                     if isinstance(message, dict)
-                    and message.get("role") in {"assistant_tool_call", "tool_result", "tool"}
+                    and message.get("role") == "assistant_tool_call"
                 ),
                 memory_summary=_summarize_memory_continuity(self.memory_continuity),
             )
+
+        self.metadata.binding = dict(self.binding)
 
     def update_metadata(self) -> None:
         """Refresh metadata from current state."""
@@ -163,6 +171,7 @@ class SessionData:
         # session from this field.  Keep it aligned even when callers reuse a
         # deserialized SessionMetadata object or mutate session_id in tests.
         self.metadata.session_id = self.session_id
+        self.metadata.binding = dict(self.binding)
         self.metadata.updated_at = self.updated_at
         self.metadata.message_count = len(self.messages)
         self.metadata.runtime_summary = _runtime_summary_from_transcript_entries(
@@ -184,14 +193,14 @@ class SessionData:
         )
         user_input_count = sum(
             1 for message in self.messages
-            if isinstance(message, dict) and message.get("role") == "user"
+            if isinstance(message, dict) and is_user_input(message)
         )
         tool_call_count = sum(
             1 for message in self.messages
             if isinstance(message, dict)
-            and message.get("role") in {"assistant_tool_call", "tool_result", "tool"}
+            and message.get("role") == "assistant_tool_call"
         )
-        self.metadata.turn_count = len(self.turns) or user_input_count
+        self.metadata.turn_count = len(derive_turn_records(self.messages, created_at=self.created_at))
         self.metadata.user_input_count = user_input_count
         self.metadata.tool_call_count = tool_call_count
         self.metadata.memory_summary = _summarize_memory_continuity(
@@ -203,7 +212,7 @@ class SessionData:
 
         # Extract first user message (truncated)
         for msg in self.messages:
-            if msg.get("role") == "user":
+            if is_user_input(msg):
                 content = msg.get("content", "")
                 if not isinstance(content, str):
                     content = "" if content is None else str(content)
@@ -213,7 +222,7 @@ class SessionData:
         # Extract last message (truncated) — avoid full reverse iteration
         if self.messages:
             for msg in reversed(self.messages):
-                if msg.get("role") in ("user", "assistant"):
+                if is_user_input(msg) or msg.get("role") == "assistant":
                     content = msg.get("content", "")
                     if not isinstance(content, str):
                         content = "" if content is None else str(content)
@@ -482,7 +491,9 @@ def _save_session_index(index: dict[str, SessionMetadata]) -> None:
             "user_input_count": meta.user_input_count,
             "tool_call_count": meta.tool_call_count,
             "status": meta.status,
+            "review_pending": meta.review_pending,
             "memory_summary": meta.memory_summary,
+            "binding": meta.binding,
         }
         for sid, meta in index.items()
     }
@@ -671,6 +682,7 @@ def _load_session_from_bundle(session_id: str) -> SessionData | None:
         user_input_count=record.metadata.user_input_count,
         tool_call_count=record.metadata.tool_call_count,
         status=record.metadata.status,
+        review_pending=extensions.get("review_pending") is True,
         memory_summary=_summarize_memory_continuity(record.memory_continuity),
         checkpoint_count=len(checkpoints),
     )
@@ -691,6 +703,8 @@ def _load_session_from_bundle(session_id: str) -> SessionData | None:
         ),
         checkpoints=checkpoints,
         metadata=metadata,
+        binding=dict(extensions.get("binding") or {}),
+        context_state=dict(extensions.get("context_state") or {}),
     )
     session._last_saved_msg_count = len(session.messages)
     session._last_saved_transcript_count = len(session.transcript_entries)
@@ -700,6 +714,7 @@ def _load_session_from_bundle(session_id: str) -> SessionData | None:
     return session
 
 
+@serialized_sessions
 def save_session(session: SessionData, force_full: bool = False) -> None:
     """Persist session to disk with incremental delta support.
 
@@ -735,6 +750,8 @@ def save_session(session: SessionData, force_full: bool = False) -> None:
             "created_at": session.created_at,
             "updated_at": session.updated_at,
             "workspace": session.workspace,
+            "binding": session.binding,
+            "context_state": session.context_state,
             "messages": session.messages,
             "transcript_entries": session.transcript_entries,
             "turns": session.turns,
@@ -773,7 +790,9 @@ def save_session(session: SessionData, force_full: bool = False) -> None:
                 "user_input_count": session.metadata.user_input_count,
                 "tool_call_count": session.metadata.tool_call_count,
                 "status": session.metadata.status,
+                "review_pending": session.metadata.review_pending,
                 "memory_summary": session.metadata.memory_summary,
+                "binding": session.binding,
             },
         }
         atomic_write_json(session_path, serializable)
@@ -808,6 +827,7 @@ def save_session(session: SessionData, force_full: bool = False) -> None:
         )
 
 
+@serialized_sessions
 def load_session(session_id: str) -> SessionData | None:
     """Load a session from disk, applying any pending deltas.
 
@@ -862,6 +882,8 @@ def load_session(session_id: str) -> SessionData | None:
             readiness_report=data.get("readiness_report", {}),
             memory_continuity=data.get("memory_continuity", {}),
             runtime_runs=data.get("runtime_runs", []),
+            binding=dict(data.get("binding") or {}),
+            context_state=dict(data.get("context_state") or {}),
             checkpoints=[
                 _deserialize_checkpoint(item)
                 for item in data.get("checkpoints", [])
@@ -955,7 +977,8 @@ def load_session(session_id: str) -> SessionData | None:
         return _load_session_from_bundle(session_id)
 
 
-def list_sessions(workspace: str | None = None) -> list[SessionMetadata]:
+@serialized_sessions
+def list_sessions(workspace: str | None = None, *, include_archived: bool = False) -> list[SessionMetadata]:
     """List available sessions, newest first.
 
     When ``workspace`` is provided, only sessions created for that exact
@@ -963,18 +986,51 @@ def list_sessions(workspace: str | None = None) -> list[SessionMetadata]:
     want current-workspace semantics.
     """
     index = _load_session_index()
+    trash = SessionTrash(SESSIONS_DIR)
     sessions = [
         meta
         for meta in index.values()
-        if workspace is None or meta.workspace == workspace
+        if (workspace is None or meta.workspace == workspace or meta.binding.get("project_path") == workspace)
+        and (include_archived or trash.get(meta.session_id) is None)
     ]
     sessions.sort(key=lambda s: s.updated_at, reverse=True)
     return sessions
 
 
-def delete_session(session_id: str) -> bool:
-    """Delete a session from disk. Returns True if deleted."""
+@serialized_sessions
+def load_session_metadata(session_id: str) -> SessionMetadata | None:
+    """Read browser metadata without restoring the model's full conversation."""
     if not _valid_session_id(session_id):
+        return None
+    metadata = _load_session_index().get(session_id)
+    if metadata is None:
+        return None
+    carrier = _session_file(session_id)
+    bundle = SESSIONS_DIR / session_id / "metadata.json"
+    for path in (carrier, bundle):
+        if not is_unsafe_stored_path(path, boundary=SESSIONS_DIR, reject_hardlinks=True) and path.is_file():
+            return metadata
+    return None
+
+
+def delete_session(session_id: str, *, missing_ok: bool = False, collect_history: bool = True) -> bool:
+    """Delete a session from disk. Returns True if deleted."""
+    if not _delete_session_data(session_id, missing_ok=missing_ok, collect_history=collect_history):
+        return False
+    try:
+        from minicode.runtime_cleanup import RuntimeCleanup
+        return RuntimeCleanup().finish_session(session_id)
+    except (OSError, ValueError, RuntimeError):
+        return False
+
+
+@serialized_sessions
+def _delete_session_data(session_id: str, *, missing_ok: bool, collect_history: bool) -> bool:
+    if not _valid_session_id(session_id):
+        return False
+    # Owned worktrees must first be explicitly cleaned or detached by the API.
+    existing = load_session(session_id)
+    if existing is not None and existing.binding.get("worktree_id"):
         return False
     session_path = _session_file(session_id)
     bundle_path = SESSIONS_DIR / session_id
@@ -991,22 +1047,34 @@ def delete_session(session_id: str) -> bool:
     ):
         return False
     bundle_exists = bundle_path.is_dir()
-    if not session_path.exists() and not bundle_exists:
+    if not session_path.exists() and not bundle_exists and not missing_ok:
+        return False
+    if not session_bundle_deletable(session_id, SESSIONS_DIR):
         return False
 
     try:
-        if session_path.exists():
-            session_path.unlink()
+        from minicode.runtime_cleanup import RuntimeCleanup
+        runtime_cleanup = RuntimeCleanup()
+        if existing is not None:
+            runtime_cleanup.queue_session(existing)
+            from minicode.task_history import purge_session_history
+            purge_session_history(existing.workspace, session_id)
         # Clean up orphaned delta files
         if delta_dir.exists():
             import shutil
-            shutil.rmtree(delta_dir, ignore_errors=True)
+            shutil.rmtree(delta_dir)
         delete_session_bundle(session_id, SESSIONS_DIR)
+        if bundle_path.exists():
+            return False
+        if session_path.exists():
+            session_path.unlink()
         index = _load_session_index()
         index.pop(session_id, None)
         _save_session_index(index)
+        from minicode.session_history import delete_history
+        delete_history(session_id, collect=collect_history)
         return True
-    except OSError:
+    except (OSError, ValueError, RuntimeError):
         return False
 
 
@@ -1018,9 +1086,16 @@ def cleanup_old_sessions(max_sessions: int = 50) -> int:
 
     to_delete = sessions[max_sessions:]
     deleted = 0
-    for meta in to_delete:
-        if delete_session(meta.session_id):
-            deleted += 1
+    # A batch must trace shared history objects once, after all selected owners
+    # are removed, rather than rereading the retained graph for every session.
+    from minicode.history_storage import history_transaction
+    from minicode.history_objects import collect_unreferenced
+    with history_transaction():
+        for meta in to_delete:
+            if delete_session(meta.session_id, collect_history=False):
+                deleted += 1
+        if deleted:
+            collect_unreferenced()
     return deleted
 
 

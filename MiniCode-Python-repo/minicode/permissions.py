@@ -3,6 +3,10 @@ from __future__ import annotations
 import json
 import os
 import sys
+import threading
+from dataclasses import dataclass, field
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Callable, Literal
@@ -25,6 +29,38 @@ PermissionDecision = Literal[
 ]
 
 PromptHandler = Callable[[dict[str, Any]], dict[str, Any]]
+
+
+@dataclass
+class _TurnEditGrants:
+    paths: set[str] = field(default_factory=set)
+    allow_all: bool = False
+    generation: int = 0
+    lock: Any = field(default_factory=threading.RLock)
+
+# Bound to one tool invocation, including operation-scoped permission adapters.
+# Concurrent Agents must never pause each other's execution budget.
+_approval_wait: ContextVar[Any | None] = ContextVar("permission_approval_wait", default=None)
+
+
+@contextmanager
+def bind_approval_wait(clock):
+    token = _approval_wait.set(clock)
+    try:
+        yield
+    finally:
+        _approval_wait.reset(token)
+
+
+def approval_cancelled() -> bool:
+    clock = _approval_wait.get()
+    return clock is not None and clock.cancellation.is_set()
+
+
+def pause_for_user_input():
+    """Suspend this tool's execution clock while its host collects an answer."""
+    clock = _approval_wait.get()
+    return clock.pause_for_approval() if clock is not None else nullcontext()
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +235,13 @@ def _write_permission_store(store: dict[str, Any]) -> None:
 
 
 class PermissionManager:
+    def _request_approval(self, request: dict[str, Any]) -> dict[str, Any]:
+        clock = _approval_wait.get()
+        with clock.pause_for_approval() if clock is not None else nullcontext():
+            if self.prompt is None:
+                return {"decision": "deny_once"}
+            return self.prompt(request)
+
     def __init__(self, workspace_root: str, prompt: PromptHandler | None = None, auto_mode: PermissionMode | None = None) -> None:
         self.workspace_root = _normalize_path(workspace_root)
         self.prompt = prompt
@@ -215,8 +258,7 @@ class PermissionManager:
         self.denied_edit_patterns: set[str] = set()
         self.session_allowed_edits: set[str] = set()
         self.session_denied_edits: set[str] = set()
-        self.turn_allowed_edits: set[str] = set()
-        self.turn_allow_all_edits = False
+        self._turn_edit_grants = _TurnEditGrants()
         self._initialize()
 
     def _initialize(self) -> None:
@@ -228,9 +270,27 @@ class PermissionManager:
         self.allowed_edit_patterns |= {_normalize_path(item) for item in store.get("allowedEditPatterns", [])}
         self.denied_edit_patterns |= {_normalize_path(item) for item in store.get("deniedEditPatterns", [])}
 
+    @property
+    def turn_allowed_edits(self) -> set[str]:
+        return self._turn_edit_grants.paths
+
+    @turn_allowed_edits.setter
+    def turn_allowed_edits(self, paths: set[str]) -> None:
+        self._turn_edit_grants.paths = paths
+
+    @property
+    def turn_allow_all_edits(self) -> bool:
+        return self._turn_edit_grants.allow_all
+
+    @turn_allow_all_edits.setter
+    def turn_allow_all_edits(self, allowed: bool) -> None:
+        self._turn_edit_grants.allow_all = allowed
+
     def begin_turn(self) -> None:
-        self.turn_allowed_edits.clear()
-        self.turn_allow_all_edits = False
+        with self._turn_edit_grants.lock:
+            self.turn_allowed_edits.clear()
+            self.turn_allow_all_edits = False
+            self._turn_edit_grants.generation += 1
 
     def end_turn(self) -> None:
         self.begin_turn()
@@ -268,12 +328,18 @@ class PermissionManager:
             "denied_edit_patterns",
         ):
             setattr(scoped, attribute, set(getattr(self, attribute)))
-        scoped.turn_allowed_edits = set(self.turn_allowed_edits)
-        scoped.turn_allow_all_edits = self.turn_allow_all_edits
+        # Only explicit turn-wide grants are shared. One-operation decisions
+        # remain local, and ending the turn revokes grants in existing forks.
+        scoped._turn_edit_grants = self._turn_edit_grants
         return scoped
 
     def get_summary(self) -> list[str]:
         summary = [f"cwd: {self.workspace_root}"]
+        summary.append(
+            "permission mode: full access; file edits, commands and external paths do not require approval"
+            if self.auto_checker.mode == PermissionMode.BYPASS
+            else f"permission mode: {self.auto_checker.mode.value}"
+        )
         summary.append(
             "extra allowed dirs: "
             + (", ".join(sorted(self.allowed_directory_prefixes)[:4]) if self.allowed_directory_prefixes else "none")
@@ -298,8 +364,19 @@ class PermissionManager:
             }
         )
 
+    def _bypass_approval(self, operation: str, target: str) -> bool:
+        if self.auto_checker.mode != PermissionMode.BYPASS:
+            return False
+        # Full access is explicit for this run. Do not turn it into persistent
+        # or session allowlist entries that would survive returning to default.
+        get_mode_state().record_decision("approve")
+        log_permission_check(operation, target, granted=True)
+        return True
+
     def ensure_path_access(self, target_path: str, intent: str) -> None:
         normalized_target = _normalize_path(target_path)
+        if self._bypass_approval("path_access", normalized_target):
+            return
         
         # Fast path: check workspace root first (most common case)
         # workspace_root is already normalized, so no need for Path.resolve() again
@@ -333,7 +410,7 @@ class PermissionManager:
             )
 
         scope_directory = normalized_target if intent in {"list", "command_cwd"} else str(Path(normalized_target).parent)
-        result = self.prompt(
+        result = self._request_approval(
             {
                 "kind": "path",
                 "summary": f"mini-code wants {intent.replace('_', ' ')} access outside the current cwd",
@@ -374,6 +451,8 @@ class PermissionManager:
         force_prompt_reason: str | None = None,
     ) -> None:
         self.ensure_path_access(command_cwd, "command_cwd")
+        if self._bypass_approval("run_command", _format_command_signature(command, args)):
+            return
         dangerous_reason = _classify_dangerous_command(command, args)
         reason = force_prompt_reason or dangerous_reason
         if not reason:
@@ -417,7 +496,7 @@ class PermissionManager:
             if dangerous_reason and not force_prompt_reason
             else "mini-code wants approval for this command"
         )
-        result = self.prompt(
+        result = self._request_approval(
             {
                 "kind": "command",
                 "summary": summary,
@@ -447,7 +526,10 @@ class PermissionManager:
         raise RuntimeError(f"Command denied: {signature}")
 
     def ensure_edit(self, target_path: str, diff_preview: str) -> None:
+        generation = self._turn_edit_grants.generation
         normalized_target = _normalize_path(target_path)
+        if self._bypass_approval("edit_file", normalized_target):
+            return
         if (
             normalized_target in self.session_denied_edits
             or normalized_target in self.denied_edit_patterns
@@ -476,7 +558,7 @@ class PermissionManager:
         if self.prompt is None:
             log_permission_check("edit_file", normalized_target, granted=False)
             raise RuntimeError(f"Edit requires approval: {normalized_target}. Start minicode in TTY mode to review it.")
-        result = self.prompt(
+        result = self._request_approval(
             {
                 "kind": "edit",
                 "summary": "mini-code wants to apply a file modification",
@@ -497,11 +579,14 @@ class PermissionManager:
         if decision == "allow_once":
             self.session_allowed_edits.add(normalized_target)
             return
-        if decision == "allow_turn":
-            self.turn_allowed_edits.add(normalized_target)
-            return
-        if decision == "allow_all_turn":
-            self.turn_allow_all_edits = True
+        if decision in {"allow_turn", "allow_all_turn"}:
+            with self._turn_edit_grants.lock:
+                if generation != self._turn_edit_grants.generation:
+                    raise RuntimeError("Edit approval expired after the turn ended")
+                if decision == "allow_turn":
+                    self.turn_allowed_edits.add(normalized_target)
+                else:
+                    self.turn_allow_all_edits = True
             return
         if decision == "allow_always":
             self.allowed_edit_patterns.add(normalized_target)
