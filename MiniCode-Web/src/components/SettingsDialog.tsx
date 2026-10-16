@@ -80,7 +80,7 @@ export function SettingsDialog({ section, onSectionChange, onClose, children }: 
           <div className="settings-dialog-local"><SlidersHorizontal size={14} /><span>本机偏好设置</span></div>
         </aside>
         <section className={`settings-dialog-panel ${section === "extensions" ? "is-extensions" : ""}`} aria-labelledby="settings-category-title">
-          <header className="settings-dialog-panel-heading"><h2 id="settings-category-title">{current.label}</h2><p>{current.description}</p></header>
+          <header className={section === "extensions" ? "sr-only" : "settings-dialog-panel-heading"}><h2 id="settings-category-title">{current.label}</h2><p>{current.description}</p></header>
           <div className="settings-dialog-content" ref={contentRef}>
             {children}
           </div>

@@ -977,6 +977,21 @@ def load_session(session_id: str) -> SessionData | None:
         return _load_session_from_bundle(session_id)
 
 
+def _session_files_available(session_id: str) -> bool:
+    """Check backing files without loading the conversation into navigation."""
+    if not _valid_session_id(session_id):
+        return False
+    bundle = SESSIONS_DIR / session_id
+    for paths in ((_session_file(session_id),), (bundle / "metadata.json", bundle / "conversation.json")):
+        if all(
+            not is_unsafe_stored_path(path, boundary=SESSIONS_DIR, reject_hardlinks=True)
+            and path.is_file()
+            for path in paths
+        ):
+            return True
+    return False
+
+
 @serialized_sessions
 def list_sessions(workspace: str | None = None, *, include_archived: bool = False) -> list[SessionMetadata]:
     """List available sessions, newest first.
@@ -992,6 +1007,7 @@ def list_sessions(workspace: str | None = None, *, include_archived: bool = Fals
         for meta in index.values()
         if (workspace is None or meta.workspace == workspace or meta.binding.get("project_path") == workspace)
         and (include_archived or trash.get(meta.session_id) is None)
+        and _session_files_available(meta.session_id)
     ]
     sessions.sort(key=lambda s: s.updated_at, reverse=True)
     return sessions
@@ -1003,14 +1019,9 @@ def load_session_metadata(session_id: str) -> SessionMetadata | None:
     if not _valid_session_id(session_id):
         return None
     metadata = _load_session_index().get(session_id)
-    if metadata is None:
+    if metadata is None or not _session_files_available(session_id):
         return None
-    carrier = _session_file(session_id)
-    bundle = SESSIONS_DIR / session_id / "metadata.json"
-    for path in (carrier, bundle):
-        if not is_unsafe_stored_path(path, boundary=SESSIONS_DIR, reject_hardlinks=True) and path.is_file():
-            return metadata
-    return None
+    return metadata
 
 
 def delete_session(session_id: str, *, missing_ok: bool = False, collect_history: bool = True) -> bool:

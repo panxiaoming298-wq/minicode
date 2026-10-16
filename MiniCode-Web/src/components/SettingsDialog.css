@@ -59,16 +59,12 @@
 .settings-account .provider-balance-heading h3 { font-size: 15px; }
 .settings-account-note h3 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
 .settings-account-note p { margin: 0 0 16px; font-size: 13px; line-height: 1.7; color: var(--muted); }
-.settings-dialog .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(210px, .9fr) minmax(0, 1.6fr); }
+.settings-dialog-panel.is-extensions .settings-dialog-content { display: flex; overflow: hidden; padding-right: 0; scrollbar-gutter: auto; }
+.settings-dialog .workspace-page.is-embedded.extensions-page { overflow: hidden; }
+.settings-dialog .extensions-page { --capability-list-width: clamp(240px, 32%, 300px); }
 .settings-dialog .extensions-page :is(.extension-detail, .skill-catalog-detail) { padding: 20px; }
 .settings-dialog .extensions-page :is(.extension-filters, .skill-catalog-filters, .extension-detail-head, .extension-health) { flex-wrap: wrap; }
 .settings-dialog .extensions-page .extension-health > .button { margin-left: 0; }
-.settings-dialog .extensions-page .capability-management-scope { padding: 12px; }
-.settings-dialog .extensions-page .capability-management-scope label { width: 100%; }
-.settings-dialog .extensions-page .capability-scope-select { flex: 1; }
-.settings-dialog .extensions-page .capability-management-scope select { width: 100%; }
-.settings-dialog .extensions-page .capability-catalog-heading { flex-wrap: wrap; gap: 8px 12px; }
-.settings-dialog .extensions-page .capability-view-tabs { gap: 12px; }
 .rail-footer .rail-settings-trigger { gap: 11px; padding: 10px 9px; min-height: 62px; }
 .rail-settings-trigger > .rail-settings-avatar { flex: 0 0 36px; width: 36px; height: 36px; padding: 9px; border-radius: 50%; background: var(--panel-deep); color: var(--text-soft); }
 .rail-settings-copy { display: flex; flex: 1; min-width: 0; flex-direction: column; gap: 2px; }
@@ -81,7 +77,6 @@
   .settings-dialog { width: calc(100vw - 40px); height: calc(100dvh - 48px); }
   .settings-dialog-body { grid-template-columns: 180px minmax(0, 1fr); gap: 20px; padding-right: 24px; }
   .settings-category { padding-inline: 12px; gap: 10px; font-size: 13px; }
-  .settings-dialog .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(180px, .9fr) minmax(0, 1.4fr); }
 }
 @media (max-width: 700px) {
   .settings-dialog { width: calc(100vw - 24px); height: calc(100dvh - 24px); border-radius: 20px; }
@@ -102,7 +97,6 @@
   .settings-account-connection { flex-wrap: wrap; gap: 12px; }
   .settings-account-connection .button { margin-left: 58px; }
   .settings-account-details > div { gap: 12px; }
-  .settings-dialog .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(0, 1fr); }
   .settings-dialog .extensions-page :is(.extension-detail, .skill-catalog-detail) { padding: 18px 14px; }
 }
 @media (prefers-reduced-motion: reduce) { .settings-dialog[open] { animation: none; } }

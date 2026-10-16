@@ -1112,3 +1112,33 @@ def test_save_load_preserves_checkpoints(temp_session_dir, tmp_path):
     assert loaded is not None
     assert len(loaded.checkpoints) == 1
     assert loaded.checkpoints[0].checkpoint_id == cp.checkpoint_id
+
+
+@pytest.mark.parametrize("storage", ["legacy", "bundle", "missing", "partial_bundle"])
+def test_session_listing_checks_backing_files_without_changing_index(temp_session_dir, storage):
+    from minicode.session import load_session_metadata
+
+    session = create_new_session(workspace="/tmp/available")
+    session.messages = [{"role": "user", "content": "Preserve this conversation"}]
+    save_session(session, force_full=True)
+    carrier = temp_session_dir / f"{session.session_id}.json"
+    bundle = temp_session_dir / session.session_id
+    if storage != "legacy":
+        carrier.unlink()
+    if storage in {"legacy", "missing"}:
+        (bundle / "metadata.json").unlink()
+    if storage in {"legacy", "missing", "partial_bundle"}:
+        (bundle / "conversation.json").unlink()
+    index = temp_session_dir.parent / "sessions_index.json"
+    original_index = index.read_bytes()
+
+    available = storage in {"legacy", "bundle"}
+    for workspace in (None, session.workspace):
+        assert [item.session_id for item in list_sessions(workspace)] == ([session.session_id] if available else [])
+    assert (load_session_metadata(session.session_id) is not None) is available
+    assert (load_session(session.session_id) is not None) is available
+    assert index.read_bytes() == original_index
+    # Restoring the persisted source makes the session visible again; listing
+    # must not erase an index row during a temporary missing-file condition.
+    save_session(session, force_full=True)
+    assert [item.session_id for item in list_sessions()] == [session.session_id]

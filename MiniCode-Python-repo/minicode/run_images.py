@@ -249,7 +249,7 @@ class RunImageStore:
             path.unlink(missing_ok=True)
         return {"clearedCount": len(blobs), "releasedBytes": released_bytes}
 
-    def records(self, *, turn_id: str = "", web_run_id: str = "") -> list[dict]:
+    def records(self, *, turn_id: str = "", web_run_id: str = "", all_images: bool = False) -> list[dict]:
         """Recover published pictures even when the tool or worker never returns."""
         directory = self.store.root / "outputs" / "images"
         try:
@@ -259,7 +259,7 @@ class RunImageStore:
         except (OSError, ValueError, ArtifactIntegrityError):
             # A damaged image directory must not prevent opening the conversation.
             return []
-        return [dict(value) for value in records if (turn_id or web_run_id)
+        return [dict(value) for value in records if (all_images or turn_id or web_run_id)
                 and (not turn_id or value.get("turnId") == turn_id)
                 and (not web_run_id or value.get("webRunId") == web_run_id)]
 

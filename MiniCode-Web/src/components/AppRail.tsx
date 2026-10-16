@@ -52,6 +52,7 @@ interface AppRailProps {
   onNewStandaloneTask: () => void;
   onNewProjectTask: (workspace: string) => Promise<void>;
   onSelectSession: (sessionId: string) => void;
+  onSearch: () => void;
   onArchiveSession: (sessionId: string) => void;
   onOpenTrash: () => void;
   onChangeWorkspace: (workspace: string) => Promise<void>;
@@ -146,6 +147,7 @@ export function AppRail({
   onNewStandaloneTask,
   onNewProjectTask,
   onSelectSession,
+  onSearch,
   onArchiveSession,
   onOpenTrash,
   onChangeWorkspace,
@@ -259,6 +261,10 @@ export function AppRail({
   useEffect(() => {
     if (searchOpen) searchRef.current?.focus();
   }, [searchOpen]);
+
+  useEffect(() => {
+    if (searchOpen) onSearch();
+  }, [searchOpen, searchRequest, onSearch]);
 
   const sessionsByProject = useMemo(() => {
     const grouped = new Map<string, SessionSummary[]>();

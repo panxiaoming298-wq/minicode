@@ -25,6 +25,7 @@ import type {
   ProjectClosePayload,
   RunEvent,
   RunInfo,
+  RunImage,
   RunBudget,
   RunInput,
   RunSnapshot,
@@ -164,6 +165,10 @@ export const api = {
   imageStatus: (sessionId: string, imageIds: string[], signal?: AbortSignal) => request<{ images: ImageStatus[] }>(
     `/api/sessions/${encodeURIComponent(sessionId)}/images/status?${new URLSearchParams({ image_ids: imageIds.join(",") })}`, { signal }),
   imageStorage: (signal?: AbortSignal) => request<ImageStorageView>("/api/storage/images", { signal }),
+  sessionImages: (sessionId: string, signal?: AbortSignal) => request<{ sessionId: string; revision: string; images: RunImage[] }>(
+    `/api/storage/images/${encodeURIComponent(sessionId)}`, { signal }),
+  storedImageUrl: (sessionId: string, imageId: string, download = false) =>
+    `${API_ROOT}/api/storage/images/${encodeURIComponent(sessionId)}/${encodeURIComponent(imageId)}${download ? "?download=true" : ""}`,
   clearSessionImages: (sessionId: string, revision: string) => request<{ clearedCount: number; releasedBytes: number }>(
     `/api/sessions/${encodeURIComponent(sessionId)}/images?${new URLSearchParams({ confirmed: "true", revision })}`, { method: "DELETE" }),
   contextKnowledge: (sessionId: string, signal?: AbortSignal) => request<ContextKnowledgeView>(

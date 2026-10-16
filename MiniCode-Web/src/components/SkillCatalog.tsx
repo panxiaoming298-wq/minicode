@@ -1,8 +1,9 @@
-import { ArrowLeft, ArrowUpRight, Check, ChevronDown, CircleAlert, CircleCheck, Copy, Download, Eye, FolderOpen, Info, LoaderCircle, RefreshCw, Search, Sparkles } from "lucide-react";
+import { ArrowLeft, ArrowUpRight, Check, ChevronDown, ChevronRight, CircleAlert, CircleCheck, Copy, Download, Eye, FolderOpen, Info, LoaderCircle, RefreshCw, Search, Sparkles, X } from "lucide-react";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { api } from "../api/client";
 import type { ConversationScope, SkillInventory, SkillInventoryItem, SkillPreview } from "../types";
 import { skillAvailability, skillSourceLabel, skillStatusLabel } from "../lib/skillPresentation";
+import { SkillMarkdown } from "./SkillMarkdown";
 import "./SkillCatalog.css";
 
 interface Props {
@@ -44,6 +45,8 @@ export function SkillCatalog({ workspace, scope, invocationWorkspace, invocation
   const list = useRef<HTMLDivElement>(null);
   const search = useRef<HTMLInputElement>(null);
   const detail = useRef<HTMLElement>(null);
+  const detailContent = useRef<HTMLDivElement>(null);
+  const previewContent = useRef<HTMLElement>(null);
   const appliedFocus = useRef("");
   const sameInvocationContext = scope === invocationScope && (scope === "standalone" || workspace === invocationWorkspace);
 
@@ -89,14 +92,23 @@ export function SkillCatalog({ workspace, scope, invocationWorkspace, invocation
   selection.current = selected?.key || "";
   useEffect(() => {
     actionRevision.current += 1; setPreview(null); setBusy(""); setNotice("");
-    detail.current?.scrollTo({ top: 0 });
+    detailContent.current?.scrollTo({ top: 0 });
   }, [selected?.key]);
+  useEffect(() => {
+    const content = detailContent.current;
+    const explanation = previewContent.current;
+    if (preview && content && explanation) {
+      content.scrollTo({ top: content.scrollTop + explanation.getBoundingClientRect().top - content.getBoundingClientRect().top - 16 });
+    }
+  }, [preview]);
   const winner = selected?.shadowedBy ? skills.find(item => item.key === selected.shadowedBy) : null;
   const availability = selected ? skillAvailability(selected, sameInvocationContext) : null;
 
   function selectSkill(key: string) {
     setSelectedKey(key); setDetailOpen(true);
-    if (window.matchMedia("(max-width: 819px)").matches) requestAnimationFrame(() => detail.current?.focus());
+    requestAnimationFrame(() => {
+      if (list.current && !list.current.getClientRects().length) detail.current?.focus({ preventScroll: true });
+    });
   }
 
   function showWinner() {
@@ -136,14 +148,21 @@ export function SkillCatalog({ workspace, scope, invocationWorkspace, invocation
   return <div className={`skill-catalog ${detailOpen ? "is-detail-open" : ""} ${importForm ? "is-installing" : ""} ${skills.length === 0 ? "is-empty" : ""}`} aria-label="技能目录">
     <section className="skill-catalog-sidebar" aria-label="Skill 目录">
       <div className="skill-catalog-toolbar">
-        <label className="extension-search"><Search size={15} /><input ref={search} aria-label="搜索技能" placeholder="搜索名称或用途" value={query} onChange={event => setQuery(event.target.value)} /></label>
+        <div className="extension-search"><Search size={15} aria-hidden="true" /><input ref={search} aria-label="搜索技能" placeholder="搜索名称或用途" value={query} onChange={event => setQuery(event.target.value)} />
+          {query && <button type="button" className="capability-search-clear" aria-label="清除技能搜索" onClick={() => { setQuery(""); search.current?.focus(); }}><X size={14} /></button>}
+        </div>
         <button className="icon-button" aria-label="刷新 Skill 目录" title="刷新 Skill 目录" onClick={() => void refresh()} disabled={loading}><RefreshCw size={16} className={loading ? "spin" : ""} /></button>
       </div>
+      <div className="skill-catalog-list-heading">
       <div className="skill-catalog-filters" role="group" aria-label="技能来源">
-        <span className="capability-filter-label">来源</span>
+        <span className="sr-only">来源</span>
         {scope === "project" ? [['all', '全部'], ['project', '本项目'], ['global', '全局']].map(([value, label]) => <button key={value} aria-pressed={filter === value} onClick={() => setFilter(value)}>{label}</button>) : <span className="capability-source-label">全局</span>}
       </div>
-      <p className="skill-catalog-count" aria-live="polite">{loading ? "正在发现技能…" : `${filtered.length} 个技能${filtered.length !== skills.length ? ` / 共 ${skills.length} 个` : ""} · ${filtered.filter(item => item.canInvokeInConversation).length} 个当前对话可用`}</p>
+      <div className="skill-catalog-count" aria-live="polite">{loading ? "正在发现技能…" : <>
+        <span title={`共 ${skills.length} 个技能`}><strong>{filtered.length}</strong>{filtered.length !== skills.length ? ` / ${skills.length}` : ""} 个技能</span>
+        <span className="sr-only">{filtered.filter(item => item.canInvokeInConversation).length} 个当前对话可用</span>
+      </>}</div>
+      </div>
       {error ? <p role="alert" className="skill-catalog-message">{error}</p> : <div ref={list} className="skill-catalog-list" role="listbox" aria-label="已发现 Skill"
         onKeyDown={event => {
           if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key) || !filtered.length) return;
@@ -158,7 +177,7 @@ export function SkillCatalog({ workspace, scope, invocationWorkspace, invocation
           return <button type="button" key={item.key} role="option" aria-selected={selected?.key === item.key}
             tabIndex={selected?.key === item.key ? 0 : -1}
             aria-label={`${item.name} · ${skillSourceLabel(item)} · ${state.label}`} onClick={() => selectSkill(item.key)}>
-            <span className="skill-row-heading"><strong>{item.name}</strong></span>
+            <span className="skill-row-heading"><strong>{item.name}</strong><ChevronRight size={14} aria-hidden="true" /></span>
             <p>{item.description || "没有描述"}</p>
             <span className="skill-row-meta"><small>{skillSourceLabel(item)}</small><span className={`skill-status tone-${state.tone}`}>{state.label}</span></span>
           </button>;
@@ -166,8 +185,9 @@ export function SkillCatalog({ workspace, scope, invocationWorkspace, invocation
         {!loading && !filtered.length && <p className="capability-list-empty">{skills.length ? "没有匹配项" : "此范围没有技能"}</p>}
       </div>}
     </section>
-    <section ref={detail} tabIndex={-1} className="skill-catalog-detail" aria-label="技能详情">
+    <section ref={detail} tabIndex={-1} className={`skill-catalog-detail ${selected && !error && !importForm ? "has-selection" : ""}`} aria-label="技能详情">
       {importForm || (selected && !error ? <>
+        <div ref={detailContent} className="skill-detail-content">
         <button className="skill-list-back" onClick={() => {
           setDetailOpen(false);
           requestAnimationFrame(() => list.current?.querySelector<HTMLButtonElement>('[aria-selected="true"]')?.focus());
@@ -186,12 +206,8 @@ export function SkillCatalog({ workspace, scope, invocationWorkspace, invocation
                 ? <button className="skill-next-action" onClick={() => onViewConversation(selected.name)}>查看当前对话的技能<ArrowUpRight size={13} /></button> : null}
           </div>
         </div>}
-        <div className="skill-detail-actions">
-          <button className="button button-primary" onClick={() => void action("use")} disabled={!selected.canInvokeInConversation || loading || Boolean(busy)}>{busy === "use" ? <LoaderCircle size={15} className="spin" /> : <ArrowUpRight size={15} />}添加到对话</button>
-          <button className="button button-secondary" onClick={() => void action("preview")} aria-expanded={preview?.key === selected.key} aria-controls="skill-content-preview" disabled={!selected.canPreview || loading || Boolean(busy)}>{busy === "preview" ? <LoaderCircle size={15} className="spin" /> : <Eye size={15} />}{preview?.key === selected.key ? "收起说明" : "查看说明"}</button>
-        </div>
         {notice && <p role="status" className="skill-catalog-notice">{notice}</p>}
-        {preview?.key === selected.key && <section id="skill-content-preview" className="skill-preview" aria-label="技能说明"><header><strong>技能说明 · SKILL.md</strong><span><Check size={13} />仅预览</span></header>{preview.truncated && <p>文件较大，展示前 256 KiB；完整内容请查看源文件。</p>}<pre>{preview.content}</pre></section>}
+        {preview?.key === selected.key && <section ref={previewContent} id="skill-content-preview" className="skill-preview" aria-label="技能说明"><header><strong>技能说明 · SKILL.md</strong><span><Check size={13} />仅预览</span></header>{preview.truncated && <p>文件较大，展示前 256 KiB；完整内容请查看源文件。</p>}<SkillMarkdown content={preview.content} /></section>}
         {selected.extensionKey && <div className="skill-owner"><div><strong>由 {selected.extensionId} 提供</strong><p>信任、权限、启停和更新由所属扩展包统一管理。</p></div><button className="button button-secondary" onClick={() => onManage(selected.extensionKey!)}><FolderOpen size={15} />管理所属扩展</button></div>}
         <details key={selected.key} className="skill-technical-details"><summary><FolderOpen size={15} /><span>文件与发现信息</span><ChevronDown size={14} /></summary>
           <dl className="skill-facts">
@@ -203,6 +219,11 @@ export function SkillCatalog({ workspace, scope, invocationWorkspace, invocation
           <button className="button button-secondary" onClick={() => void action("copy")} disabled={!selected.path || loading || Boolean(busy)}><Copy size={15} />复制文件路径</button>
           {discovery}
         </details>
+        </div>
+        <div className="skill-detail-actions">
+          <button className="button button-secondary" onClick={() => void action("preview")} aria-expanded={preview?.key === selected.key} aria-controls="skill-content-preview" disabled={!selected.canPreview || loading || Boolean(busy)}>{busy === "preview" ? <LoaderCircle size={15} className="spin" /> : <Eye size={15} />}{preview?.key === selected.key ? "收起说明" : "查看说明"}</button>
+          <button className="button button-primary" onClick={() => void action("use")} disabled={!selected.canInvokeInConversation || loading || Boolean(busy)}>{busy === "use" ? <LoaderCircle size={15} className="spin" /> : <ArrowUpRight size={15} />}添加到对话</button>
+        </div>
       </> : <><div className="skill-catalog-empty capability-empty-detail"><span className="capability-empty-icon"><Sparkles size={28} strokeWidth={1.5} aria-hidden="true" /></span>
         <h2>{loading ? "正在读取目录" : error ? "暂时无法读取技能" : skills.length ? "没有匹配的技能" : scope === "standalone" ? "本机全局尚未发现技能" : "此查看范围尚未发现技能"}</h2>
         <p>{error ? "请重试，或检查本机服务是否正常运行。" : skills.length ? "调整搜索词或来源筛选后查看。" : scope === "standalone" ? "全局技能可供独立对话和项目使用。项目技能需切换查看范围。" : "这里包含本项目和继承的全局技能，也可以导入新的技能。"}</p>

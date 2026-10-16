@@ -705,3 +705,26 @@ def test_run_rejects_non_public_execution_profile(
         )
 
     assert response.status_code == 422
+
+
+def test_navigation_excludes_missing_session_files_and_their_pins(tmp_path, isolated_web_home):
+    with _client(tmp_path, isolated_web_home) as client:
+        existing = client.post("/api/sessions", json={"workspace": str(tmp_path)}).json()["session"]
+        missing = client.post("/api/sessions", json={"workspace": str(tmp_path)}).json()["session"]
+        identity = missing["sessionId"]
+        assert client.put("/api/navigation/pins", json={"kind": "session", "target": identity, "pinned": True}).status_code == 200
+        assert identity in {item["sessionId"] for item in client.get("/api/navigation").json()["sessions"]}
+        # An external cleanup can remove data without updating sessions_index.json.
+        for path in (
+            session_module.SESSIONS_DIR / f"{identity}.json",
+            session_module.SESSIONS_DIR / identity / "metadata.json",
+            session_module.SESSIONS_DIR / identity / "conversation.json",
+        ):
+            path.unlink()
+
+        navigation = client.get("/api/navigation").json()
+        assert [item["sessionId"] for item in navigation["sessions"]] == [existing["sessionId"]]
+        assert navigation["pinnedSessionIds"] == []
+        assert [item["sessionId"] for item in client.get("/api/sessions").json()["sessions"]] == [existing["sessionId"]]
+        assert client.get(f"/api/sessions/{identity}/view").status_code == 404
+        assert client.get(f"/api/sessions/{existing['sessionId']}/view").status_code == 200

@@ -1,29 +1,39 @@
-.extensions-page { overflow: hidden; }
+.extensions-page { overflow: hidden; container: capabilities / inline-size; }
 .extensions-page .workspace-page-content { display: flex; flex: 1; flex-direction: column; width: min(1280px, 100%); min-height: 0; padding: 24px 32px; }
 .extensions-page .workspace-page-heading { display: grid; flex-shrink: 0; grid-template-columns: 48px minmax(0, 1fr); align-items: center; gap: 6px 16px; margin-bottom: 20px; }
 .extensions-page .workspace-page-icon { grid-row: span 2; width: 48px; height: 48px; margin: 0; border: 1px solid var(--line); background: var(--panel); }
 .extensions-page .workspace-page-heading h1 { margin: 0; font-size: 25px; line-height: 1.3; }
 .extensions-page .workspace-page-heading p { font-size: 13px; line-height: 1.6; }
-.capability-management-scope { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 8px 24px; padding: 12px 16px; margin-bottom: 16px; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--panel); }
-.capability-management-scope label { display: flex; align-items: center; gap: 14px; min-width: 0; max-width: 100%; color: var(--muted); font-size: 12px; }
+.capability-management-scope { display: flex; flex: 0 1 auto; align-items: center; min-width: 0; gap: 4px; margin-left: auto; }
+.capability-management-scope label { display: flex; align-items: center; gap: 8px; min-width: 0; max-width: 100%; color: var(--muted); font-size: 12px; }
 .capability-management-scope label > span:first-child { flex-shrink: 0; }
 .capability-scope-select { position: relative; display: flex; align-items: center; min-width: 0; color: var(--text-soft); }
 .capability-scope-select > svg { position: absolute; pointer-events: none; }
 .capability-scope-select > svg:first-child { left: 12px; }
 .capability-scope-select > svg:last-child { right: 12px; }
-.capability-management-scope select { appearance: none; min-width: 0; max-width: 100%; width: 300px; height: 38px; border: 1px solid var(--line-strong); border-radius: var(--radius-control); padding: 0 34px 0 36px; color: var(--text); background: var(--surface-raised); font: inherit; font-size: 13px; text-overflow: ellipsis; cursor: pointer; }
+.capability-management-scope select { appearance: none; min-width: 0; max-width: 100%; width: 200px; height: 36px; border: 1px solid var(--line-strong); border-radius: var(--radius-control); padding: 0 34px 0 36px; color: var(--text); background: var(--surface-raised); font: inherit; font-size: 13px; text-overflow: ellipsis; cursor: pointer; }
 .capability-management-scope select:disabled { cursor: not-allowed; opacity: .6; }
 .capability-conversation-scope { display: flex; align-items: center; gap: 7px; min-width: 0; color: var(--muted); font-size: 12px; }
 .capability-conversation-scope > svg { flex-shrink: 0; }
-.capability-conversation-scope > span { overflow-wrap: anywhere; }
-.capability-scope-help { flex-basis: 100%; margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.capability-conversation-scope > span { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.capability-scope-help { margin: 0; color: var(--muted); font-size: 12px; line-height: 1.6; }
+.capability-scope-info { position: relative; flex-shrink: 0; color: var(--muted); }
+.capability-scope-info > summary { display: grid; place-items: center; width: 30px; height: 36px; border-radius: 6px; list-style: none; cursor: pointer; }
+.capability-scope-info > summary::-webkit-details-marker { display: none; }
+.capability-scope-info > summary:hover, .capability-scope-info[open] > summary { background: var(--panel); color: var(--text); }
+.capability-scope-info > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.capability-scope-description { position: absolute; z-index: var(--z-sticky); top: calc(100% + 8px); right: 0; width: min(300px, calc(100vw - 80px)); padding: 14px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface-raised); box-shadow: var(--shadow-soft); }
+.capability-scope-description .capability-conversation-scope { align-items: flex-start; color: var(--text-soft); }
+.capability-scope-description .capability-conversation-scope > svg { margin-top: 2px; }
+.capability-scope-description .capability-conversation-scope > span { max-width: none; white-space: normal; overflow-wrap: anywhere; }
+.capability-scope-description .capability-scope-help { margin-top: 10px; }
 .capability-context-note { display: flex; flex-shrink: 0; align-items: center; gap: 9px; margin: -4px 0 12px; color: var(--text-soft); font-size: 12px; line-height: 1.6; }
 .capability-context-note > svg { flex-shrink: 0; }
 .capability-context-note p { flex: 1; min-width: 0; margin: 0; overflow-wrap: anywhere; }
 .capability-context-note button { display: inline-flex; flex-shrink: 0; align-items: center; gap: 4px; min-height: 36px; padding: 4px 0 4px 10px; background: transparent; color: var(--text); font-size: 12px; }
 .capability-filter-label { align-self: center; margin-right: 4px; color: var(--muted); font-size: 12px; }
-.capability-catalog-heading { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
-.capability-add-button { margin-bottom: 10px; }
+.capability-catalog-heading { display: flex; flex-shrink: 0; align-items: center; gap: 16px; min-width: 0; margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
+.capability-add-button { flex-shrink: 0; }
 .capability-tab-panel { display: flex; flex: 1; flex-direction: column; min-height: 0; min-width: 0; }
 .capability-tab-panel[hidden] { display: none; }
 .capability-source-label { align-self: center; padding: 6px 0; color: var(--muted); font-size: 12px; }
@@ -76,19 +86,21 @@
 .capability-import-footer > div { display: flex; gap: 8px; margin-left: auto; }
 .capability-form-error { margin: 0; padding: 12px; border-radius: var(--radius-control); background: var(--accent-faint); color: var(--danger); font-size: 13px; overflow-wrap: anywhere; }
 .extensions-page .capability-view-tabs { gap: 24px; padding: 0; margin: 0; border: 0; }
-.extensions-page .capability-view-tabs button { position: relative; justify-content: center; gap: 8px; min-height: 44px; padding: 0 4px 12px; border-radius: 0; background: transparent; color: var(--muted); font-size: 14px; }
+.extensions-page .capability-view-tabs button { position: relative; justify-content: center; gap: 8px; min-height: 44px; padding: 0 4px; border-radius: 0; background: transparent; color: var(--muted); font-size: 14px; }
 .extensions-page .capability-view-tabs button:hover { color: var(--text); }
 .extensions-page .capability-view-tabs button[aria-selected="true"] { background: transparent; color: var(--text); font-weight: 600; }
-.extensions-page .capability-view-tabs button[aria-selected="true"]::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; border-radius: 2px; background: var(--text); content: ""; }
+.extensions-page .capability-view-tabs button[aria-selected="true"]::after { position: absolute; right: 0; bottom: -11px; left: 0; height: 2px; border-radius: 2px; background: var(--text); content: ""; }
 .extensions-page .extensions-summary { gap: 12px; margin-bottom: 16px; }
 .extensions-page .extensions-summary > span { min-height: 20px; padding: 0 12px 0 0; }
 .extensions-page .extensions-summary strong { font-variant-numeric: tabular-nums; }
-.extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: clamp(300px, 30%, 360px) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); min-height: 0; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface-raised); overflow: hidden; }
+.extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: var(--capability-list-width, clamp(300px, 30%, 360px)) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); min-height: 0; border: 1px solid var(--line); border-radius: var(--radius-card); background: var(--surface-raised); overflow: hidden; }
 .extensions-page :is(.extensions-sidebar, .skill-catalog-sidebar) { max-height: none; }
 .extensions-page :is(.extension-toolbar, .skill-catalog-toolbar) { align-items: center; gap: 8px; padding: 16px 16px 10px; }
 .extensions-page .extension-search { min-height: 38px; border-color: var(--line); }
 .extensions-page .extension-search > svg { flex-shrink: 0; }
 .extensions-page .extension-search input { font-size: 13px; line-height: 1.5; padding: 0; box-shadow: none; }
+.capability-search-clear { display: grid; place-items: center; flex-shrink: 0; width: 26px; height: 26px; padding: 0; border-radius: 5px; background: transparent; color: var(--muted); }
+.capability-search-clear:hover { background: var(--panel-deep); color: var(--text); }
 .extensions-page .extension-search:focus-within { border-color: var(--line-strong); box-shadow: none; }
 .extensions-page .extension-search:has(input:focus-visible) { box-shadow: 0 0 0 3px var(--focus-ring); }
 .extensions-page :is(.extension-toolbar, .skill-catalog-toolbar) > .icon-button { width: 36px; height: 36px; flex-shrink: 0; border-radius: var(--radius-control); }
@@ -98,7 +110,11 @@
 .extensions-page :is(.extension-filters, .skill-catalog-filters) button[aria-pressed="true"] { border-color: var(--line); background: var(--surface-raised); color: var(--text); box-shadow: none; }
 .extensions-page :is(.skill-import, .extension-install-toggle) { margin-left: auto; }
 .extensions-page .capability-source-label { padding: 6px 9px; }
-.extensions-page .skill-catalog-count { padding: 2px 16px 14px; font-size: 12px; line-height: 1.6; }
+.extensions-page .skill-catalog-count { display: flex; flex: 0 0 auto; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 12px; padding: 2px 16px 12px; font-size: 11px; line-height: 1.6; }
+.skill-catalog-list-heading { display: flex; flex-shrink: 0; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 4px 8px; padding: 0 12px 8px; }
+.extensions-page .skill-catalog-list-heading :is(.skill-catalog-filters, .skill-catalog-count) { padding: 0; }
+.extensions-page .skill-catalog-toolbar { padding: 12px 12px 8px; }
+.skill-catalog-count strong { color: var(--text-soft); font-weight: 600; font-variant-numeric: tabular-nums; }
 .extensions-page :is(.extension-detail, .skill-catalog-detail) { overflow-y: auto; padding: 28px 32px; overscroll-behavior: contain; scrollbar-gutter: stable; }
 .extensions-page :is(.skill-detail-heading, .extension-title-line) h2 { font-size: 22px; line-height: 1.4; font-weight: 600; }
 .extensions-page .skill-status.status-ready { color: var(--success); background: var(--success-soft); }
@@ -137,7 +153,7 @@
 .extensions-page .is-onboarding .capability-empty-icon { width: 56px; height: 56px; margin-bottom: 4px; border-radius: 16px; }
 .extensions-page .is-onboarding .capability-empty-detail > p { max-width: 470px; }
 
-.extensions-page :is(.extensions-body, .skill-catalog).is-installing { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto; }
+.extensions-page :is(.extensions-body, .skill-catalog).is-installing { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); }
 .extensions-page .is-installing :is(.extensions-sidebar, .skill-catalog-sidebar) { display: none; }
 .extensions-page .is-installing :is(.extension-detail, .skill-catalog-detail) { display: block; padding: 32px; }
 .extensions-page .extensions-body.is-installing > .extension-detail { display: block; }
@@ -145,7 +161,7 @@
 
 @media (min-width: 820px) and (max-width: 1199px) {
   .extensions-page .workspace-page-content { padding: 24px; }
-  .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(250px, .9fr) minmax(0, 1.7fr); }
+  .extensions-page { --capability-list-width: clamp(240px, 32%, 300px); }
   .extensions-page :is(.extension-detail, .skill-catalog-detail) { padding: 24px 20px; }
   .extensions-page :is(.extension-filters, .skill-catalog-filters) { flex-wrap: wrap; }
   .extensions-page .extension-detail-head { flex-direction: column; align-items: flex-start; }
@@ -154,17 +170,11 @@
 }
 @media (max-width: 819px) {
   .extensions-page .workspace-page-content { padding: 18px 16px 16px; }
-  .extensions-page:is(.is-extension-view, .is-adding-capability) .workspace-page-content { display: block; overflow-y: auto; overscroll-behavior: contain; }
-  .extensions-page:is(.is-extension-view, .is-adding-capability) .capability-tab-panel:not([hidden]) { display: block; }
-  .extensions-page:is(.is-extension-view, .is-adding-capability) :is(.extensions-body, .skill-catalog) { display: block; }
-  .extensions-page:is(.is-extension-view, .is-adding-capability) :is(.extension-detail, .skill-catalog-detail) { overflow-y: visible; scrollbar-gutter: auto; }
   .extensions-page .workspace-page-heading { grid-template-columns: 44px minmax(0, 1fr); gap: 5px 12px; margin-bottom: 16px; }
   .extensions-page .workspace-page-icon { width: 44px; height: 44px; }
   .extensions-page .workspace-page-heading h1 { font-size: 23px; }
-  .capability-management-scope { padding: 10px 12px; gap: 8px; margin-bottom: 12px; }
-  .capability-management-scope label { width: 100%; }
-  .capability-scope-select { flex: 1; }
-  .capability-management-scope select { width: 100%; height: 44px; font-size: 13px; }
+  .capability-management-scope select { height: 44px; font-size: 13px; }
+  .capability-scope-info > summary { width: 44px; height: 44px; }
   .capability-conversation-scope { font-size: 12px; }
   .extensions-page :is(.extensions-body, .skill-catalog) { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); min-height: 0; }
   .extensions-page :is(.extensions-sidebar, .skill-catalog-sidebar) { max-height: none; border: 0; }
@@ -201,11 +211,35 @@
   .capability-import-form input:not([type="radio"]), .capability-import-form textarea { font-size: 16px; min-height: 44px; }
   .extensions-page .extension-import-tabs button { flex-direction: column; gap: 6px; padding: 10px 4px; font-size: 12px; white-space: normal; }
 }
+@container capabilities (max-width: 620px) {
+  .capability-catalog-heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "tabs add" "scope scope"; gap: 8px 12px; }
+  .capability-view-tabs { grid-area: tabs; justify-self: start; }
+  .capability-add-button { grid-area: add; }
+  .capability-management-scope { grid-area: scope; width: 100%; gap: 4px; margin: 0; }
+  .capability-management-scope label { flex: 1; }
+  .capability-scope-select { flex: 1; }
+  .capability-management-scope select { width: 100%; }
+  .extensions-page .capability-view-tabs button[aria-selected="true"]::after { bottom: 0; }
+  .extensions-page :is(.extensions-body, .skill-catalog):not(.is-empty):not(.is-installing) { grid-template-columns: minmax(0, 1fr); }
+  .extensions-page :is(.extensions-body, .skill-catalog):not(.is-empty):not(.is-installing) > :is(.extension-detail, .skill-catalog-detail) { display: none; }
+  .extensions-page :is(.extensions-body, .skill-catalog).is-detail-open:not(.is-empty):not(.is-installing) > :is(.extension-detail, .skill-catalog-detail) { display: block; }
+  .extensions-page :is(.extensions-body, .skill-catalog).is-detail-open:not(.is-empty):not(.is-installing) > :is(.extensions-sidebar, .skill-catalog-sidebar) { display: none; }
+  .extensions-page :is(.extensions-sidebar, .skill-catalog-sidebar) { border-right: 0; }
+  .skill-list-back { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; margin-bottom: 12px; padding: 0; background: transparent; color: var(--text-soft); font-size: 13px; }
+  .extensions-page .is-empty :is(.extensions-sidebar, .skill-catalog-sidebar) { grid-template-columns: minmax(0, 1fr); gap: 10px; padding: 14px; }
+  .extensions-page .is-empty :is(.extension-filters, .skill-catalog-filters) { justify-self: start; }
+  .extensions-page .is-empty .skill-catalog-count { padding: 0; }
+}
 @media (max-width: 359px) {
   .extensions-page .workspace-page-content { padding-inline: 14px; }
   .capability-management-scope label { gap: 8px; }
   .extensions-page .workspace-page-heading p { font-size: 12px; }
   .capability-mcp-transport { flex-wrap: wrap; gap: 12px; }
+  .extensions-page .capability-view-tabs { gap: 12px; }
+  .extensions-page .capability-view-tabs button { gap: 6px; padding-inline: 0; font-size: 13px; }
+  .extensions-page .capability-add-button { padding-inline: 10px; }
+  .skill-detail-actions { gap: 6px; padding-inline: 12px; }
+  .skill-detail-actions .button { padding-inline: 10px; }
 }
 @media (prefers-reduced-motion: reduce) {
   .capability-discovery-chevron { transition: none; }

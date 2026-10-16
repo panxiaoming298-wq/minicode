@@ -276,6 +276,7 @@ function ExtensionsContext({
   const [skillRevision, setSkillRevision] = useState(0);
   const [extensionDetailOpen, setExtensionDetailOpen] = useState(false);
   const extensionList = useRef<HTMLDivElement>(null);
+  const extensionDetail = useRef<HTMLElement>(null);
   const accessSection = useRef<HTMLElement>(null);
   const diagnostics = useRef<HTMLDetailsElement>(null);
   const noInstalledExtensions = Boolean(!loading && catalog && !catalog.extensions.length);
@@ -628,21 +629,6 @@ function ExtensionsContext({
     <WorkspacePage className={`extensions-page ${view === "extensions" ? "is-extension-view" : ""} ${installOpen ? "is-adding-capability" : ""}`} title="扩展与能力" icon={Blocks} headingId="extensions-title"
       description="选择技能用于对话，管理扩展的安装、信任与权限。"
       onBack={onBack} onOpenRail={onOpenRail} railCollapsed={railCollapsed} embedded={embedded}>
-        <div className="capability-management-scope">
-          <label><span>查看范围</span><span className="capability-scope-select">
-            {scope === "project" ? <FolderOpen size={16} aria-hidden="true" /> : <Monitor size={16} aria-hidden="true" />}
-            <select aria-label="查看范围" aria-describedby="capability-scope-help" value={workspace} disabled={busy || installOpen}
-            onChange={event => onScopeChange(event.target.value)}>
-            <option value="">本机全局</option>
-            {projects.map(project => <option key={project.path} value={project.path}>项目：{project.name}</option>)}
-          </select><ChevronDown size={14} aria-hidden="true" /></span></label>
-          <span className="capability-conversation-scope"><MessageSquare size={14} aria-hidden="true" /><span>当前对话：{conversationLabel}</span></span>
-          <p id="capability-scope-help" className="capability-scope-help">{scope === "project" ? "包含本项目与继承的全局能力。" : "全局能力可供项目和独立对话使用。"}添加能力时保存到此范围。</p>
-        </div>
-
-        {outsideInvocationContext && view === "skills" && !installOpen && <div className="capability-context-note"><Info size={16} /><p>正在查看{managementLabel}，技能能否添加以「{conversationLabel}」对话为准。</p>
-          <button disabled={busy || installOpen} onClick={() => onScopeChange(invocationScope === "project" ? invocationWorkspace : "")}>查看当前对话范围<ArrowUpRight size={14} /></button></div>}
-
         <div className="capability-catalog-heading">
           <div className="capability-view-tabs" role="tablist" aria-label="能力目录" onKeyDown={event => {
             if (busy || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
@@ -654,8 +640,27 @@ function ExtensionsContext({
             <button id="capability-skills-tab" role="tab" aria-selected={view === "skills"} aria-controls="capability-skills-panel" tabIndex={view === "skills" ? 0 : -1} disabled={busy} onClick={() => { setInstallOpen(false); setView("skills"); }}><Sparkles size={16} />技能</button>
             <button id="capability-extensions-tab" role="tab" aria-selected={view === "extensions"} aria-controls="capability-extensions-panel" tabIndex={view === "extensions" ? 0 : -1} disabled={busy} onClick={() => { setInstallOpen(false); setView("extensions"); }}><Package size={16} />扩展包</button>
           </div>
+          <div className="capability-management-scope">
+            <label><span>查看范围</span><span className="capability-scope-select">
+              {scope === "project" ? <FolderOpen size={16} aria-hidden="true" /> : <Monitor size={16} aria-hidden="true" />}
+              <select aria-label="查看范围" aria-describedby="capability-scope-help" value={workspace} disabled={busy || installOpen}
+                onChange={event => onScopeChange(event.target.value)}>
+                <option value="">本机全局</option>
+                {projects.map(project => <option key={project.path} value={project.path}>项目：{project.name}</option>)}
+              </select><ChevronDown size={14} aria-hidden="true" /></span></label>
+            <details className="capability-scope-info">
+              <summary aria-label="查看范围说明" title="查看范围说明"><Info size={15} aria-hidden="true" /></summary>
+              <div className="capability-scope-description">
+                <span className="capability-conversation-scope"><MessageSquare size={14} aria-hidden="true" /><span>当前对话：{conversationLabel}</span></span>
+                <p id="capability-scope-help" className="capability-scope-help">{scope === "project" ? "包含本项目与继承的全局能力。" : "全局能力可供项目和独立对话使用。"}添加能力时保存到此范围。</p>
+              </div>
+            </details>
+          </div>
           <button className="button button-primary capability-add-button" disabled={busy || installOpen} onClick={() => openInstall(view === "skills" ? "skill" : "package")}><Plus size={16} />{view === "skills" ? "添加技能" : "添加扩展"}</button>
         </div>
+
+        {outsideInvocationContext && view === "skills" && !installOpen && <div className="capability-context-note"><Info size={16} /><p>正在查看{managementLabel}，技能能否添加以「{conversationLabel}」对话为准。</p>
+          <button disabled={busy || installOpen} onClick={() => onScopeChange(invocationScope === "project" ? invocationWorkspace : "")}>查看当前对话范围<ArrowUpRight size={14} /></button></div>}
 
         {notice && (
           <div className={`extension-notice notice-${notice.kind}`} role="status">
@@ -688,16 +693,17 @@ function ExtensionsContext({
             aria-label="扩展目录"
           >
             <div className="extension-toolbar">
-              <label className="extension-search">
-                <span className="sr-only">搜索扩展</span>
-                <Search size={15} />
+              <div className="extension-search">
+                <Search size={15} aria-hidden="true" />
                 <input
                   ref={searchRef}
+                  aria-label="搜索扩展"
                   value={search}
                   onChange={(event) => setSearch(event.target.value)}
                   placeholder="搜索名称、ID 或发布者"
                 />
-              </label>
+                {search && <button type="button" className="capability-search-clear" aria-label="清除扩展搜索" onClick={() => { setSearch(""); searchRef.current?.focus(); }}><X size={14} /></button>}
+              </div>
               <button
                 className="icon-button"
                 onClick={() => void refreshCatalog()}
@@ -742,7 +748,12 @@ function ExtensionsContext({
                   <button
                     key={extension.key}
                     className={`extension-row ${selected?.key === extension.key ? "is-selected" : ""}`}
-                    onClick={() => { setSelectedKey(extension.key); setExtensionDetailOpen(true); }}
+                    onClick={() => {
+                      setSelectedKey(extension.key); setExtensionDetailOpen(true);
+                      requestAnimationFrame(() => {
+                        if (extensionList.current && !extensionList.current.getClientRects().length) extensionDetail.current?.focus({ preventScroll: true });
+                      });
+                    }}
                     role="option"
                     aria-selected={selected?.key === extension.key}
                     tabIndex={selected?.key === extension.key ? 0 : -1}
@@ -769,7 +780,7 @@ function ExtensionsContext({
             </div>
           </section>}
 
-          <section className="extension-detail" aria-label="扩展详情">
+          <section ref={extensionDetail} tabIndex={-1} className="extension-detail" aria-label="扩展详情">
             {(view === "extensions" ? importForm : null) || (selected ? (
               <>
                 <button className="skill-list-back" onClick={() => {

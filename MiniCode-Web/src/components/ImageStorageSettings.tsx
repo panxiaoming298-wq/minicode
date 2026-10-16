@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
-import { Images, LoaderCircle, RefreshCw, Trash2 } from "lucide-react";
+import { Images, LoaderCircle, RefreshCw } from "lucide-react";
 import { api } from "../api/client";
+import { messagePreview } from "../lib/attachments";
 import type { ImageStorageSession, ImageStorageView } from "../types";
+import { ImageStorageSessionRow } from "./ImageStorageSessionRow";
 import "./ImageStorageSettings.css";
 
 function bytes(value: number | null): string {
@@ -81,26 +83,22 @@ export function ImageStorageSettings() {
     <header><h2 id="image-storage-heading"><Images size={17} />聊天图片存储</h2>
       <button type="button" className="button button-secondary" disabled={loading || busy} aria-label="刷新图片用量"
         onClick={() => { setError(""); void refresh(); }}><RefreshCw size={14} />刷新</button></header>
-    <p className="settings-help">截图和检查时保存的图片副本长期保留，随聊天一起管理。删除项目原图或移入回收站会继续保留副本；永久删除聊天会一并清理。</p>
+    <p className="settings-help">点击对话查看图片副本。副本随对话保留，删除项目原图或归档对话不影响副本；永久删除聊天会一并清理。</p>
     {view && <p className="image-storage-total">{view.unknownSessionCount ? "已确认占用" : "已占用"} <strong>{bytes(view.storedBytes)}</strong>
       {view.unknownSessionCount > 0 && ` · ${view.unknownSessionCount} 条对话的用量暂不可读取`}</p>}
     {error && !confirmation && <p className="image-storage-error" role="alert">{error}</p>}
     {notice && <p className="image-storage-notice" role="status">{notice}</p>}
     {loading && !view ? <p className="settings-help" role="status"><LoaderCircle size={15} className="spin" /> 正在读取图片用量…</p>
       : view && !view.sessions.length ? <p className="settings-help">暂无占用空间的聊天图片副本。</p>
-      : view && <ul className="image-storage-list" aria-label="各对话图片用量">{view.sessions.map(row => <li key={row.sessionId}>
-        <div><strong title={row.title}>{row.title}</strong><p>{row.workspaceName} · {new Date(row.updatedAt).toLocaleString("zh-CN", { month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit" })}</p>
-          <p>{row.storedCount === null ? "图片数量未知" : `${row.storedCount} 张图片`} · {bytes(row.storedBytes)}
-          {row.archived && " · 回收站"}{row.running && " · 任务运行中"}</p>{row.error && <p className="image-storage-error">{row.error}</p>}</div>
-        <button type="button" className="button button-secondary" disabled={busy || loading || !row.canClear}
-          aria-label={`清理图片 ${row.title}`} onClick={() => { setError(""); setNotice(""); setConfirmation(row); }}><Trash2 size={14} />清理图片</button>
-      </li>)}</ul>}
+      : view && <ul className="image-storage-list" aria-label="各对话图片用量">{view.sessions.map(row => <ImageStorageSessionRow key={row.sessionId}
+        row={row} disabled={busy || loading} formatBytes={bytes}
+        onClear={selected => { setError(""); setNotice(""); setConfirmation(selected); }} />)}</ul>}
     <dialog ref={dialog} className="image-storage-confirm" aria-labelledby="image-storage-confirm-heading"
       aria-describedby="image-storage-confirm-description" onCancel={event => {
         event.preventDefault(); if (!busyRef.current) setConfirmation(null);
       }}>
       <h2 id="image-storage-confirm-heading">清理这条对话的图片副本？</h2>
-      <p className="image-storage-confirm-title">{confirmation?.title}</p>
+      <p className="image-storage-confirm-title">{confirmation && messagePreview(confirmation.title)}</p>
       <p id="image-storage-confirm-description">将清理 {confirmation?.storedCount ?? 0} 张图片副本，预计释放 {bytes(confirmation?.storedBytes ?? 0)}。
         文字记录、文件名和保存时间会保留，图片会显示为“已清理”。此操作无法恢复副本，项目原图不受影响。</p>
       {error && <p className="image-storage-error" role="alert">{error}</p>}

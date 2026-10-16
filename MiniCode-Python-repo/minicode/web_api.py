@@ -3698,6 +3698,26 @@ def create_app(
                              "unknownSessionCount": unknown, "retention": "until-cleared-or-session-deleted"},
                             headers={"Cache-Control": "no-store"})
 
+    def _require_image_storage_session(session_id: str) -> None:
+        if session_store.load_session_metadata(session_id) is None:
+            raise HTTPException(404, "会话不存在。")
+        entry = _session_trash().get(session_id)
+        if entry and entry.deletion_pending:
+            raise HTTPException(409, "对话正在永久删除，暂时无法查看图片。")
+
+    @app.get("/api/storage/images/{session_id}")
+    def stored_session_images(session_id: str) -> Response:
+        _require_image_storage_session(session_id)
+        from minicode.run_images import RunImageStore
+        try:
+            store = RunImageStore(session_id)
+            summary = store.storage_summary()
+            images = [image for image in store.records(all_images=True) if image.get("availability") != "cleared"]
+            return JSONResponse({"sessionId": session_id, "revision": summary["revision"], "images": images},
+                                headers={"Cache-Control": "no-store"})
+        except (OSError, ValueError, RuntimeError) as error:
+            raise HTTPException(503, "暂时无法读取图片列表，请稍后重新加载。") from error
+
     @app.get("/api/sessions/{session_id}/images/status")
     def image_status(session_id: str, image_ids: str) -> Response:
         _require_unarchived_session(session_id)
@@ -3736,9 +3756,7 @@ def create_app(
             except (OSError, RuntimeError) as error:
                 raise HTTPException(503, "图片清理未完成，文字记录仍保留；请刷新存储用量后重试。") from error
 
-    @app.get("/api/sessions/{session_id}/images/{image_id}")
-    def run_image(session_id: str, image_id: str, download: bool = False):
-        _require_unarchived_session(session_id)
+    def _session_image_response(session_id: str, image_id: str, download: bool = False):
         if session_store.load_session_metadata(session_id) is None:
             raise HTTPException(status_code=404, detail="会话不存在。")
         from urllib.parse import quote
@@ -3759,6 +3777,16 @@ def create_app(
             "Content-Security-Policy": "default-src 'none'; sandbox",
             "Content-Disposition": f"{disposition}; filename*=UTF-8''{quote(metadata['name'], safe='')}",
         })
+
+    @app.get("/api/sessions/{session_id}/images/{image_id}")
+    def run_image(session_id: str, image_id: str, download: bool = False):
+        _require_unarchived_session(session_id)
+        return _session_image_response(session_id, image_id, download)
+
+    @app.get("/api/storage/images/{session_id}/{image_id}")
+    def stored_image(session_id: str, image_id: str, download: bool = False):
+        _require_image_storage_session(session_id)
+        return _session_image_response(session_id, image_id, download)
 
     @app.get("/api/sessions/{session_id}/runs/{run_id}/project-artifacts/{artifact_id}")
     def project_artifact(session_id: str, run_id: str, artifact_id: str):

@@ -238,6 +238,9 @@ export default function App() {
   const [trashNotice, setTrashNotice] = useState("");
   const [capabilityRevision, setCapabilityRevision] = useState(0);
   const refreshComposerSkills = useCallback(() => setCapabilityRevision(value => value + 1), []);
+  const refreshNavigation = useCallback(() => {
+    void api.getNavigation().then(setNavigation).catch(() => undefined);
+  }, []);
   const [railOpen, setRailOpen] = useState(false);
   const [railCollapsed, setRailCollapsed] = useState(() => {
     try { return window.localStorage.getItem("minicode.rail.collapsed") === "true"; }
@@ -782,8 +785,21 @@ export default function App() {
     resetTask("standalone");
   }
 
+  function removeMissingSession(sessionId: string, previousSessionId: string | null, previousScope: ConversationScope, preserveView: boolean) {
+    resetTask(previousScope, true);
+    conversationCache.current.delete(sessionId);
+    setNavigation(current => ({ ...current,
+      sessions: current.sessions.filter(item => item.sessionId !== sessionId),
+      pinnedSessionIds: current.pinnedSessionIds.filter(id => id !== sessionId),
+    }));
+    if (previousSessionId && previousSessionId !== sessionId) void selectSession(previousSessionId, preserveView);
+    setError("对话已不存在，已从列表中移除。");
+  }
+
   async function selectSession(sessionId: string, preserveView = false) {
     if (conversationViews) return selectConversationView(sessionId, preserveView);
+    const previousSessionId = selectedSessionIdRef.current;
+    const previousScope = conversationScopeRef.current;
     setComposerNotice("");
     setHistory(null); setHistoryError(""); setHistoryLoading(false); setForkTurn(null);
     setHistoryRevision((current) => current + 1);
@@ -862,6 +878,10 @@ export default function App() {
       }
     } catch (reason) {
       if (selectionRequestRef.current === requestId) {
+        if (reason instanceof ApiError && reason.status === 404 && reason.message === "会话不存在。") {
+          removeMissingSession(sessionId, previousSessionId, previousScope, preserveView);
+          return;
+        }
         setError(reason instanceof Error ? reason.message : "无法读取会话。");
         setSelectedSessionId(null);
         selectedSessionIdRef.current = null;
@@ -877,6 +897,8 @@ export default function App() {
   }
 
   async function selectConversationView(sessionId: string, preserveView: boolean) {
+    const previousSessionId = selectedSessionIdRef.current;
+    const previousScope = conversationScopeRef.current;
     saveCurrentReadingView();
     selectionAbortRef.current?.abort();
     earlierPageRef.current = null;
@@ -962,6 +984,10 @@ export default function App() {
       });
     } catch (cause) {
       if (isCurrent()) {
+        if (cause instanceof ApiError && cause.status === 404 && cause.message === "会话不存在。") {
+          removeMissingSession(sessionId, previousSessionId, previousScope, preserveView);
+          return;
+        }
         setError(cause instanceof Error ? cause.message : "无法读取对话，请重新打开。");
         setSessionLoading(false); setSessionInspectLoading(false);
         // Keep cached reading available; submission waits for authoritative run state.
@@ -1749,6 +1775,7 @@ export default function App() {
           onNewStandaloneTask={newStandaloneTask}
           onNewProjectTask={changeWorkspace}
           onSelectSession={(sessionId) => void selectSession(sessionId)}
+          onSearch={refreshNavigation}
           onArchiveSession={(sessionId) => void archiveSelectedSession(sessionId)}
           onOpenTrash={openTrash}
           onChangeWorkspace={changeWorkspace}
